@@ -80,13 +80,13 @@ fn preserves_policy_validation_errors() {
     let temporary = tempdir().expect("create temporary directory");
     let config_path = temporary.path().join("policy.toml");
 
-    fs::write(&config_path, "version = 2\nscopes = []").expect("write invalid policy");
+    fs::write(&config_path, "version = 4\nscopes = []").expect("write invalid policy");
 
     let result = Config::load(&config_path);
 
     assert!(matches!(
         result,
-        Err(ConfigLoadError::Invalid(ConfigError::UnsupportedVersion(2)))
+        Err(ConfigLoadError::Invalid(ConfigError::UnsupportedVersion(4)))
     ));
 }
 

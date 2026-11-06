@@ -1,15 +1,40 @@
 use persona::runner::{RunError, RunLimits, RunRequest, SubprocessRunner, argument};
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 fn request<'a>(args: &'a [OsString], cwd: &'a Path) -> RunRequest<'a> {
+    static ENVIRONMENT: OnceLock<Vec<(OsString, OsString)>> = OnceLock::new();
+    let environment = ENVIRONMENT.get_or_init(|| {
+        let coreutils = std::env::var_os("PERSONA_TEST_COREUTILS")
+            .unwrap_or_else(|| OsString::from("/usr/bin"));
+        let mut path = coreutils;
+        path.push(":/bin:/usr/bin");
+        vec![(OsString::from("PATH"), path)]
+    });
     RunRequest {
         executable: Path::new("/bin/sh"),
         args,
         cwd,
-        environment: &[],
+        environment,
+        stdin: None,
     }
+}
+
+#[test]
+fn sends_bounded_input_to_a_child_without_shell_interpolation() {
+    let args = [];
+    let input = b"synthetic stdin fixture";
+    let cat = std::env::var_os("PERSONA_TEST_CAT").unwrap_or_else(|| OsString::from("/bin/cat"));
+    let mut request = request(&args, Path::new("/"));
+    request.executable = Path::new(&cat);
+    request.stdin = Some(input);
+    let output = SubprocessRunner::default()
+        .run(request)
+        .expect("run cat fixture");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, input);
 }
 
 #[test]

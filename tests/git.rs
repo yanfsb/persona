@@ -1,4 +1,4 @@
-use persona::git::{GitClient, GitError};
+use persona::git::{GitClient, GitError, PushTuple};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,6 +80,79 @@ fn init_repo(home: &Path, directory: &Path) {
 }
 
 #[test]
+fn resolves_only_existing_commit_objects_without_option_injection() {
+    let temporary = tempdir().expect("create temporary directory");
+    let repo = temporary.path().join("repo");
+    init_repo(temporary.path(), &repo);
+    run_fixture(fixture_git(temporary.path()).arg("-C").arg(&repo).args([
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "seed",
+    ]));
+    let client = client(temporary.path());
+    let oid = client.resolve_commit_oid(&repo, "HEAD").unwrap();
+    assert!(matches!(oid.len(), 40 | 64));
+    assert!(matches!(
+        client.resolve_commit_oid(&repo, "--help"),
+        Err(GitError::InvalidOutput)
+    ));
+    assert!(matches!(
+        client.resolve_commit_oid(&repo, "deadbeef"),
+        Err(GitError::MissingObject)
+    ));
+}
+
+#[test]
+fn detects_custom_merge_drivers_without_returning_configured_values() {
+    let temporary = tempdir().expect("create temporary directory");
+    let repo = temporary.path().join("repo");
+    init_repo(temporary.path(), &repo);
+    assert!(
+        !client(temporary.path())
+            .has_custom_merge_driver(&repo)
+            .unwrap()
+    );
+    run_fixture(fixture_git(temporary.path()).arg("-C").arg(&repo).args([
+        "config",
+        "merge.synthetic.driver",
+        "echo fixture",
+    ]));
+    assert!(
+        client(temporary.path())
+            .has_custom_merge_driver(&repo)
+            .unwrap()
+    );
+}
+
+#[test]
+fn detects_implicit_push_options_and_remote_mirror_mode_by_key_name_only() {
+    let temporary = tempdir().expect("create temporary directory");
+    let repo = temporary.path().join("repo");
+    init_repo(temporary.path(), &repo);
+    let git = client(temporary.path());
+    assert!(!git.has_push_options(&repo).unwrap());
+    assert!(!git.has_remote_mirror_push(&repo, "origin").unwrap());
+
+    run_fixture(fixture_git(temporary.path()).arg("-C").arg(&repo).args([
+        "config",
+        "push.pushOption",
+        "synthetic-hidden-side-effect",
+    ]));
+    assert!(git.has_push_options(&repo).unwrap());
+    run_fixture(fixture_git(temporary.path()).arg("-C").arg(&repo).args([
+        "config",
+        "remote.origin.mirror",
+        "true",
+    ]));
+    assert!(git.has_remote_mirror_push(&repo, "origin").unwrap());
+}
+
+#[test]
 fn discovers_the_checkout_root_from_a_subdirectory() {
     let temporary = tempdir().expect("create temporary directory");
     let repo = temporary.path().join("project");
@@ -136,6 +209,28 @@ fn discovers_the_linked_worktree_instead_of_the_main_checkout() {
         root,
         fs::canonicalize(&linked).expect("canonicalize linked worktree")
     );
+}
+
+#[test]
+fn resolves_only_explicit_remote_fetch_destinations_after_rewrite() {
+    let temporary = tempdir().expect("create temporary directory");
+    let repo = temporary.path().join("fetch-repo");
+    init_repo(temporary.path(), &repo);
+    run_fixture(fixture_git(temporary.path()).current_dir(&repo).args([
+        "remote",
+        "add",
+        "origin",
+        "git@rewrite.invalid:org/repo.git",
+    ]));
+    run_fixture(fixture_git(temporary.path()).current_dir(&repo).args([
+        "config",
+        "url.https://github.com/.insteadOf",
+        "git@rewrite.invalid:",
+    ]));
+    let destinations = client(temporary.path())
+        .effective_fetch_destinations(&repo, "origin")
+        .unwrap();
+    assert_eq!(destinations, ["https://github.com/org/repo.git"]);
 }
 
 #[test]
@@ -214,6 +309,49 @@ fn rejects_directories_without_a_working_tree() {
 }
 
 #[test]
+fn identifies_unsafe_https_settings_without_exposing_config_values() {
+    let temporary = tempdir().expect("create temporary directory");
+    let repo = temporary.path().join("repo");
+    init_repo(temporary.path(), &repo);
+    let git = client(temporary.path());
+    assert!(!git.has_unsafe_https_transport_config(&repo).unwrap());
+
+    run_fixture(fixture_git(temporary.path()).current_dir(&repo).args([
+        "config",
+        "http.extraHeader",
+        "Authorization: synthetic-secret",
+    ]));
+    run_fixture(fixture_git(temporary.path()).current_dir(&repo).args([
+        "config",
+        "credential.helper",
+        "store --file=/tmp/synthetic",
+    ]));
+    assert!(git.has_unsafe_https_transport_config(&repo).unwrap());
+
+    let worktree_repo = temporary.path().join("worktree-config-repo");
+    init_repo(temporary.path(), &worktree_repo);
+    run_fixture(
+        fixture_git(temporary.path())
+            .current_dir(&worktree_repo)
+            .args(["config", "extensions.worktreeConfig", "true"]),
+    );
+    run_fixture(
+        fixture_git(temporary.path())
+            .current_dir(&worktree_repo)
+            .args([
+                "config",
+                "--worktree",
+                "http.extraHeader",
+                "Authorization: synthetic-worktree-secret",
+            ]),
+    );
+    assert!(
+        git.has_unsafe_https_transport_config(&worktree_repo)
+            .unwrap()
+    );
+}
+
+#[test]
 fn refuses_environment_that_redirects_the_repository() {
     let temporary = tempdir().expect("create temporary directory");
     let repo = temporary.path().join("project");
@@ -244,4 +382,37 @@ fn requires_an_absolute_git_executable() {
         git.checkout_root(temporary.path()),
         Err(GitError::RelativeExecutable(_))
     ));
+}
+
+#[test]
+fn enumerates_bounded_outgoing_commit_oids_for_online_verification() {
+    let temporary = tempdir().expect("create temporary directory");
+    let repo = temporary.path().join("repo");
+    init_repo(temporary.path(), &repo);
+    run_fixture(fixture_git(temporary.path()).arg("-C").arg(&repo).args([
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "seed",
+    ]));
+    let git = client(temporary.path());
+    let oid = git.resolve_commit_oid(&repo, "HEAD").unwrap();
+    let tuple = PushTuple {
+        local_ref: "refs/heads/main".to_owned(),
+        local_oid: oid.clone(),
+        remote_ref: "refs/heads/main".to_owned(),
+        remote_oid: "0".repeat(oid.len()),
+    };
+    let commits = git
+        .outgoing_commit_oids_many(
+            &repo,
+            &[tuple],
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(commits, [oid]);
 }

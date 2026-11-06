@@ -195,42 +195,20 @@ impl GpgClient {
         let output = git
             .verify_commit(directory, oid, home, &self.executable)
             .map_err(map_git_error)?;
-        let mut statuses = String::from_utf8(output.stdout).map_err(|_| GpgError::InvalidOutput)?;
-        statuses.push_str(&String::from_utf8(output.stderr).map_err(|_| GpgError::InvalidOutput)?);
+        parse_verification(output)
+    }
 
-        let mut primary_fingerprint = None;
-        let mut valid = false;
-        let mut unavailable_key = false;
-        for line in statuses.lines() {
-            let Some(status) = line.strip_prefix("[GNUPG:] ") else {
-                continue;
-            };
-            let fields: Vec<&str> = status.split_whitespace().collect();
-            match fields.first().copied() {
-                Some("VALIDSIG") => {
-                    valid = true;
-                    let candidate = fields.last().copied().unwrap_or_default();
-                    let candidate = if candidate.len() == 40
-                        && candidate.chars().all(|c| c.is_ascii_hexdigit())
-                    {
-                        candidate
-                    } else {
-                        fields.get(1).copied().unwrap_or_default()
-                    };
-                    if candidate.len() == 40 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-                        primary_fingerprint = Some(candidate.to_ascii_uppercase());
-                    }
-                }
-                Some("NO_PUBKEY") | Some("ERRSIG") => unavailable_key = true,
-                _ => {}
-            }
-        }
-
-        Ok(Verification {
-            cryptographically_valid: valid && output.status.success(),
-            unavailable_key,
-            primary_fingerprint,
-        })
+    pub fn verify_tag_oid(
+        &self,
+        git: &GitClient,
+        directory: &Path,
+        oid: &str,
+        home: &Path,
+    ) -> Result<Verification, GpgError> {
+        let output = git
+            .verify_tag(directory, oid, home, &self.executable)
+            .map_err(map_git_error)?;
+        parse_verification(output)
     }
 
     fn list_keys(&self, home: &Path) -> Result<RunOutput, GpgError> {
@@ -264,9 +242,46 @@ impl GpgClient {
                 args: &args,
                 cwd,
                 environment,
+                stdin: None,
             })
             .map_err(map_runner_error)
     }
+}
+
+fn parse_verification(output: RunOutput) -> Result<Verification, GpgError> {
+    let mut statuses = String::from_utf8(output.stdout).map_err(|_| GpgError::InvalidOutput)?;
+    statuses.push_str(&String::from_utf8(output.stderr).map_err(|_| GpgError::InvalidOutput)?);
+    let mut primary_fingerprint = None;
+    let mut valid = false;
+    let mut unavailable_key = false;
+    for line in statuses.lines() {
+        let Some(status) = line.strip_prefix("[GNUPG:] ") else {
+            continue;
+        };
+        let fields: Vec<&str> = status.split_whitespace().collect();
+        match fields.first().copied() {
+            Some("VALIDSIG") => {
+                valid = true;
+                let candidate = fields.last().copied().unwrap_or_default();
+                let candidate =
+                    if candidate.len() == 40 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+                        candidate
+                    } else {
+                        fields.get(1).copied().unwrap_or_default()
+                    };
+                if candidate.len() == 40 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+                    primary_fingerprint = Some(candidate.to_ascii_uppercase());
+                }
+            }
+            Some("NO_PUBKEY") | Some("ERRSIG") => unavailable_key = true,
+            _ => {}
+        }
+    }
+    Ok(Verification {
+        cryptographically_valid: valid && output.status.success(),
+        unavailable_key,
+        primary_fingerprint,
+    })
 }
 
 fn is_public_key_armor(contents: &[u8]) -> bool {
@@ -295,9 +310,10 @@ fn isolated_environment(home: &Path) -> Vec<(OsString, OsString)> {
 fn map_runner_error(error: RunError) -> GpgError {
     match error {
         RunError::RelativeExecutable(path) => GpgError::RelativeExecutable(path),
-        RunError::Spawn(error) | RunError::Wait(error) | RunError::Termination(error) => {
-            GpgError::Runner(error)
-        }
+        RunError::Spawn(error)
+        | RunError::Wait(error)
+        | RunError::Termination(error)
+        | RunError::StdinWrite(error) => GpgError::Runner(error),
         RunError::Timeout => GpgError::Timeout,
         RunError::OutputLimit { stream } => GpgError::OutputLimit { stream },
     }

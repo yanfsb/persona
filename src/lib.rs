@@ -1,10 +1,24 @@
+pub mod audit;
+pub mod authorization;
 pub mod config;
 pub mod context;
+pub mod credential;
+pub mod gh_adapter;
 pub mod git;
+pub mod git_command;
+pub mod git_https;
 pub mod gpg;
+pub mod hooks;
+#[cfg(unix)]
+pub mod installer;
 pub mod paths;
+pub mod push;
+pub mod push_handoff;
 pub mod report;
 pub mod runner;
+pub mod ssh_signature;
+pub mod ssh_transport;
+pub mod storage;
 
 use std::path::{Path, PathBuf};
 

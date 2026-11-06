@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -34,6 +34,7 @@ pub struct RunRequest<'a> {
     pub args: &'a [OsString],
     pub cwd: &'a Path,
     pub environment: &'a [(OsString, OsString)],
+    pub stdin: Option<&'a [u8]>,
 }
 
 #[derive(Debug)]
@@ -51,6 +52,7 @@ pub enum RunError {
     OutputLimit { stream: &'static str },
     Wait(String),
     Termination(String),
+    StdinWrite(String),
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +77,11 @@ impl SubprocessRunner {
             .args(request.args)
             .current_dir(request.cwd)
             .env_clear()
-            .stdin(Stdio::null())
+            .stdin(if request.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (name, value) in request.environment {
@@ -94,6 +100,15 @@ impl SubprocessRunner {
             .stderr
             .take()
             .ok_or_else(|| RunError::Spawn("stderr pipe unavailable".to_owned()))?;
+
+        let stdin_thread = request.stdin.map(|input| {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("piped stdin exists when input is configured");
+            let input = input.to_vec();
+            thread::spawn(move || stdin.write_all(&input))
+        });
 
         let stdout_overflow = Arc::new(AtomicBool::new(false));
         let stderr_overflow = Arc::new(AtomicBool::new(false));
@@ -116,16 +131,19 @@ impl SubprocessRunner {
                     if stdout_overflow.load(Ordering::Acquire) {
                         let _ = terminate(&mut child);
                         join_readers(stdout_thread, stderr_thread);
+                        let _ = join_stdin_writer(stdin_thread);
                         return Err(RunError::OutputLimit { stream: "stdout" });
                     }
                     if stderr_overflow.load(Ordering::Acquire) {
                         let _ = terminate(&mut child);
                         join_readers(stdout_thread, stderr_thread);
+                        let _ = join_stdin_writer(stdin_thread);
                         return Err(RunError::OutputLimit { stream: "stderr" });
                     }
                     if started.elapsed() >= self.limits.timeout {
                         let _ = terminate(&mut child);
                         join_readers(stdout_thread, stderr_thread);
+                        let _ = join_stdin_writer(stdin_thread);
                         return Err(RunError::Timeout);
                     }
                     thread::sleep(self.limits.poll_interval);
@@ -133,6 +151,7 @@ impl SubprocessRunner {
                 Err(error) => {
                     let _ = terminate(&mut child);
                     join_readers(stdout_thread, stderr_thread);
+                    let _ = join_stdin_writer(stdin_thread);
                     return Err(RunError::Wait(error.to_string()));
                 }
             }
@@ -142,6 +161,7 @@ impl SubprocessRunner {
         // Always tear down the isolated process group before joining readers.
         let termination_error = terminate(&mut child).err();
         let (stdout, stderr) = join_readers(stdout_thread, stderr_thread);
+        let stdin_error = join_stdin_writer(stdin_thread);
         if let Some(error) = termination_error {
             return Err(error);
         }
@@ -150,6 +170,11 @@ impl SubprocessRunner {
         }
         if stderr_overflow.load(Ordering::Acquire) {
             return Err(RunError::OutputLimit { stream: "stderr" });
+        }
+        if status.success() {
+            if let Some(error) = stdin_error {
+                return Err(RunError::StdinWrite(error));
+            }
         }
         Ok(RunOutput {
             status,
@@ -188,6 +213,23 @@ fn read_capped<R: Read + Send + 'static>(
         }
         output
     })
+}
+
+fn join_stdin_writer(writer: Option<thread::JoinHandle<std::io::Result<()>>>) -> Option<String> {
+    let writer = writer?;
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    while !writer.is_finished() {
+        if Instant::now() >= deadline {
+            drop(writer);
+            return Some("stdin writer cleanup exceeded its deadline".to_owned());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    match writer.join() {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => Some("stdin writer thread panicked".to_owned()),
+    }
 }
 
 fn join_readers(
@@ -285,4 +327,24 @@ fn wait_for_child(child: &mut Child) -> Result<(), RunError> {
 
 pub fn argument(value: impl AsRef<OsStr>) -> OsString {
     value.as_ref().to_os_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn stdin_writer_join_is_bounded_when_the_writer_is_stuck() {
+        let (release, wait) = mpsc::channel::<()>();
+        let writer = thread::spawn(move || {
+            let _ = wait.recv();
+            Ok(())
+        });
+        let started = Instant::now();
+        let result = join_stdin_writer(Some(writer));
+        assert!(result.is_some());
+        assert!(started.elapsed() < CLEANUP_TIMEOUT + Duration::from_millis(250));
+        release.send(()).unwrap();
+    }
 }

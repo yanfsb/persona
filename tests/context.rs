@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
-use persona::context::{ContextError, resolve_context};
+use persona::context::{
+    ContextError, resolve_context, resolve_operation_context, resolve_target_context,
+};
 use persona::paths::PathError;
 use persona::{ResolveError, Scope};
 use std::fs;
@@ -40,6 +42,116 @@ fn canonicalizes_query_and_scopes_before_selecting() {
         selected.root,
         fs::canonicalize(&nested).expect("canonicalize expected root")
     )
+}
+
+#[test]
+fn new_clone_target_uses_its_most_specific_scope_not_the_callers_scope() {
+    let temporary = tempdir().expect("create temporary directory");
+    let parent = temporary.path().join("work");
+    let nested = parent.join("personal");
+    fs::create_dir_all(&nested).expect("create nested scope parent");
+    let target = nested.join("new-clone");
+    let scopes = [scope("work", &parent), scope("personal", &nested)];
+
+    let selected = resolve_target_context(&target, &scopes)
+        .expect("resolve future clone target")
+        .expect("clone target is managed");
+    assert_eq!(selected.name, "personal");
+    assert_eq!(selected.root, fs::canonicalize(&nested).unwrap());
+}
+
+#[test]
+fn new_nested_clone_target_resolves_from_nearest_physical_ancestor() {
+    let temporary = tempdir().expect("create temporary directory");
+    let managed = temporary.path().join("managed");
+    fs::create_dir_all(&managed).expect("create managed scope");
+    let alias = temporary.path().join("managed-alias");
+    symlink(&managed, &alias).expect("create scope alias");
+    let target = alias.join("group").join("repository");
+    let scopes = [scope("managed", &managed)];
+
+    let selected = resolve_target_context(&target, &scopes)
+        .expect("resolve nested target")
+        .expect("target is managed");
+
+    assert_eq!(selected.name, "managed");
+    assert_eq!(selected.root, fs::canonicalize(&managed).unwrap());
+}
+
+#[test]
+fn target_operation_selects_target_scope_without_requiring_managed_caller_context() {
+    let temporary = tempdir().expect("create temporary directory");
+    let managed = temporary.path().join("managed");
+    let unmanaged = temporary.path().join("unmanaged");
+    fs::create_dir_all(&managed).expect("create managed scope");
+    fs::create_dir_all(&unmanaged).expect("create unmanaged caller");
+    let target = managed.join("new-clone");
+    let scopes = [scope("managed", &managed)];
+
+    let selected = resolve_operation_context(&unmanaged, Some(&target), &scopes)
+        .expect("resolve target operation")
+        .expect("target is managed");
+    assert_eq!(selected.name, "managed");
+}
+
+#[test]
+fn dangling_symlink_in_future_target_path_is_rejected() {
+    let temporary = tempdir().expect("create temporary directory");
+    let managed = temporary.path().join("managed");
+    fs::create_dir_all(&managed).expect("create managed scope");
+    let dangling = temporary.path().join("dangling");
+    symlink(temporary.path().join("missing-target"), &dangling).expect("create dangling link");
+    let scopes = [scope("managed", &managed)];
+
+    assert!(resolve_target_context(&dangling.join("clone"), &scopes).is_err());
+}
+
+#[test]
+fn new_clone_target_outside_managed_scopes_stays_unmanaged() {
+    let temporary = tempdir().expect("create temporary directory");
+    let managed = temporary.path().join("managed");
+    let outside = temporary.path().join("outside");
+    fs::create_dir_all(&managed).expect("create managed scope");
+    fs::create_dir_all(&outside).expect("create unmanaged parent");
+    let scopes = [scope("managed", &managed)];
+
+    assert!(
+        resolve_target_context(&outside.join("clone"), &scopes)
+            .expect("resolve future target")
+            .is_none()
+    );
+}
+
+#[test]
+fn nested_v2_scope_replaces_parent_profile_without_inheritance() {
+    let temporary = tempdir().expect("create temporary directory");
+    let parent = temporary.path().join("work");
+    let nested = parent.join("personal");
+    fs::create_dir_all(&nested).expect("create nested scope");
+    let config_text = format!(
+        "version = 2\n\
+         [[profiles]]\nname = \"work\"\n[profiles.git]\nauthor = {{ name = \"Work\", email = \"work@example.invalid\" }}\ncommitter = {{ name = \"Work\", email = \"work@example.invalid\" }}\n\
+         [[profiles]]\nname = \"personal\"\n[profiles.git]\nauthor = {{ name = \"Personal\", email = \"personal@example.invalid\" }}\ncommitter = {{ name = \"Personal\", email = \"personal@example.invalid\" }}\n\
+         [[scopes]]\nname = \"work-root\"\npath = {:?}\nprofile = \"work\"\n\
+         [[scopes]]\nname = \"personal-root\"\npath = {:?}\nprofile = \"personal\"\n",
+        parent, nested
+    );
+    let config = persona::config::Config::parse(&config_text).expect("v2 nested config");
+    let selected = resolve_context(&nested, &config.scopes())
+        .expect("resolve nested scope")
+        .expect("nested scope selected");
+    assert_eq!(selected.name, "personal-root");
+    assert_eq!(
+        config
+            .policies()
+            .iter()
+            .find(|policy| policy.name == selected.name)
+            .unwrap()
+            .git
+            .author
+            .name,
+        "Personal"
+    );
 }
 
 #[test]
