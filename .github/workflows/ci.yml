@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: Linux x86_64
+          - runner: ubuntu-24.04-arm
+            label: Linux aarch64
+          - runner: macos-15
+            label: macOS aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install declared MSRV toolchain
+        run: rustup toolchain install 1.85 --profile minimal
+      - name: Install native test tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh gnupg openssh-server openssl gh
+          sudo install -m 0644 tests/fixtures/https/test-ca.crt /usr/local/share/ca-certificates/persona-test-ca.crt
+          sudo update-ca-certificates
+      - name: Install native test tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list gnupg >/dev/null 2>&1 || brew install gnupg
+          brew list gh >/dev/null 2>&1 || brew install gh
+      - name: Resolve fixture tools
+        id: tools
+        shell: bash
+        run: |
+          for tool in git gpg gh zsh ssh ssh-keygen ssh-agent ssh-add openssl cat; do
+            path="$(command -v "$tool")"
+            if [[ -z "$path" ]]; then echo "missing test tool: $tool" >&2; exit 1; fi
+            key="${tool//-/_}"
+            echo "$key=$path" >> "$GITHUB_OUTPUT"
+          done
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            echo "sshd=$(command -v sshd)" >> "$GITHUB_OUTPUT"
+          else
+            echo "sshd=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Rust 1.85 MSRV
+        run: cargo +1.85 check --locked --all-targets
+      - name: Assert runner architecture
+        run: |
+          case "${{ matrix.label }}" in
+            "Linux x86_64") expected=x86_64 ;;
+            "Linux aarch64") expected=aarch64 ;;
+            "macOS aarch64") expected=arm64 ;;
+          esac
+          actual="$(uname -m)"
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'Expected %s runner, got %s\n' "$expected" "$actual" >&2
+            exit 1
+          fi
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Locked provider-free fixture tests
+        env:
+          PERSONA_TEST_GIT: ${{ steps.tools.outputs.git }}
+          PERSONA_TEST_GPG: ${{ steps.tools.outputs.gpg }}
+          PERSONA_TEST_NATIVE_GH: ${{ steps.tools.outputs.gh }}
+          PERSONA_TEST_ZSH: ${{ steps.tools.outputs.zsh }}
+          PERSONA_TEST_SSH: ${{ steps.tools.outputs.ssh }}
+          PERSONA_TEST_SSH_KEYGEN: ${{ steps.tools.outputs.ssh_keygen }}
+          PERSONA_TEST_SSH_AGENT: ${{ steps.tools.outputs.ssh_agent }}
+          PERSONA_TEST_SSH_ADD: ${{ steps.tools.outputs.ssh_add }}
+          PERSONA_TEST_SSHD: ${{ steps.tools.outputs.sshd }}
+          PERSONA_TEST_OPENSSL: ${{ steps.tools.outputs.openssl }}
+          PERSONA_TEST_CAT: ${{ steps.tools.outputs.cat }}
+          PERSONA_TEST_COREUTILS: /usr/bin
+          PERSONA_TEST_LOCAL_HTTPS_TRUSTED: ${{ runner.os == 'Linux' && '1' || '' }}
+        run: cargo test --locked --all-targets -- --nocapture --test-threads=1
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Nix package and fixture checks
+        run: nix flake check --system "$(nix eval --raw --impure --expr builtins.currentSystem)" --show-trace
