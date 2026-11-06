@@ -359,9 +359,12 @@ This is not process, Keychain, network, or anonymity isolation.
 
 The `v0.1.0-rc.1` flake builds native packages for Apple Silicon macOS
 (`aarch64-darwin`), Linux arm64 (`aarch64-linux`), and Linux x86_64
-(`x86_64-linux`). The locked Cargo suite, Clippy, formatting, Rust 1.85
-compatibility check, and native Nix checks are exercised by CI on those three
-runner architectures. Nix's sandbox explicitly skips the local loopback TLS and
+(`x86_64-linux`). CI is configured to run the locked Cargo suite, Clippy,
+formatting, Rust 1.85 compatibility, and Nix checks on the three architectures.
+For this private repository, GitHub currently returns `startup_failure` before
+creating jobs, so that configuration is not evidence of a successful hosted CI
+run. See the release notes for the local validation actually performed. Nix's
+sandbox explicitly skips the local loopback TLS and
 SSH-server tests; the same transport fixtures run on the isolated Linux hosts
 outside the Nix sandbox. In OrbStack, Nix validation requires
 `--option filter-syscalls false` while keeping the build sandbox enabled; this
@@ -392,8 +395,7 @@ module:
 
 ```nix
 # Existing flake inputs:
-inputs.persona.url =
-  "git+ssh://git@github.com/yanfsb/persona?ref=v0.1.0-rc.1";
+inputs.persona.url = "github:yanfsb/persona/v0.1.0-rc.1";
 
 # Existing Home Manager module, with persona passed as a module argument:
 { pkgs, persona, ... }:
