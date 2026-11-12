@@ -23,6 +23,7 @@ test:
   PERSONA_TEST_SSHD="$(command -v sshd)" \
   PERSONA_TEST_OPENSSL="$(command -v openssl)" \
   PERSONA_TEST_CAT="$(command -v cat)" \
+  PERSONA_TEST_CP="$(command -v cp)" \
   PERSONA_TEST_COREUTILS="$(dirname "$(command -v cat)")" \
   cargo test --locked --all-targets -- --nocapture --test-threads=1
 

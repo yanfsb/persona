@@ -336,12 +336,9 @@ fn write_gpg_replacement_wrapper(
 ) {
     use std::os::unix::fs::PermissionsExt;
 
-    let cp = std::env::var_os("PERSONA_TEST_COREUTILS")
-        .map(PathBuf::from)
-        .map(|directory| directory.join("cp"))
-        .unwrap_or_else(|| PathBuf::from("/bin/cp"));
+    let cp = executable("cp", "PERSONA_TEST_CP").expect("cp is required for signing tests");
     let script = format!(
-        "#!/bin/sh\nif [ ! -e {marker} ]; then\n  : > {marker}\n  {cp} -f {replacement} {source}\nfi\nexec {real_gpg} \"$@\"\n",
+        "#!/bin/sh\nif [ ! -e {marker} ]; then\n  if {cp} -f {replacement} {source}; then\n    printf copied > {marker}\n  else\n    printf copy-failed > {marker}\n  fi\nfi\nexec {real_gpg} \"$@\"\n",
         marker = shell_quote(marker),
         cp = shell_quote(&cp),
         replacement = shell_quote(replacement),
@@ -473,7 +470,11 @@ fn stages_key_bytes_before_the_configured_path_can_be_replaced() {
     let keyring = GpgClient::new(wrapper)
         .isolated_keyring(&public_key)
         .expect("staged public bytes should survive source replacement");
-    assert!(marker.exists(), "replacement wrapper was not invoked");
+    assert_eq!(
+        fs::read(&marker).expect("replacement wrapper must report its copy result"),
+        b"copied",
+        "replacement wrapper did not copy the key; check PERSONA_TEST_CP",
+    );
     assert_eq!(
         GpgClient::new(real_gpg)
             .configured_primary_fingerprint(keyring.path(), &fingerprint)

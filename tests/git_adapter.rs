@@ -1059,7 +1059,12 @@ fn managed_https_push_succeeds_and_rejects_a_server_update_race() {
     assert!(
         rejection.contains("non-fast-forward")
             || rejection.contains("failed to update ref")
-            || rejection.contains("stale info"),
+            || rejection.contains("stale info")
+            || (rejection.contains("incorrect old value provided")
+                && rejection.contains(&racing_oid))
+            || (rejection.contains("cannot lock ref 'refs/heads/main'")
+                && rejection.contains(&racing_oid)
+                && rejection.contains(&pushed_oid)),
         "push failure must be attributable to the server's stale-ref rejection, not an unrelated local guard: {rejection}"
     );
     assert_eq!(
