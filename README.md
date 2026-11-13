@@ -50,7 +50,7 @@ The project currently documents source builds and Nix packaging for Apple Silico
 
 ## Status and validation
 
-The current source declares macOS arm64 and Linux arm64/x86_64 targets. A target is not a promise of stable support. Hosted CI passed on all three platforms for the CI-fix commit `e61a72d`; that run does not cover this candidate branch or validate a release candidate. A new public RC still requires CI on its exact candidate commit and installation smoke checks. The limited pilot did not test managed publication. See the [evidence matrix](docs/implementation-matrix.md) and [release checklist](docs/releasing.md).
+The current source declares macOS arm64 and Linux arm64/x86_64 targets. A target is not a promise of stable support. Hosted CI passed on all three platforms for the CI-fix commit `e61a72d` and for the open-source-preparation candidate commit `a30dfa2` ([run 43361382293](https://github.com/yanfsb/persona/actions/runs/43361382293)), including the workflow Nix checks. This is not a release-readiness claim; a new public RC still requires CI on its exact candidate commit and installation smoke checks. The limited pilot did not test managed publication. See the [evidence matrix](docs/implementation-matrix.md) and [release checklist](docs/releasing.md).
 
 ## License
 
