@@ -43,19 +43,20 @@ jobs:
         id: tools
         shell: bash
         run: |
-          for tool in git gpg gh zsh ssh ssh-keygen ssh-agent ssh-add openssl cat; do
+          for tool in git gpg gh zsh ssh ssh-keygen ssh-agent ssh-add openssl cat cp; do
             path="$(command -v "$tool")"
             if [[ -z "$path" ]]; then echo "missing test tool: $tool" >&2; exit 1; fi
             key="${tool//-/_}"
             echo "$key=$path" >> "$GITHUB_OUTPUT"
           done
+          echo "coreutils=$(dirname "$(command -v cat)")" >> "$GITHUB_OUTPUT"
           if [[ "$RUNNER_OS" == Linux ]]; then
             echo "sshd=$(command -v sshd)" >> "$GITHUB_OUTPUT"
           else
             echo "sshd=" >> "$GITHUB_OUTPUT"
           fi
       - name: Rust 1.85 MSRV
-        run: cargo +1.85 check --locked --all-targets
+        run: cargo +1.85 check --locked --all-targets --features test-support
       - name: Assert runner architecture
         run: |
           case "${{ matrix.label }}" in
@@ -70,6 +71,8 @@ jobs:
           fi
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Documentation
+        run: cargo test --locked --test documentation
       - name: Locked provider-free fixture tests
         env:
           PERSONA_TEST_GIT: ${{ steps.tools.outputs.git }}
@@ -83,11 +86,12 @@ jobs:
           PERSONA_TEST_SSHD: ${{ steps.tools.outputs.sshd }}
           PERSONA_TEST_OPENSSL: ${{ steps.tools.outputs.openssl }}
           PERSONA_TEST_CAT: ${{ steps.tools.outputs.cat }}
-          PERSONA_TEST_COREUTILS: /usr/bin
+          PERSONA_TEST_CP: ${{ steps.tools.outputs.cp }}
+          PERSONA_TEST_COREUTILS: ${{ steps.tools.outputs.coreutils }}
           PERSONA_TEST_LOCAL_HTTPS_TRUSTED: ${{ runner.os == 'Linux' && '1' || '' }}
-        run: cargo test --locked --all-targets -- --nocapture --test-threads=1
+        run: cargo test --locked --all-targets --features test-support -- --nocapture --test-threads=1
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --features test-support -- -D warnings
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:

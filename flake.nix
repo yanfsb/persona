@@ -60,14 +60,14 @@
             PERSONA_TEST_SKIP_LOCAL_TLS = "Nix sandbox loopback TLS is not reliable for the local Git transport fixture";
             PERSONA_TEST_SKIP_LOCAL_HTTPS_PUSH = "Nix sandbox does not install the synthetic CA in system trust";
             checkPhase = ''
-              cargo test --workspace --all-targets --locked -- --nocapture --test-threads=1
+              cargo test --workspace --all-targets --features test-support --locked -- --nocapture --test-threads=1
             '';
           };
           clippy = mkRustPackage pkgs {
             nativeBuildInputs = (testTools pkgs) ++ [ pkgs.clippy ];
             doCheck = true;
             checkPhase = ''
-              cargo clippy --workspace --all-targets --locked -- -D warnings
+              cargo clippy --workspace --all-targets --features test-support --locked -- -D warnings
             '';
           };
           fmt = pkgs.runCommand "persona-fmt" {

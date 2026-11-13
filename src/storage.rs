@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tempfile::{Builder, NamedTempFile};
@@ -10,6 +10,11 @@ pub struct PersonaPaths {
     pub config_file: PathBuf,
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
+}
+
+/// Advisory process lock for a complete private-config read/modify/write.
+pub struct ConfigUpdateLock {
+    _file: File,
 }
 
 #[derive(Debug)]
@@ -74,6 +79,87 @@ impl PersonaPaths {
             }
         }
         Ok(())
+    }
+
+    /// Serialize config mutations across Persona processes. Keep the returned
+    /// guard alive from before loading the config until after writing it.
+    pub fn lock_config_update(&self) -> Result<ConfigUpdateLock, StorageError> {
+        self.ensure_private_directories()?;
+        self.validate_private_state()?;
+        let path = self.state_dir.join("config-update.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|source| io_error(&path, source))?;
+        let metadata = file.metadata().map_err(|source| io_error(&path, source))?;
+        if !metadata.is_file() {
+            return Err(StorageError::UnsafeFile(path));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+                || metadata.nlink() != 1
+            {
+                return Err(StorageError::UnsafeFile(path));
+            }
+            use std::os::fd::AsRawFd;
+            #[cfg(feature = "test-support")]
+            let mut acquired =
+                if let Some(marker) = env::var_os("PERSONA_TEST_CONFIG_LOCK_CONTENDED") {
+                    // Test-only signal: emit it only after the kernel confirms that
+                    // another process currently owns the exclusive lock.
+                    // SAFETY: `file` remains open for the lifetime of the guard.
+                    let result =
+                        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                    if result == 0 {
+                        true
+                    } else {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::WouldBlock {
+                            return Err(io_error(&path, error));
+                        }
+                        let marker = PathBuf::from(marker);
+                        OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&marker)
+                            .map_err(|source| io_error(&marker, source))?;
+                        false
+                    }
+                } else {
+                    false
+                };
+            #[cfg(not(feature = "test-support"))]
+            let mut acquired = false;
+            while !acquired {
+                // SAFETY: `file` remains open for the lifetime of the returned guard.
+                let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if result == 0 {
+                    acquired = true;
+                    continue;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(io_error(&path, error));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(io_error(
+            &path,
+            io::Error::new(io::ErrorKind::Unsupported, "config locking requires Unix"),
+        ));
+        Ok(ConfigUpdateLock { _file: file })
     }
 
     pub fn validate_private_config(&self) -> Result<(), StorageError> {
@@ -289,7 +375,7 @@ fn io_error(path: impl AsRef<OsStr>, source: io::Error) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::{PersonaPaths, StorageError};
-    use std::fs;
+    use std::fs::{self, File};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -330,6 +416,60 @@ mod tests {
             ),
             Err(StorageError::RelativeXdgPath(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_update_lock_excludes_other_open_file_descriptions() {
+        use std::os::fd::AsRawFd;
+        let temporary = tempdir().unwrap();
+        let paths = PersonaPaths::from_environment(Some(temporary.path()), None, None).unwrap();
+        let first = paths.lock_config_update().unwrap();
+        let lock_path = paths.state_dir.join("config-update.lock");
+        let second = File::open(lock_path).unwrap();
+        // SAFETY: both descriptors remain open during the nonblocking lock attempt.
+        assert_ne!(
+            unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(first);
+        // SAFETY: `second` remains open and the first advisory lock was released.
+        assert_eq!(
+            unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serialized_config_updates_read_the_latest_contents() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let temporary = tempdir().unwrap();
+        let paths = PersonaPaths::from_environment(Some(temporary.path()), None, None).unwrap();
+        paths.write_config(b"base").unwrap();
+        let first_lock = paths.lock_config_update().unwrap();
+        let first_snapshot = fs::read(&paths.config_file).unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let second_paths = paths.clone();
+        let second = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = second_paths.lock_config_update().unwrap();
+            let mut contents = fs::read(&second_paths.config_file).unwrap();
+            contents.extend_from_slice(b"-second");
+            second_paths.write_config(&contents).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let mut first_contents = first_snapshot;
+        first_contents.extend_from_slice(b"-first");
+        paths.write_config(&first_contents).unwrap();
+        drop(first_lock);
+        second.join().unwrap();
+
+        assert_eq!(fs::read(&paths.config_file).unwrap(), b"base-first-second");
     }
 
     #[cfg(unix)]

@@ -1,6 +1,7 @@
 use crate::credential::{sign_private_state_payload, verify_private_state_payload};
 use crate::storage::PersonaPaths;
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -72,7 +73,24 @@ pub fn write(paths: &PersonaPaths, handoff: &PushHandoff) -> Result<NamedTempFil
     Ok(file)
 }
 
+pub struct LockedPushHandoff {
+    handoff: PushHandoff,
+    _file: File,
+}
+
+impl LockedPushHandoff {
+    pub fn handoff(&self) -> &PushHandoff {
+        &self.handoff
+    }
+}
+
 pub fn read(paths: &PersonaPaths, path: &Path) -> Result<PushHandoff, String> {
+    read_locked(paths, path).map(|locked| locked.handoff.clone())
+}
+
+/// Read a one-time handoff while holding an exclusive nonblocking lock on the
+/// opened file. The caller must keep the returned guard alive through consume.
+pub fn read_locked(paths: &PersonaPaths, path: &Path) -> Result<LockedPushHandoff, String> {
     paths
         .validate_private_state()
         .map_err(|_| "push handoff state directory is not private".to_owned())?;
@@ -86,9 +104,10 @@ pub fn read(paths: &PersonaPaths, path: &Path) -> Result<PushHandoff, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    let file = options
+    let mut file = options
         .open(path)
         .map_err(|_| "push handoff file is unavailable or unsafe".to_owned())?;
+    lock_handoff_file(&file)?;
     let metadata = file
         .metadata()
         .map_err(|_| "cannot inspect private push handoff".to_owned())?;
@@ -106,7 +125,8 @@ pub fn read(paths: &PersonaPaths, path: &Path) -> Result<PushHandoff, String> {
         }
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_HANDOFF_BYTES + 1)
+    (&mut file)
+        .take(MAX_HANDOFF_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "cannot read private push handoff".to_owned())?;
     if bytes.len() as u64 > MAX_HANDOFF_BYTES {
@@ -122,8 +142,30 @@ pub fn read(paths: &PersonaPaths, path: &Path) -> Result<PushHandoff, String> {
     {
         return Err("push handoff authentication failed".to_owned());
     }
-    serde_json::from_str(&envelope.payload)
-        .map_err(|_| "push handoff payload is malformed".to_owned())
+    let handoff = serde_json::from_str(&envelope.payload)
+        .map_err(|_| "push handoff payload is malformed".to_owned())?;
+    Ok(LockedPushHandoff {
+        handoff,
+        _file: file,
+    })
+}
+
+fn lock_handoff_file(file: &File) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` remains open for the lifetime of the lock guard.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err("push handoff is already being consumed".to_owned());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err("one-time push handoff locking is unsupported on this platform".to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +214,19 @@ mod tests {
 
         fs::write(file.path(), b"{}").unwrap();
         assert!(read(&paths, file.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_one_process_can_hold_a_handoff_for_authorization() {
+        let temporary = tempdir().unwrap();
+        let paths = paths(temporary.path());
+        let file = write(&paths, &handoff()).unwrap();
+
+        let first = super::read_locked(&paths, file.path()).unwrap();
+        assert!(super::read_locked(&paths, file.path()).is_err());
+        drop(first);
+        assert!(super::read_locked(&paths, file.path()).is_ok());
     }
 
     #[test]

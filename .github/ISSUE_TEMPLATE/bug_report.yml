@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible Persona defect.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include tokens, private keys, credentials, real identity data, private repository URLs, or unredacted configuration/logs. For suspected vulnerabilities, use private reporting instead of this public form.
+  - type: input
+    id: version
+    attributes:
+      label: Persona version or commit
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic identities, a disposable repository, and redacted paths.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Checks already performed
+    validations:
+      required: false
