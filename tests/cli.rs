@@ -15,6 +15,192 @@ fn persona_command(directory: &Path) -> Command {
     command
 }
 
+#[cfg(all(unix, feature = "test-support"))]
+#[test]
+fn concurrent_scope_add_commands_preserve_both_updates() {
+    use persona::config::Config;
+    use persona::storage::PersonaPaths;
+    use std::time::{Duration, Instant};
+
+    let temporary = tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let config_home = temporary.path().join("config-home");
+    let state_home = temporary.path().join("state-home");
+    let base_scope = temporary.path().join("base");
+    let first_scope = temporary.path().join("first-scope");
+    let second_scope = temporary.path().join("second-scope");
+    for directory in [&home, &base_scope, &first_scope, &second_scope] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let paths =
+        PersonaPaths::from_environment(Some(&home), Some(&config_home), Some(&state_home)).unwrap();
+    let base_path = toml::Value::String(
+        base_scope
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let config = format!(
+        r#"version = 3
+
+[[profiles]]
+name = "work"
+[profiles.git]
+author = {{ name = "Synthetic", email = "author@example.invalid" }}
+committer = {{ name = "Synthetic", email = "committer@example.invalid" }}
+
+[[scopes]]
+name = "base"
+path = {base_path}
+profile = "work"
+"#
+    );
+    paths.create_config(config.as_bytes()).unwrap();
+
+    let gate = temporary.path().join("git-gate");
+    fs::create_dir(&gate).unwrap();
+    let real_git =
+        PathBuf::from(std::env::var_os("PERSONA_TEST_GIT").expect("test Git executable"));
+    let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+
+    // The first CLI pauses in Git after loading config while holding the
+    // update lock. The second signals only after the kernel confirms contention.
+    let launch =
+        |gate_id: &str, scope_name: &str, scope_path: &Path, contention_marker: Option<&Path>| {
+            let git_wrapper = temporary.path().join(format!("git-wrapper-{gate_id}"));
+            let wrapper_script = format!(
+                r#"#!/bin/sh
+set -eu
+gate_dir={}
+gate_id={}
+real_git={}
+printf '%s\n' "$*" >> "$gate_dir/calls-$gate_id"
+if [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then
+    : > "$gate_dir/entered-$gate_id"
+    attempt=0
+    while [ ! -f "$gate_dir/release" ]; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 2000 ] || exit 98
+        /bin/sleep 0.01
+    done
+fi
+exec "$real_git" "$@"
+"#,
+                shell_quote(&gate.to_string_lossy()),
+                shell_quote(gate_id),
+                shell_quote(&real_git.to_string_lossy()),
+            );
+            fs::write(&git_wrapper, wrapper_script).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&git_wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let mut command = Command::new(env!("CARGO_BIN_EXE_persona"));
+            command
+                .env_clear()
+                .current_dir(temporary.path())
+                .args(["scope", "add", scope_name])
+                .arg(scope_path)
+                .args(["--profile", "work"])
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &config_home)
+                .env("XDG_STATE_HOME", &state_home)
+                .env("PERSONA_GIT", &git_wrapper);
+            if let Some(marker) = contention_marker {
+                command.env("PERSONA_TEST_CONFIG_LOCK_CONTENDED", marker);
+            }
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+
+    let first = launch("first", "first", &first_scope, None);
+    let first_entered = gate.join("entered-first");
+    let first_deadline = Instant::now() + Duration::from_secs(10);
+    while !first_entered.exists() {
+        if Instant::now() >= first_deadline {
+            fs::write(gate.join("release"), b"release").unwrap();
+            let output = first.wait_with_output().unwrap();
+            panic!(
+                "first CLI never reached gated Git: calls={:?}, status={}, stderr={}",
+                fs::read_to_string(gate.join("calls-first")),
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let contention_marker = temporary.path().join("config-lock-contended");
+    let second = launch("second", "second", &second_scope, Some(&contention_marker));
+    let contention_deadline = Instant::now() + Duration::from_secs(10);
+    while !contention_marker.exists() {
+        if Instant::now() >= contention_deadline {
+            fs::write(gate.join("release"), b"release").unwrap();
+            drop(first.wait_with_output().unwrap());
+            let second_output = second.wait_with_output().unwrap();
+            panic!(
+                "second CLI never observed config-lock contention; second entered Git={}, status={}, stderr={}",
+                gate.join("entered-second").exists(),
+                second_output.status,
+                String::from_utf8_lossy(&second_output.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    fs::write(gate.join("release"), b"release").unwrap();
+
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+    assert!(
+        first_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        second_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+
+    let config = Config::load(&paths.config_file).unwrap();
+    for expected in ["base", "first", "second"] {
+        assert!(
+            config.policies().iter().any(|scope| scope.name == expected),
+            "concurrent updates lost scope `{expected}`"
+        );
+    }
+}
+
+#[test]
+fn handoff_lock_helper_process() {
+    let Ok(handoff_path) = std::env::var("PERSONA_TEST_HANDOFF_LOCK_PATH") else {
+        return;
+    };
+    use persona::push_handoff::read_locked;
+    use persona::storage::PersonaPaths;
+    use std::time::{Duration, Instant};
+
+    let paths = PersonaPaths::discover().unwrap();
+    let guard = read_locked(&paths, Path::new(&handoff_path)).unwrap();
+    let ready = PathBuf::from(std::env::var_os("PERSONA_TEST_HANDOFF_LOCK_READY").unwrap());
+    let release = PathBuf::from(std::env::var_os("PERSONA_TEST_HANDOFF_LOCK_RELEASE").unwrap());
+    fs::write(ready, b"locked").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !release.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "parent did not release handoff lock"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(guard);
+}
+
 fn write_policy(path: &Path, scope_root: &Path) {
     let root = scope_root
         .to_str()
@@ -1593,15 +1779,53 @@ profile = "work"
     );
 
     let race_handoff = write(&paths, &handoff).unwrap();
-    let first = spawn_hook(race_handoff.path(), &input);
-    let second = spawn_hook(race_handoff.path(), &input);
-    let first = first.wait_with_output().unwrap();
-    let second = second.wait_with_output().unwrap();
-    assert_ne!(
-        first.status.success(),
-        second.status.success(),
-        "a one-time handoff must authorize at most one concurrent hook invocation"
+    let helper_binary = std::env::current_exe().unwrap();
+    let ready = temporary.path().join("handoff-lock.ready");
+    let release = temporary.path().join("handoff-lock.release");
+    let mut holder = Command::new(helper_binary)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_TEST_HANDOFF_LOCK_PATH", race_handoff.path())
+        .env("PERSONA_TEST_HANDOFF_LOCK_READY", &ready)
+        .env("PERSONA_TEST_HANDOFF_LOCK_RELEASE", &release)
+        .args(["--exact", "handoff_lock_helper_process", "--nocapture"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handoff-lock helper never acquired the handoff"
+        );
+        assert!(
+            holder.try_wait().unwrap().is_none(),
+            "handoff-lock helper exited early"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let competing_hook = run_hook(race_handoff.path(), &input);
+    fs::write(&release, b"release").unwrap();
+    let holder_output = holder.wait_with_output().unwrap();
+    assert!(
+        holder_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&holder_output.stderr)
     );
+    assert!(
+        !competing_hook.status.success(),
+        "a hook must fail while another process holds the one-time handoff lock"
+    );
+    let after_release = run_hook(race_handoff.path(), &input);
+    assert_eq!(
+        after_release.status.code(),
+        Some(0),
+        "a failed concurrent contender must not consume the held handoff: {}",
+        String::from_utf8_lossy(&after_release.stderr)
+    );
+    assert!(!race_handoff.path().exists());
 
     let original_config = fs::read(&config).unwrap();
     let config_handoff = write(&paths, &handoff).unwrap();

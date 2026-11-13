@@ -6,7 +6,7 @@ use persona::authorization::{
 use persona::config::{Config, GitPolicy, Identity, Profile};
 use persona::git::{GitClient, PushTuple};
 use persona::report::{Report, Status, exit_code};
-use persona::storage::PersonaPaths;
+use persona::storage::{ConfigUpdateLock, PersonaPaths};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -147,7 +147,7 @@ enum InstallCommands {
 
 #[derive(Subcommand)]
 enum ConfigCommands {
-    /// Print a v2 migration preview without modifying the source file.
+    /// Print a v3 migration preview without modifying the source file.
     Migrate {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -480,9 +480,12 @@ fn main() -> ExitCode {
                         let directory = absolute_path(&args.cwd, &current);
                         let mut request = PushRequest { remote, destination, tuples, leases: Vec::new() };
                         let primary_handoff = args.primary_handoff;
-                        let handoff_binding = primary_handoff.as_deref().map(|path| {
+                        let validated_handoff = primary_handoff.as_deref().map(|path| {
                             validate_primary_handoff(path, &config, &directory, &mut request)
-                        }).transpose()?.flatten();
+                        }).transpose()?;
+                        let handoff_binding = validated_handoff
+                            .as_ref()
+                            .and_then(|handoff| handoff.github_binding.clone());
                         let exit = show_status(&config, &directory, format, args.verbose, Some(request), handoff_binding, args.online_verified)?;
                         if exit == 0 {
                             if let Some(path) = primary_handoff {
@@ -3791,15 +3794,21 @@ fn consume_primary_handoff(path: &Path) -> Result<(), String> {
         .map_err(|_| "cannot consume one-time primary push authorization handoff".to_owned())
 }
 
+struct ValidatedPrimaryHandoff {
+    github_binding: Option<persona::push_handoff::HandoffGithubBinding>,
+    _lock: persona::push_handoff::LockedPushHandoff,
+}
+
 fn validate_primary_handoff(
     handoff_path: &Path,
     config_path: &Path,
     directory: &Path,
     request: &mut PushRequest,
-) -> Result<Option<persona::push_handoff::HandoffGithubBinding>, String> {
+) -> Result<ValidatedPrimaryHandoff, String> {
     let paths = PersonaPaths::discover()
         .map_err(|_| "cannot resolve private state for push handoff verification".to_owned())?;
-    let handoff = persona::push_handoff::read(&paths, handoff_path)?;
+    let locked_handoff = persona::push_handoff::read_locked(&paths, handoff_path)?;
+    let handoff = locked_handoff.handoff();
     let config_path = std::fs::canonicalize(config_path)
         .map_err(|_| "cannot resolve current policy for push handoff verification".to_owned())?;
     let handoff_config = std::fs::canonicalize(&handoff.config_path)
@@ -3888,7 +3897,10 @@ fn validate_primary_handoff(
     if handoff.github_binding != binding {
         return Err("enrolled GitHub binding changed after primary push authorization".to_owned());
     }
-    Ok(binding)
+    Ok(ValidatedPrimaryHandoff {
+        github_binding: binding,
+        _lock: locked_handoff,
+    })
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -4463,6 +4475,9 @@ fn preview_config_migration(config_path: &Path) -> Result<u8, String> {
 fn apply_config_migration() -> Result<u8, String> {
     let paths = PersonaPaths::discover()
         .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+    let _update_lock = paths
+        .lock_config_update()
+        .map_err(|error| format!("cannot lock private configuration for migration: {error:?}"))?;
     paths
         .validate_private_config()
         .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
@@ -4487,6 +4502,9 @@ fn apply_config_migration() -> Result<u8, String> {
 fn rollback_config(backup: &Path) -> Result<u8, String> {
     let paths = PersonaPaths::discover()
         .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+    let _update_lock = paths
+        .lock_config_update()
+        .map_err(|error| format!("cannot lock private configuration for rollback: {error:?}"))?;
     let previous = paths
         .rollback(backup)
         .map_err(|error| format!("cannot roll back configuration: {error:?}"))?;
@@ -4671,16 +4689,16 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
             Ok(0)
         }
         ProfileCommands::Add(args) => {
-            let mut config = load_private_config()?;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
             let preview = args.preview;
             let profile = profile_from_args(*args, None)?;
             config
                 .add_profile(profile)
                 .map_err(|error| format!("cannot add profile: {error:?}"))?;
-            persist_private_config(&config, preview)
+            persist_private_config(&paths, &update_lock, &config, preview)
         }
         ProfileCommands::Update(args) => {
-            let mut config = load_private_config()?;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
             let existing = config
                 .profiles()
                 .iter()
@@ -4692,14 +4710,14 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
             config
                 .update_profile(profile)
                 .map_err(|error| format!("cannot update profile: {error:?}"))?;
-            persist_private_config(&config, preview)
+            persist_private_config(&paths, &update_lock, &config, preview)
         }
         ProfileCommands::Remove { name, preview } => {
-            let mut config = load_private_config()?;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
             config
                 .remove_profile(&name)
                 .map_err(|error| format!("cannot remove profile: {error:?}"))?;
-            persist_private_config(&config, preview)
+            persist_private_config(&paths, &update_lock, &config, preview)
         }
     }
 }
@@ -5077,14 +5095,14 @@ fn scope_command(command: ScopeCommands) -> Result<u8, String> {
             profile,
             preview,
         } => {
-            let mut config = load_private_config()?;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
             let current = std::env::current_dir()
                 .map_err(|error| format!("cannot determine current directory: {error}"))?;
             let root = physical_scope_root(&absolute_path(&path, &current))?;
             config
                 .add_scope(name, root, &profile)
                 .map_err(|error| format!("cannot add scope: {error:?}"))?;
-            persist_private_config(&config, preview)
+            persist_private_config(&paths, &update_lock, &config, preview)
         }
         ScopeCommands::Update {
             name,
@@ -5092,21 +5110,21 @@ fn scope_command(command: ScopeCommands) -> Result<u8, String> {
             profile,
             preview,
         } => {
-            let mut config = load_private_config()?;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
             let current = std::env::current_dir()
                 .map_err(|error| format!("cannot determine current directory: {error}"))?;
             let root = physical_scope_root(&absolute_path(&path, &current))?;
             config
                 .update_scope(&name, root, &profile)
                 .map_err(|error| format!("cannot update scope: {error:?}"))?;
-            persist_private_config(&config, preview)
+            persist_private_config(&paths, &update_lock, &config, preview)
         }
         ScopeCommands::Remove { name, preview } => {
-            let mut config = load_private_config()?;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
             config
                 .remove_scope(&name)
                 .map_err(|error| format!("cannot remove scope: {error:?}"))?;
-            persist_private_config(&config, preview)
+            persist_private_config(&paths, &update_lock, &config, preview)
         }
     }
 }
@@ -5124,14 +5142,11 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             paths
                 .validate_private_config()
                 .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
-            let mut config = Config::load(&paths.config_file)
+            let config = Config::load(&paths.config_file)
                 .map_err(|error| format!("cannot load private configuration: {error:?}"))?;
-            let existing = config
-                .profiles()
-                .iter()
-                .find(|item| item.name == profile)
-                .cloned()
-                .ok_or_else(|| format!("profile `{profile}` does not exist"))?;
+            if !config.profiles().iter().any(|item| item.name == profile) {
+                return Err(format!("profile `{profile}` does not exist"));
+            }
             let gh = gh_executable().ok_or_else(|| {
                 "cannot find gh; set PERSONA_GH to an absolute gh executable".to_owned()
             })?;
@@ -5142,12 +5157,18 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             let binding = selector
                 .enroll(confirm_online, &user)
                 .map_err(|error| format!("GitHub enrollment failed: {error:?}"))?;
-            let mut updated = existing;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
+            let mut updated = config
+                .profiles()
+                .iter()
+                .find(|item| item.name == profile)
+                .cloned()
+                .ok_or_else(|| format!("profile `{profile}` was removed during enrollment"))?;
             updated.github = Some(binding.clone());
             config
                 .update_profile(updated)
                 .map_err(|error| format!("cannot bind GitHub account: {error:?}"))?;
-            persist_private_config(&config, false)?;
+            persist_private_config(&paths, &update_lock, &config, false)?;
             println!(
                 "Bound stable GitHub account ID {} on {} to profile `{}`.",
                 binding.account_id, binding.host, profile
@@ -5199,7 +5220,7 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             }
         }
         AuthCommands::Unbind { profile, preview } => {
-            let mut config = load_private_config()?;
+            let (paths, update_lock, mut config) = load_private_config_for_update()?;
             let mut profile_config = config
                 .profiles()
                 .iter()
@@ -5213,7 +5234,7 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             config
                 .update_profile(profile_config)
                 .map_err(|error| format!("cannot remove GitHub binding: {error:?}"))?;
-            persist_private_config(&config, preview)
+            persist_private_config(&paths, &update_lock, &config, preview)
         }
     }
 }
@@ -5233,9 +5254,26 @@ fn load_private_config() -> Result<Config, String> {
         .map_err(|error| format!("cannot load private configuration: {error:?}"))
 }
 
-fn persist_private_config(config: &Config, preview: bool) -> Result<u8, String> {
+fn load_private_config_for_update() -> Result<(PersonaPaths, ConfigUpdateLock, Config), String> {
     let paths = PersonaPaths::discover()
         .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+    let update_lock = paths
+        .lock_config_update()
+        .map_err(|error| format!("cannot lock private configuration for update: {error:?}"))?;
+    paths
+        .validate_private_config()
+        .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+    let config = Config::load(&paths.config_file)
+        .map_err(|error| format!("cannot load private configuration: {error:?}"))?;
+    Ok((paths, update_lock, config))
+}
+
+fn persist_private_config(
+    paths: &PersonaPaths,
+    _update_lock: &ConfigUpdateLock,
+    config: &Config,
+    preview: bool,
+) -> Result<u8, String> {
     paths
         .validate_private_config()
         .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
