@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a scoped change to Persona.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Persona is a bounded release candidate. Describe the use case and constraints; do not include credentials, private keys, private repository data, or personal paths.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Compatibility and security considerations
+    validations:
+      required: false

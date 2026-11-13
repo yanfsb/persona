@@ -1,6 +1,6 @@
 # ADR-0001: Directory-scoped identity guardrails
 
-- **Status:** Accepted; implementation in progress
+- **Status:** Accepted; implementation evidence is tracked separately in the [current matrix](../implementation-matrix.md)
 - **Date:** 2026-10-29
 - **Decision owners:** Persona maintainers
 - **Platforms:** macOS and Linux, first-class targets
@@ -9,7 +9,7 @@
 
 Persona began as a read-only auditor. The product requirement is broader: let a developer use distinct Git, signing, SSH and GitHub identities in different directory contexts on one OS account, preserve ordinary `git` and `gh` workflows, and block accidental use of a mismatched identity before presenting credentials to a remote in supported paths.
 
-The existing auditor resolves physical checkout roots and observes Git/OpenPGP state, but it does not choose an identity, mediate normal Git/GitHub commands, or prevent an operation. Its current aggregate status also includes informational `UNKNOWN` findings, so it is not a suitable authorization decision. The old [`sketch.md`](../../sketch.md) and [`directory-scoped.md`](../../directory-scoped.md) are historical proposals, not the implementation contract.
+This ADR records the architectural decision, not a current acceptance checklist. The initial auditor-era drafts are curated in [`docs/archive`](../archive/README.md) and are not the implementation contract. Current CLI behavior is documented in the [user guides](../README.md); current implementation evidence and gaps belong in the [implementation matrix](../implementation-matrix.md).
 
 The system operates within one macOS or Linux user account. Personas share that user's filesystem, processes, environment, credential stores and agents. This ADR addresses operational mistakes in integrated paths; it does not promise a security sandbox, immunity to a malicious same-user program, or anonymity.
 
