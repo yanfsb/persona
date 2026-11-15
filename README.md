@@ -2,7 +2,7 @@
 
 Persona is a directory-scoped Git/GitHub identity guardrail for developers who use more than one identity on the same macOS or Linux account. Its managed adapters check a bounded set of commands against a local profile before delegation.
 
-> **Release candidate:** `0.1.0-rc.1` remains private. A limited real-account pilot verified account binding, repository metadata reads, and SSH fetch; managed publication and production use have not been exercised. Do not rely on this release candidate as a production security boundary.
+> **Release candidate:** `0.1.1-rc.1` is a patch candidate following `0.1.0-rc.1`. A limited real-account pilot verified account binding, repository metadata reads, and SSH fetch; managed publication and production use have not been exercised. Do not rely on this release candidate as a production security boundary.
 
 Persona is **not** a sandbox, firewall, anonymity system, or universal Git/GitHub replacement. Direct native binaries and hostile processes running as the same OS user can bypass its managed paths. See the [security model](docs/security-model.md) before use.
 

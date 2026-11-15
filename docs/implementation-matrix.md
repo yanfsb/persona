@@ -6,16 +6,16 @@ This matrix distinguishes source implementation, local tests, and hosted CI. A t
 
 | Item | Current evidence | Status |
 |---|---|---|
-| Version | `0.1.0-rc.1`; historical release note at [`releases/v0.1.0-rc.1.md`](releases/v0.1.0-rc.1.md) | Private release candidate; no public release readiness claim |
+| Version | `0.1.1-rc.1`; historical predecessor at [`releases/v0.1.0-rc.1.md`](releases/v0.1.0-rc.1.md); candidate note at [`releases/v0.1.1-rc.1.md`](releases/v0.1.1-rc.1.md) | Patch release candidate; do not treat as a stable or production-security release |
 | Declared targets | Apple Silicon macOS, Linux arm64, Linux x86_64 (`Cargo.toml`, CI matrix) | Target declaration only |
 | CI-fix branch | Run [43128664622](https://github.com/yanfsb/persona/actions/runs/43128664622), commit `e61a72d` on `fix/ci-fixtures` | Passed on Linux x86_64, Linux arm64, and macOS arm64; this run predates and does not cover the open-source-preparation candidate. |
-| Open-source-preparation candidate | Run [43361382293](https://github.com/yanfsb/persona/actions/runs/43361382293), commit `a30dfa2` on `docs/open-source-prep` | Passed on Linux x86_64, Linux arm64, and macOS arm64, including the workflow Nix checks. This is not a new release tag or a public-release approval. |
+| Merged open-source-preparation baseline | Run [43489260619](https://github.com/yanfsb/persona/actions/runs/43489260619), merge commit `d43baba` on `main` | Passed on Linux x86_64, Linux arm64, and macOS arm64, including the workflow Nix checks. This is not evidence for the new patch candidate. |
 | Earlier failed run | Run `42851871730`: Linux stale-ref race assertion and macOS key-staging fixture failed | Historical failures resolved by the CI-fix branch; preserve the RC1 release-time record below. |
 | Real-provider pilot | Account binding, repository metadata read, and SSH fetch were checked in a limited local pilot | Managed publication and production use were **not** exercised; no release-readiness claim. |
-| Private vulnerability reporting | Repository remains private; the API query returned 404, which does not establish whether the setting is disabled or unavailable | **Launch gate**; confirm channel availability, enable it, and verify monitored notifications. |
-| License/public visibility | MIT OR Apache-2.0 files and Cargo metadata are present in this candidate; GitHub still reports the repository private and no license metadata | **Launch gate**; confirm rights-holder attribution, publish the reviewed files, change visibility separately, and verify anonymous fetch. |
+| Private vulnerability reporting | GitHub API readback reports the channel enabled; repository owner `yanfsb` has admin access | Channel enabled. Notification delivery and monitoring are not independently observable from this workflow; confirm maintainer coverage before making support commitments. |
+| License/public visibility | GitHub reports public visibility and Apache-2.0 metadata; Cargo declares MIT OR Apache-2.0. The GitHub contributors endpoint lists only `yanfsb` | Public visibility and metadata are observed; sole-account contribution history does not itself establish separate legal rights-holder authority. |
 
-The CI-fix and open-source-preparation commits have green hosted runs on all three platforms. The open-source-preparation run also passed the workflow Nix checks on each runner. The next release candidate must have a green hosted run on its exact commit and installation smoke evidence for the released source/Nix package. Local test success does not substitute for that evidence. Do not mark a failed test skipped or retry-only to obtain a green badge.
+The CI-fix and merged open-source-preparation commits have green hosted runs on all three platforms; the merged main run also passed workflow Nix checks. The patch candidate must have a green hosted run on its exact commit and installation-smoke evidence for the released source/Nix package. Local test success does not substitute for that evidence. Do not mark a failed test skipped or retry-only to obtain a green badge.
 
 ## Source surfaces and tests
 

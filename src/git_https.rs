@@ -98,50 +98,75 @@ pub struct CredentialRequest {
     path: String,
 }
 
-/// Parse Git's credential-helper protocol without accepting embedded secrets,
-/// URL userinfo, duplicate keys, helper extensions, or unbounded input.
+/// Parse Git's credential-helper protocol while discarding unused metadata.
+/// Only the unique HTTPS destination fields participate in authorization;
+/// caller-supplied credentials and URL-based destination overrides are refused.
 pub fn parse_credential_request(input: &[u8]) -> Result<CredentialRequest, HttpsCredentialError> {
     if input.len() > MAX_CREDENTIAL_INPUT_BYTES {
         return Err(HttpsCredentialError::InputTooLarge);
     }
-    let text = std::str::from_utf8(input).map_err(|_| HttpsCredentialError::MalformedRequest)?;
     let mut fields = std::collections::HashMap::new();
-    let mut lines = text.split('\n');
     let mut terminated = false;
-    for line in lines.by_ref() {
+    let mut lines = input.split_inclusive(|byte| *byte == b'\n');
+    for raw_line in lines.by_ref() {
+        let has_newline = raw_line.ends_with(b"\n");
+        let mut line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        if has_newline {
+            line = line.strip_suffix(b"\r").unwrap_or(line);
+        }
         if line.is_empty() {
             terminated = true;
             break;
         }
-        if line.contains('\r') || line.contains('\0') {
+        if line.contains(&b'\r') || line.contains(&0) {
             return Err(HttpsCredentialError::MalformedRequest);
         }
-        let (name, value) = line
-            .split_once('=')
+        let separator = line
+            .iter()
+            .position(|byte| *byte == b'=')
             .ok_or(HttpsCredentialError::MalformedRequest)?;
-        if !matches!(name, "protocol" | "host" | "path" | "username")
-            || fields.insert(name, value).is_some()
+        let (name, value_with_separator) = line.split_at(separator);
+        let value = &value_with_separator[1..];
+        if name.is_empty()
+            || !name.iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+            })
         {
             return Err(HttpsCredentialError::MalformedRequest);
         }
+        let name = match name {
+            b"password" | b"credential" | b"oauth_refresh_token" | b"url" => {
+                return Err(HttpsCredentialError::MalformedRequest);
+            }
+            b"protocol" => "protocol",
+            b"host" => "host",
+            b"path" => "path",
+            b"username" => "username",
+            _ => continue,
+        };
+        let value = std::str::from_utf8(value)
+            .map_err(|_| HttpsCredentialError::MalformedRequest)?
+            .to_owned();
+        if fields.insert(name, value).is_some() {
+            return Err(HttpsCredentialError::MalformedRequest);
+        }
     }
-    if !terminated || lines.any(|line| !line.is_empty()) || fields.get("protocol") != Some(&"https")
-    {
+    if terminated && lines.any(|line| !line.is_empty()) {
         return Err(HttpsCredentialError::MalformedRequest);
     }
-    if fields.contains_key("username") && fields.get("username") != Some(&"x-access-token") {
+    if fields.get("protocol").map(String::as_str) != Some("https") {
         return Err(HttpsCredentialError::MalformedRequest);
     }
     let host = parse_credential_host(
         fields
             .get("host")
-            .copied()
+            .map(String::as_str)
             .ok_or(HttpsCredentialError::MalformedRequest)?,
     )?;
     let path = validate_repository_path(
         fields
             .get("path")
-            .copied()
+            .map(String::as_str)
             .ok_or(HttpsCredentialError::MalformedRequest)?,
     )?;
     Ok(CredentialRequest { host, path })
@@ -343,12 +368,38 @@ mod tests {
     }
 
     #[test]
+    fn accepts_standard_git_metadata_and_repeated_attributes() {
+        let request = parse_credential_request(
+            b"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=org/repo.git\nusername=another-hint\nwwwauth[]=Basic realm=fixture\nwwwauth[]=Bearer realm=fixture\nstate[]=helper=value\nunknown[]=\nunknown[]=opaque=value\nunknown=opaque=value\n\n",
+        )
+        .unwrap();
+        assert_eq!(request.host, "github.com");
+        assert_eq!(request.path, "org/repo.git");
+    }
+
+    #[test]
+    fn accepts_eof_terminated_and_crlf_credential_requests() {
+        for input in [
+            &b"protocol=https\nhost=github.com\npath=org/repo.git"[..],
+            &b"protocol=https\nhost=github.com\npath=org/repo.git\n"[..],
+            &b"protocol=https\r\nhost=github.com\r\npath=org/repo.git\r\n\r\n"[..],
+        ] {
+            let request = parse_credential_request(input).unwrap();
+            assert_eq!(request.host, "github.com");
+            assert_eq!(request.path, "org/repo.git");
+        }
+    }
+
+    #[test]
     fn refuses_credential_protocol_secrets_duplicates_and_userinfo() {
         for input in [
             &b"protocol=https\nhost=github.com\npath=org/repo\npassword=stolen\n\n"[..],
+            &b"protocol=https\nhost=github.com\npath=org/repo\ncredential=Bearer stolen\n\n"[..],
+            &b"protocol=https\nhost=github.com\npath=org/repo\noauth_refresh_token=stolen\n\n"[..],
             &b"protocol=https\nhost=github.com\nhost=evil.example\npath=org/repo\n\n"[..],
             &b"protocol=https\nhost=github.com\npath=org/repo\nurl=https://u:p@github.com/org/repo\n\n"[..],
             &b"protocol=https\nhost=github.com\npath=org/repo\n\nprotocol=https\nhost=evil.example\npath=org/other\n\n"[..],
+            &b"protocol=https\nhost=github.com\nhost=evil.example\npath=org/repo\n\n"[..],
             &b"protocol=http\nhost=github.com\npath=org/repo\n\n"[..],
             &b"protocol=https\nhost=github.com:444\npath=org/repo\n\n"[..],
         ] {

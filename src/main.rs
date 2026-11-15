@@ -1314,6 +1314,7 @@ fn run_managed_git() -> Result<u8, String> {
     if !native_git.is_absolute() || !native_git.is_file() {
         return Err("Persona requires an absolute, existing native Git executable".to_owned());
     }
+    let native_gh = gh_executable().filter(|path| path.is_absolute() && path.is_file());
     let home =
         tempfile::tempdir().map_err(|error| format!("cannot create isolated Git HOME: {error}"))?;
     let preflight_environment = vec![
@@ -2164,6 +2165,9 @@ fn run_managed_git() -> Result<u8, String> {
     if let Some(path) = &expected_ssh_push_path {
         command.env("PERSONA_EXPECTED_SSH_PUSH_PATH", path);
     }
+    if let Some(gh) = native_gh {
+        command.env("PERSONA_GH", gh);
+    }
     if let Some(handoff) = &push_handoff_file {
         let state_home = handoff
             .path()
@@ -2183,12 +2187,6 @@ fn run_managed_git() -> Result<u8, String> {
         }
         if let Some(ssh_keygen) = std::env::var_os("PERSONA_SSH_KEYGEN") {
             command.env("PERSONA_SSH_KEYGEN", ssh_keygen);
-        }
-    }
-    if let Some(gh) = std::env::var_os("PERSONA_GH") {
-        let gh = PathBuf::from(gh);
-        if gh.is_absolute() && gh.is_file() {
-            command.env("PERSONA_GH", gh);
         }
     }
     if signing_operation {

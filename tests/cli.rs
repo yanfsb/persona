@@ -2622,7 +2622,7 @@ profile = "work"
                 .stdin
                 .take()
                 .unwrap()
-                .write_all(b"protocol=https\\nhost=github.com\\npath=org/repo.git\\n\\n")?;
+                .write_all(b"protocol=https\nhost=github.com\npath=org/repo.git\n\n")?;
             child.wait_with_output()
         })
         .unwrap();
@@ -2642,7 +2642,7 @@ profile = "work"
         .spawn()
         .and_then(|mut child| {
             child.stdin.take().unwrap().write_all(
-                b"protocol=https\nhost=github.com:443\npath=org/repo.git\nusername=x-access-token\n\n",
+                b"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com:443\npath=org/repo.git\nusername=untrusted-hint\nwwwauth[]=Basic realm=fixture\nwwwauth[]=Bearer realm=fixture\nstate[]=opaque=value\nunknown[]=ignored\n\n",
             )?;
             child.wait_with_output()
         })
@@ -2676,7 +2676,7 @@ profile = "work"
         .spawn()
         .and_then(|mut child| {
             child.stdin.take().unwrap().write_all(
-                b"protocol=https\nhost=github.com\npath=org/repo.git\nusername=x-access-token\n\n",
+                b"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=org/repo.git\nusername=untrusted-hint\nwwwauth[]=Basic realm=fixture\n\n",
             )?;
             child.wait_with_output()
         })
@@ -2692,6 +2692,123 @@ profile = "work"
         b"username=x-access-token\npassword=synthetic-token\n\n"
     );
     assert!(marker.exists());
+
+    fs::remove_file(&marker).unwrap();
+    let native_git = Command::new(&git)
+        .current_dir(&scope)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("XDG_STATE_HOME", &state)
+        .env("GH_CONFIG_DIR", &gh_config)
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("PERSONA_CONFIG_PATH", &config_file)
+        .env("PERSONA_GH", &gh)
+        .args(["-c", "credential.helper="])
+        .arg("-c")
+        .arg(format!("credential.helper={}", shim.display()))
+        .args([
+            "-c",
+            "credential.useHttpPath=true",
+            "credential",
+            "fill",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(
+                b"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=org/repo.git\nwwwauth[]=Basic realm=fixture\n\n",
+            )?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert_eq!(
+        native_git.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&native_git.stderr)
+    );
+    assert!(String::from_utf8_lossy(&native_git.stdout).contains("password=synthetic-token"));
+    assert!(!String::from_utf8_lossy(&native_git.stdout).contains("wwwauth"));
+    assert!(
+        marker.exists(),
+        "native Git should invoke Persona's synthetic helper"
+    );
+
+    let initialized = Command::new(&git)
+        .current_dir(&scope)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+
+    let shim_directory = temporary.path().join("managed-shims");
+    let gh_directory = temporary.path().join("caller-bin");
+    fs::create_dir(&shim_directory).unwrap();
+    fs::set_permissions(&shim_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(&gh_directory).unwrap();
+    let persona_binary = env!("CARGO_BIN_EXE_persona");
+    for name in ["git", "gh", "ssh", "git-credential-persona"] {
+        std::os::unix::fs::symlink(persona_binary, shim_directory.join(name)).unwrap();
+    }
+    let native_gh = gh_directory.join("gh");
+    fs::write(&native_gh, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&native_gh, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let forwarding_marker = temporary.path().join("forwarded-gh-path");
+    let real_git = git.to_string_lossy();
+    let fake_git = temporary.path().join("git-observes-gh");
+    fs::write(
+        &fake_git,
+        format!(
+            r#"#!/bin/sh
+if [ "${{PERSONA_GH:-}}" = "{}" ]; then : > "{}"; fi
+exec "{}" "$@"
+"#,
+            native_gh.display(),
+            forwarding_marker.display(),
+            real_git
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let caller_path = std::env::join_paths([
+        gh_directory.as_path(),
+        shim_directory.as_path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap();
+    let direct_shim = Command::new(shim_directory.join("git"))
+        .arg("status")
+        .current_dir(&scope)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("XDG_STATE_HOME", &state)
+        .env("GH_CONFIG_DIR", &gh_config)
+        .env("PATH", caller_path)
+        .env("PERSONA_CONFIG_PATH", &config_file)
+        .env("PERSONA_SHIM_DIR", &shim_directory)
+        .env("PERSONA_GIT", &fake_git)
+        .output()
+        .unwrap();
+    assert_eq!(
+        direct_shim.status.code(),
+        Some(0),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&direct_shim.stdout),
+        String::from_utf8_lossy(&direct_shim.stderr)
+    );
+    assert!(
+        forwarding_marker.exists(),
+        "direct Git shim should forward only the discovered absolute gh path"
+    );
 }
 
 #[test]
