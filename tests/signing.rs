@@ -1109,6 +1109,35 @@ fn push_audit_trusts_pinned_upstream_signatures_but_checks_new_commits() {
         finding(&report, "git.push.signature.fingerprint")["status"],
         "PASS"
     );
+
+    checked(git(&home, &repo, &["config", "commit.gpgSign", "false"]));
+    checked(git(
+        &home,
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "unsigned post-baseline commit",
+        ],
+    ));
+    let unsigned_head = commit_oid(&home, &repo);
+    let report = run_persona_push(
+        &repo,
+        &policy,
+        &gpg_binary().expect("GPG"),
+        &unsigned_head,
+        &"0".repeat(40),
+        &destination,
+    );
+    assert_eq!(
+        finding(&report, "git.push.signature.present")["status"],
+        "FAIL"
+    );
+    assert_eq!(
+        finding(&report, "git.push.signature.valid")["status"],
+        "FAIL"
+    );
 }
 
 #[test]
