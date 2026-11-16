@@ -1101,9 +1101,14 @@ exit 64
     );
     fs::write(&gh, script).unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let cat = PathBuf::from(std::env::var_os("PERSONA_TEST_CAT").expect("PERSONA_TEST_CAT"));
+    assert!(cat.is_absolute() && cat.is_file());
     let curl = temporary.path().join("curl-fixture");
     let curl_script = format!(
         r#"#!/bin/sh
+# Model the uploader's empty executable search path even on non-sandboxed hosts.
+PATH=
+export PATH
 printf '%s\n' "$*" >> '{curl_marker}'
 [ -z "$GH_TOKEN" ] || exit 71
 [ "$PERSONA_UPLOAD_TOKEN" = "synthetic-release-token" ] || exit 72
@@ -1116,34 +1121,35 @@ url=
 for argument in "$@"; do url="$argument"; done
 case "$url" in
   *name=fixture.bin)
-    cat > '{uploaded_body}'
-    [ "$(cat '{uploaded_body}')" = "snapshot bytes" ] || exit 76
+    '{cat}' > '{uploaded_body}'
+    [ "$('{cat}' '{uploaded_body}')" = "snapshot bytes" ] || exit 76
     printf 'HTTP/2.0 201 Created\r\nContent-Type: application/json\r\n\r\n%s\n' '{{"id":456,"name":"fixture.bin","size":14,"state":"uploaded","digest":"{fixture_digest}"}}'
     exit 0;;
   *name=release%2Bnotes.bin)
-    cat > '{plus_uploaded_body}'
-    [ "$(cat '{plus_uploaded_body}')" = "plus snapshot" ] || exit 77
+    '{cat}' > '{plus_uploaded_body}'
+    [ "$('{cat}' '{plus_uploaded_body}')" = "plus snapshot" ] || exit 77
     printf 'HTTP/2.0 201 Created\r\nContent-Type: application/json\r\n\r\n%s\n' '{{"id":460,"name":"release+notes.bin","size":13,"state":"uploaded","digest":null}}'
     exit 0;;
   *name=race.bin)
-    cat >/dev/null
+    '{cat}' >/dev/null
     printf 'HTTP/2.0 201 Created\r\n\r\n%s\n' '{{"id":457,"name":"race.bin","size":4,"state":"uploaded","digest":null}}'
     exit 0;;
   *name=first.bin)
-    cat > '{first_body}'
+    '{cat}' > '{first_body}'
     printf 'HTTP/2.0 201 Created\r\n\r\n%s\n' '{{"id":458,"name":"first.bin","size":5,"state":"uploaded","digest":null}}'
     exit 0;;
   *name=fail.bin)
-    cat >/dev/null
+    '{cat}' >/dev/null
     printf 'HTTP/2.0 502 Bad Gateway\r\n\r\n%s\n' '{{"message":"upload may have started"}}'
     exit 0;;
   *name=bad.bin)
-    cat >/dev/null
+    '{cat}' >/dev/null
     printf 'HTTP/2.0 201 Created\r\n\r\n%s\n' '{{"id":459,"name":"bad.bin","size":999,"state":"uploaded","digest":null}}'
     exit 0;;
 esac
 exit 64
 "#,
+        cat = cat.display(),
         curl_marker = curl_marker.display(),
         uploaded_body = uploaded_body.display(),
         plus_uploaded_body = plus_uploaded_body.display(),
