@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -17,6 +18,59 @@ fn fixture_git(git: &Path, home: &Path) -> Command {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0");
     command
+}
+
+fn tracing_git(git: &Path, wrapper: &Path, fetch_calls: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        wrapper,
+        format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do\n  if [ \"$argument\" = fetch ]; then\n    printf '%s\\n' \"$*\" >> '{}'\n    break\n  fi\ndone\nexec '{}' \"$@\"\n",
+            fetch_calls.display(),
+            git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn spawn_tls_client_hello_observer(
+    listener: TcpListener,
+    expected_hellos: usize,
+    timeout: Duration,
+) -> (Receiver<()>, Receiver<Vec<Vec<u8>>>) {
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    let (complete_sender, complete_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + timeout;
+        ready_sender.send(()).unwrap();
+        let mut hellos = Vec::new();
+        while hellos.len() < expected_hellos && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    stream.set_read_timeout(Some(remaining)).unwrap();
+                    let mut bytes = [0; 8];
+                    let count = stream.read(&mut bytes).unwrap_or(0);
+                    if count > 0 && bytes[0] == 0x16 {
+                        hellos.push(bytes[..count].to_vec());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = complete_sender.send(hellos);
+    });
+    (ready_receiver, complete_receiver)
 }
 
 #[cfg(unix)]
@@ -36,34 +90,7 @@ fn managed_fetch_routes_ssh_only_through_the_profile_transport() {
     fs::create_dir(&repo).unwrap();
     let https_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let https_port = https_listener.local_addr().unwrap().port();
-    https_listener.set_nonblocking(true).unwrap();
     let https_destination = format!("https://127.0.0.1:{https_port}/org/mixed.git");
-    let tls_server = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut hellos = 0;
-        while Instant::now() < deadline {
-            match https_listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(1)))
-                        .unwrap();
-                    let mut bytes = [0; 8];
-                    let count = stream.read(&mut bytes).unwrap_or(0);
-                    if count > 0 && bytes[0] == 0x16 {
-                        hellos += 1;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-            if hellos > 1 {
-                break;
-            }
-        }
-        hellos
-    });
     let key = temporary.path().join("client-key");
     let generated = Command::new(&ssh_keygen)
         .env_clear()
@@ -96,6 +123,9 @@ fn managed_fetch_routes_ssh_only_through_the_profile_transport() {
     )
     .unwrap();
     let marker = temporary.path().join("ssh-args");
+    let fetch_calls = temporary.path().join("git-fetches");
+    let tracing_git_path = temporary.path().join("git-fixture");
+    tracing_git(&git, &tracing_git_path, &fetch_calls);
     let fake_ssh = temporary.path().join("ssh-fixture");
     fs::write(
         &fake_ssh,
@@ -202,7 +232,7 @@ profile = "fixture"
         .env_clear()
         .env("HOME", temporary.path())
         .env("PATH", "/usr/bin:/bin")
-        .env("PERSONA_GIT", &git)
+        .env("PERSONA_GIT", &tracing_git_path)
         .env("PERSONA_SSH", &fake_ssh)
         .env("PERSONA_SSH_KEYGEN", &ssh_keygen)
         .current_dir(&repo)
@@ -229,11 +259,17 @@ profile = "fixture"
     assert!(ssh_args.contains("git-upload-pack 'org/repo.git'"));
 
     fs::remove_file(&marker).unwrap();
+    let _ = fs::remove_file(&fetch_calls);
+    let (observer_ready, observer_complete) =
+        spawn_tls_client_hello_observer(https_listener, 1, Duration::from_secs(6));
+    observer_ready
+        .recv_timeout(Duration::from_secs(1))
+        .expect("mixed TLS observer must be ready before fetch-all starts");
     let all_fetch = Command::new(env!("CARGO_BIN_EXE_persona"))
         .env_clear()
         .env("HOME", temporary.path())
         .env("PATH", "/usr/bin:/bin")
-        .env("PERSONA_GIT", &git)
+        .env("PERSONA_GIT", &tracing_git_path)
         .env("PERSONA_SSH", &fake_ssh)
         .env("PERSONA_SSH_KEYGEN", &ssh_keygen)
         .current_dir(&repo)
@@ -256,8 +292,16 @@ profile = "fixture"
         String::from_utf8_lossy(&all_fetch.stderr)
     );
     assert!(!all_ssh_args.contains("org/skipped.git"));
+    let fetch_calls_output = fs::read_to_string(&fetch_calls).unwrap();
+    let mut fetched_remotes = fetch_calls_output
+        .lines()
+        .filter_map(|call| call.split_whitespace().last())
+        .collect::<Vec<_>>();
+    fetched_remotes.sort_unstable();
+    assert_eq!(fetched_remotes, ["https", "origin", "upstream"]);
 
     fs::remove_file(&marker).unwrap();
+    let _ = fs::remove_file(&fetch_calls);
     let mut denied_config = fs::read_to_string(&config).unwrap();
     denied_config = denied_config.replace(
         &format!("  {{ name = \"upstream\", fetch_destinations = [\"{upstream}\"], push_destinations = [] }},\n"),
@@ -268,7 +312,7 @@ profile = "fixture"
         .env_clear()
         .env("HOME", temporary.path())
         .env("PATH", "/usr/bin:/bin")
-        .env("PERSONA_GIT", &git)
+        .env("PERSONA_GIT", &tracing_git_path)
         .env("PERSONA_SSH", &fake_ssh)
         .env("PERSONA_SSH_KEYGEN", &ssh_keygen)
         .current_dir(&repo)
@@ -284,11 +328,22 @@ profile = "fixture"
         !marker.exists(),
         "all remotes must be authorized before transport"
     );
-    let https_requests = tls_server.join().unwrap();
+    assert!(
+        !fetch_calls.exists(),
+        "unauthorized mixed fetch must not launch any Git transport"
+    );
+    let observed_hellos = observer_complete
+        .recv_timeout(Duration::from_secs(7))
+        .expect("mixed TLS observer must complete within its bounded deadline");
     if std::env::var_os("PERSONA_TEST_SKIP_LOCAL_TLS").is_none() {
         assert_eq!(
-            https_requests, 1,
+            observed_hellos.len(),
+            1,
             "mixed fetch should reach HTTPS once, while unauthorized preflight sends no second request"
+        );
+        assert!(
+            observed_hellos[0].first() == Some(&0x16),
+            "expected a TLS ClientHello record, got {observed_hellos:?}"
         );
     }
 
@@ -297,7 +352,7 @@ profile = "fixture"
         .env_clear()
         .env("HOME", temporary.path())
         .env("PATH", "/usr/bin:/bin")
-        .env("PERSONA_GIT", &git)
+        .env("PERSONA_GIT", &tracing_git_path)
         .env("PERSONA_SSH", &fake_ssh)
         .env("PERSONA_SSH_KEYGEN", &ssh_keygen)
         .current_dir(&repo)
@@ -323,33 +378,104 @@ profile = "fixture"
     assert!(clone_ssh_args.contains("git-upload-pack 'org/repo.git'"));
 }
 
+#[cfg(unix)]
 #[test]
-fn accepted_stream_from_nonblocking_listener_waits_for_delayed_client_hello() {
+fn mixed_remote_fetch_all_preflight_rejects_before_any_transport() {
+    let git = std::path::PathBuf::from(
+        std::env::var_os("PERSONA_TEST_GIT").expect("PERSONA_TEST_GIT must be set"),
+    );
+    let temporary = tempdir().unwrap();
+    let repo = temporary.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let init = fixture_git(&git, temporary.path())
+        .args(["init", "--quiet"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    for (name, url) in [
+        ("00-denied", "https://127.0.0.1:9/org/denied.git"),
+        ("zz-ssh", "git@github.com:org/repo.git"),
+    ] {
+        let added = fixture_git(&git, temporary.path())
+            .args(["-C"])
+            .arg(&repo)
+            .args(["remote", "add", name, url])
+            .output()
+            .unwrap();
+        assert!(added.status.success());
+    }
+
+    let config = temporary.path().join("persona.toml");
+    let scope_path = toml::Value::String(repo.to_string_lossy().into_owned());
+    fs::write(
+        &config,
+        format!(
+            r#"
+version = 2
+[[profiles]]
+name = "fixture"
+[profiles.git]
+author = {{ name = "Fixture", email = "fixture@example.invalid" }}
+committer = {{ name = "Fixture", email = "fixture@example.invalid" }}
+remotes = [
+  {{ name = "zz-ssh", fetch_destinations = ["git@github.com:org/repo.git"], push_destinations = [] }}
+]
+[[scopes]]
+name = "fixture"
+path = {scope_path}
+profile = "fixture"
+"#
+        ),
+    )
+    .unwrap();
+
+    let fetch_calls = temporary.path().join("git-fetches");
+    let tracing_git_path = temporary.path().join("git-fixture");
+    tracing_git(&git, &tracing_git_path, &fetch_calls);
+    let output = Command::new(env!("CARGO_BIN_EXE_persona"))
+        .env_clear()
+        .env("HOME", temporary.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("PERSONA_GIT", &tracing_git_path)
+        .current_dir(&repo)
+        .args(["run", "--config"])
+        .arg(&config)
+        .args(["--cwd"])
+        .arg(&repo)
+        .args(["--", "git", "fetch", "--all"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("00-denied"),
+        "expected rejection of the unapproved mixed remote: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fetch_calls.exists(),
+        "unauthorized mixed preflight must not launch Git transport, even when local TLS is skipped"
+    );
+}
+
+#[test]
+fn mixed_tls_observer_waits_for_delayed_client_hello() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
-    listener.set_nonblocking(true).unwrap();
     let client = thread::spawn(move || {
         let mut stream = TcpStream::connect(address).unwrap();
         thread::sleep(Duration::from_millis(100));
         stream.write_all(&[0x16]).unwrap();
     });
-    let mut stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => panic!("local fixture accept failed: {error}"),
-        }
-    };
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
-    let mut byte = [0];
-    stream.read_exact(&mut byte).unwrap();
+    let (ready, complete) = spawn_tls_client_hello_observer(listener, 1, Duration::from_secs(2));
+    ready
+        .recv_timeout(Duration::from_secs(1))
+        .expect("delayed ClientHello observer must become ready");
+    let hellos = complete
+        .recv_timeout(Duration::from_secs(3))
+        .expect("delayed ClientHello observer must complete within its deadline");
     client.join().unwrap();
-    assert_eq!(byte, [0x16]);
+    assert_eq!(hellos, [vec![0x16]]);
 }
 
 #[test]
@@ -370,35 +496,7 @@ fn managed_fetch_only_connects_to_an_exact_https_destination() {
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    listener.set_nonblocking(true).unwrap();
     let destination = format!("https://127.0.0.1:{port}/org/repo.git");
-    let server = thread::spawn(move || {
-        let mut hellos = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while hellos.len() < 2 {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(1)))
-                        .unwrap();
-                    let mut bytes = [0; 8];
-                    let count = stream.read(&mut bytes).unwrap_or(0);
-                    if bytes.first() == Some(&0x16) {
-                        hellos.push(bytes[..count].to_vec());
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return hellos;
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => return hellos,
-            }
-        }
-        hellos
-    });
 
     let init = fixture_git(&git, temporary.path())
         .args(["init", "--quiet"])
@@ -426,6 +524,11 @@ fn managed_fetch_only_connects_to_an_exact_https_destination() {
     )
     .unwrap();
 
+    let (observer_ready, observer_complete) =
+        spawn_tls_client_hello_observer(listener, 2, Duration::from_secs(6));
+    observer_ready
+        .recv_timeout(Duration::from_secs(1))
+        .expect("exact-destination TLS observer must be ready before fetch");
     let output = Command::new(env!("CARGO_BIN_EXE_persona"))
         .env_clear()
         .env("HOME", temporary.path())
@@ -466,7 +569,9 @@ fn managed_fetch_only_connects_to_an_exact_https_destination() {
         !clone.status.success(),
         "the fixture server closes TLS before clone can complete"
     );
-    let tls_hellos = server.join().unwrap();
+    let tls_hellos = observer_complete
+        .recv_timeout(Duration::from_secs(7))
+        .expect("exact-destination TLS observer must complete within its bounded deadline");
     assert_eq!(
         tls_hellos.len(),
         2,
