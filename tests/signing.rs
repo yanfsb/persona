@@ -2,6 +2,7 @@ use persona::git::{GitClient, safe_environment};
 use persona::gpg::{GpgClient, GpgError};
 use persona::ssh_signature::SshVerifier;
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -1044,6 +1045,69 @@ fn push_audit_fails_when_an_earlier_outgoing_commit_is_unsigned() {
     assert_eq!(
         finding(&report, "git.push.signature.valid")["status"],
         "FAIL"
+    );
+}
+
+#[test]
+fn push_audit_trusts_pinned_upstream_signatures_but_checks_new_commits() {
+    let (temporary, policy, public_key, fingerprint) = setup();
+    let repo = temporary.path().join("repo");
+    let home = temporary.path().join("gnupg");
+    let destination = temporary.path().join("remote.git");
+    checked(git(
+        &home,
+        &repo,
+        &["remote", "add", "origin", destination.to_str().unwrap()],
+    ));
+    checked(git(&home, &repo, &["config", "commit.gpgSign", "false"]));
+    checked(git(
+        &home,
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "synthetic upstream merge without a local signature",
+        ],
+    ));
+    let baseline = commit_oid(&home, &repo);
+    checked(git(
+        &home,
+        &repo,
+        &["update-ref", "refs/remotes/origin/main", &baseline],
+    ));
+    checked(git(&home, &repo, &["config", "commit.gpgSign", "true"]));
+    signed_commit(&home, &repo);
+    let head = commit_oid(&home, &repo);
+    write_push_policy(&policy, &repo, &fingerprint, &public_key, &destination);
+    let mut policy_contents = fs::read_to_string(&policy).expect("read push policy");
+    writeln!(
+        policy_contents,
+        "allow_initial_push = true\n\n[[scopes.git.push.upstream_baselines]]\ndestination = {:?}\ntracking_ref = \"refs/remotes/origin/main\"\noid = \"{baseline}\"",
+        destination.to_string_lossy(),
+    )
+    .expect("append pinned baseline");
+    fs::write(&policy, policy_contents).expect("write baseline push policy");
+
+    let report = run_persona_push(
+        &repo,
+        &policy,
+        &gpg_binary().expect("GPG"),
+        &head,
+        &"0".repeat(40),
+        &destination,
+    );
+    assert_eq!(
+        finding(&report, "git.push.signature.present")["status"],
+        "PASS"
+    );
+    assert_eq!(
+        finding(&report, "git.push.signature.valid")["status"],
+        "PASS"
+    );
+    assert_eq!(
+        finding(&report, "git.push.signature.fingerprint")["status"],
+        "PASS"
     );
 }
 

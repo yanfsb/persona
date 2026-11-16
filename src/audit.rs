@@ -1684,11 +1684,20 @@ fn add_push_findings(
         &trusted_upstream,
         request.tuples.len(),
     );
+    // Commits already reachable from an exact, preflight-validated pinned
+    // upstream baseline are existing remote history, not new signing input.
+    // Only commits outside those trusted baselines must satisfy this profile's
+    // local signing policy.
+    let commits_requiring_local_signature = commits
+        .iter()
+        .filter(|commit| !trusted_upstream.contains(&commit.oid))
+        .cloned()
+        .collect::<Vec<_>>();
     add_push_signature_findings(
         findings,
         git,
         root,
-        &commits,
+        &commits_requiring_local_signature,
         scope_policy.git.signing.as_ref(),
         &scope_policy.git.committer.email,
         executables,
@@ -1930,14 +1939,14 @@ fn add_push_ssh_signature_findings(
         status(valid_failed, valid_unknown),
         Some("cryptographically valid under the configured SSH key".to_owned()),
         Some(observed.clone()),
-        "each outgoing SSH signature was verified offline against the explicit allowed signer",
+        "each non-baseline outgoing SSH signature was verified offline against the explicit allowed signer",
     ));
     findings.push(Finding::status(
         "git.push.signature.fingerprint",
         status(fingerprint_failed, fingerprint_unknown),
         Some(policy.fingerprint.clone()),
         Some(observed),
-        "each verified outgoing SSH signature matched the configured key fingerprint",
+        "each verified non-baseline outgoing SSH signature matched the configured key fingerprint",
     ));
 }
 
@@ -2088,7 +2097,7 @@ fn add_push_signature_findings(
         presence_status,
         Some("present on every outgoing commit".to_owned()),
         Some(checked_text.clone()),
-        "every outgoing commit was checked for an embedded OpenPGP signature",
+        "every non-baseline outgoing commit was checked for an embedded OpenPGP signature",
     ));
 
     let valid_status = if valid_failed {
@@ -2103,7 +2112,7 @@ fn add_push_signature_findings(
         valid_status,
         Some("cryptographically valid under the configured key".to_owned()),
         Some(checked_text.clone()),
-        "every signed outgoing commit was verified with the isolated public keyring",
+        "every signed non-baseline outgoing commit was verified with the isolated public keyring",
     ));
 
     let fingerprint_status = if fingerprint_failed {
@@ -2118,7 +2127,7 @@ fn add_push_signature_findings(
         fingerprint_status,
         Some(signing_policy.fingerprint.clone()),
         Some(checked_text),
-        "every verified outgoing signature mapped to the configured primary fingerprint",
+        "every verified non-baseline outgoing signature mapped to the configured primary fingerprint",
     ));
 }
 
