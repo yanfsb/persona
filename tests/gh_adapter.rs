@@ -534,14 +534,26 @@ fn native_gh_routes_only_through_a_local_unix_socket_fixture() {
         while requests.len() < 2 && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
+                    stream.set_nonblocking(true).unwrap();
+                    let read_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
                     let mut request = Vec::new();
+                    let mut complete = false;
                     let mut buffer = [0_u8; 4096];
                     loop {
-                        let read = stream.read(&mut buffer).unwrap();
+                        let read = match stream.read(&mut buffer) {
+                            Ok(read) => read,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if Instant::now() >= read_deadline {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Err(error) => panic!("Unix socket fixture read failed: {error}"),
+                        };
                         if read == 0 {
                             break;
                         }
@@ -560,10 +572,22 @@ fn native_gh_routes_only_through_a_local_unix_socket_fixture() {
                                 })
                                 .unwrap_or(0);
                             if request.len() >= header_end + 4 + content_length {
+                                complete = true;
                                 break;
                             }
                         }
                     }
+                    if request.is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        complete,
+                        "Unix socket fixture received an incomplete request"
+                    );
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
                     let request_line = String::from_utf8_lossy(&request)
                         .lines()
                         .next()
@@ -578,8 +602,11 @@ fn native_gh_routes_only_through_a_local_unix_socket_fixture() {
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         payload.len()
                     );
-                    stream.write_all(response.as_bytes()).unwrap();
-                    stream.write_all(payload).unwrap();
+                    let mut response = response.into_bytes();
+                    response.extend_from_slice(payload);
+                    stream.write_all(&response).unwrap_or_else(|error| {
+                        panic!("Unix socket fixture response failed for {request_line}: {error}")
+                    });
                     requests.push((request_line, request));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -590,6 +617,10 @@ fn native_gh_routes_only_through_a_local_unix_socket_fixture() {
         }
         requests
     });
+
+    // Native HTTP clients may open and cancel an unused connection. It is not
+    // an API request and must not consume one of the two expected responses.
+    drop(std::os::unix::net::UnixStream::connect(&socket).unwrap());
 
     let wrapper = temporary.path().join("gh-wrapper");
     fs::write(
