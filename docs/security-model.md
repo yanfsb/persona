@@ -30,4 +30,4 @@ Managed asset upload reuses the release signing/account/destination gates. It sn
 - Inspect every preview and use disposable repositories for installation/hook tests.
 - Keep configuration, backups, tokens and private keys out of source control and public issue reports.
 - Treat unsupported commands as unmanaged/blocked, not as implicitly protected. `git fetch --all` preflights every eligible remote's exact destination before transport, but independent runtime transfers are not atomic: earlier remotes may have fetched before a later network failure.
-- A limited real-account pilot verified binding, repository metadata reads, and SSH fetch only. Managed publication and production use have not been exercised. Do not use this release candidate as a security boundary for production publishing.
+- The earlier limited real-account pilot verified binding, repository metadata reads, and SSH fetch only; release-specific publication evidence must be recorded separately. Production use has not been evaluated. Do not use this release candidate as a security boundary for production publishing.

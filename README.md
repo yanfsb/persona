@@ -2,7 +2,7 @@
 
 Persona is a directory-scoped Git/GitHub identity guardrail for developers who use more than one identity on the same macOS or Linux account. Its managed adapters check a bounded set of commands against a local profile before delegation.
 
-> **Release candidate:** `0.1.1-rc.2` is a follow-up patch candidate to `0.1.1-rc.1`. A limited real-account pilot verified account binding, repository metadata reads, and SSH fetch; managed publication and production use have not been exercised. Do not rely on this release candidate as a production security boundary.
+> **Release candidate:** `0.1.1-rc.3` adds audited release asset uploads and transport-fixture hardening to `0.1.1-rc.2`. The earlier limited real-account pilot covered binding, repository metadata reads, and SSH fetch; release-specific publication evidence belongs in the published release record. Production use has not been evaluated. Do not rely on this release candidate as a production security boundary.
 
 Persona is **not** a sandbox, firewall, anonymity system, or universal Git/GitHub replacement. Direct native binaries and hostile processes running as the same OS user can bypass its managed paths. See the [security model](docs/security-model.md) before use.
 
@@ -50,7 +50,7 @@ The project currently documents source builds and Nix packaging for Apple Silico
 
 ## Status and validation
 
-The current source declares macOS arm64 and Linux arm64/x86_64 targets. A target is not a promise of stable support. Hosted CI passed on all three platforms for the CI-fix commit `e61a72d` and for the open-source-preparation candidate commit `a30dfa2` ([run 43361382293](https://github.com/yanfsb/persona/actions/runs/43361382293)), including the workflow Nix checks. This is not a release-readiness claim; a new public RC still requires CI on its exact candidate commit and installation smoke checks. The limited pilot did not test managed publication. See the [evidence matrix](docs/implementation-matrix.md) and [release checklist](docs/releasing.md).
+The current source declares macOS arm64 and Linux arm64/x86_64 targets. A target is not a promise of stable support. Hosted CI passed on all three platforms for the CI-fix commit `e61a72d` and for the open-source-preparation candidate commit `a30dfa2` ([run 43361382293](https://github.com/yanfsb/persona/actions/runs/43361382293)), including the workflow Nix checks. This is not a release-readiness claim; a new public RC still requires CI on its exact candidate commit and installation smoke checks. The earlier limited pilot did not test managed publication; consult each release's publication record for its exact subsequent evidence. See the [evidence matrix](docs/implementation-matrix.md) and [release checklist](docs/releasing.md).
 
 ## License
 
