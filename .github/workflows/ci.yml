@@ -31,7 +31,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y zsh gnupg openssh-server openssl gh
+          sudo apt-get install -y zsh gnupg openssh-server openssl gh curl
           sudo install -m 0644 tests/fixtures/https/test-ca.crt /usr/local/share/ca-certificates/persona-test-ca.crt
           sudo update-ca-certificates
       - name: Install native test tools (macOS)
@@ -43,7 +43,7 @@ jobs:
         id: tools
         shell: bash
         run: |
-          for tool in git gpg gh zsh ssh ssh-keygen ssh-agent ssh-add openssl cat cp; do
+          for tool in git gpg gh zsh ssh ssh-keygen ssh-agent ssh-add openssl cat cp curl; do
             path="$(command -v "$tool")"
             if [[ -z "$path" ]]; then echo "missing test tool: $tool" >&2; exit 1; fi
             key="${tool//-/_}"
@@ -97,4 +97,4 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Nix package and fixture checks
-        run: nix flake check --system "$(nix eval --raw --impure --expr builtins.currentSystem)" --show-trace
+        run: nix flake check --system "$(nix eval --raw --impure --expr builtins.currentSystem)" --print-build-logs --show-trace

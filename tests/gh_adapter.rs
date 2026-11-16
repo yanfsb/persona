@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -1025,28 +1026,132 @@ fn audited_signed_tag_release_uses_local_credentials_and_validates_response() {
         .status
         .success()
     );
+    for tag in ["v-missing", "v-wrong", "v-partial", "v-bad", "v-race"] {
+        assert!(
+            git_run(&[
+                "-c",
+                "user.name=Release Author",
+                "-c",
+                "user.email=release@example.invalid",
+                "tag",
+                "-s",
+                "-m",
+                "signed release",
+                tag,
+            ])
+            .status
+            .success()
+        );
+    }
     let tag_oid = String::from_utf8_lossy(&git_run(&["rev-parse", "refs/tags/v1"]).stdout)
         .trim()
         .to_owned();
+    let additional_tag_oids = ["v-missing", "v-wrong", "v-partial", "v-bad", "v-race"].map(|tag| {
+        String::from_utf8_lossy(&git_run(&["rev-parse", &format!("refs/tags/{tag}")]).stdout)
+            .trim()
+            .to_owned()
+    });
     let marker = temporary.path().join("gh-api-calls");
+    let curl_marker = temporary.path().join("curl-upload-calls");
+    let asset_source = repo.join("fixture.bin");
+    let uploaded_body = temporary.path().join("uploaded-body");
+    let plus_asset_source = repo.join("release+notes.bin");
+    let plus_uploaded_body = temporary.path().join("plus-uploaded-body");
+    let wrong_account_mode = temporary.path().join("wrong-account-mode");
+    let race_seen = temporary.path().join("race-tag-seen");
+    let changed_tag_oid = "f".repeat(40);
+    let fixture_digest = format!("sha256:{:x}", Sha256::digest(b"snapshot bytes"));
+    fs::write(&asset_source, b"snapshot bytes").unwrap();
     let gh = temporary.path().join("gh-fixture");
     let script = format!(
         r#"#!/bin/sh
 printf '%s\n' "$*" >> '{marker}'
-if [ "$1 $2" = "auth token" ]; then [ "$5" = "--user" ] && [ "$6" = "synthetic-user" ] || exit 63; printf 'synthetic-release-token\n'; exit 0; fi
+if [ "$1 $2" = "auth token" ]; then [ "$5" = "--user" ] && [ "$6" = "synthetic-user" ] || exit 63; if [ -f '{wrong_account_mode}' ]; then printf 'different-account-token\n'; else printf 'synthetic-release-token\n'; fi; exit 0; fi
 if [ "$1" = "api" ]; then [ "$GH_TOKEN" = "synthetic-release-token" ] || exit 73; fi
 if [ "$1 $2" = "api user" ]; then printf '4242\n'; exit 0; fi
 case "$2" in
   repos/org/repo/git/ref/tags/v1) printf '%s\n' '["{tag_oid}","tag"]'; exit 0;;
+  repos/org/repo/git/ref/tags/v-missing) printf '%s\n' '["{missing_tag_oid}","tag"]'; exit 0;;
+  repos/org/repo/git/ref/tags/v-wrong) printf '%s\n' '["{wrong_tag_oid}","tag"]'; exit 0;;
+  repos/org/repo/git/ref/tags/v-partial) printf '%s\n' '["{partial_tag_oid}","tag"]'; exit 0;;
+  repos/org/repo/git/ref/tags/v-bad) printf '%s\n' '["{bad_tag_oid}","tag"]'; exit 0;;
+  repos/org/repo/git/ref/tags/v-race) if [ -f '{race_seen}' ]; then printf '%s\n' '["{changed_tag_oid}","tag"]'; else : > '{race_seen}'; printf '%s\n' '["{race_tag_oid}","tag"]'; fi; exit 0;;
   repos/org/repo/releases) printf '%s\n' '{{"id":123,"tag_name":"v1"}}'; exit 0;;
+  repos/org/repo/releases/tags/v1) printf 'mutated after snapshot' > '{asset_source}'; if [ -f '{uploaded_body}' ]; then printf '%s\n' '{{"id":123,"tag_name":"v1","assets":[{{"name":"fixture.bin"}}]}}'; else printf '%s\n' '{{"id":123,"tag_name":"v1","assets":[]}}'; fi; exit 0;;
+  repos/org/repo/releases/tags/v-missing) exit 1;;
+  repos/org/repo/releases/tags/v-wrong) printf '%s\n' '{{"id":123,"tag_name":"wrong-tag","assets":[]}}'; exit 0;;
+  repos/org/repo/releases/tags/v-race) printf '%s\n' '{{"id":123,"tag_name":"v-race","assets":[]}}'; exit 0;;
+  repos/org/repo/releases/tags/v-bad) printf '%s\n' '{{"id":123,"tag_name":"v-bad","assets":[]}}'; exit 0;;
+  repos/org/repo/releases/tags/v-partial) printf '%s\n' '{{"id":123,"tag_name":"v-partial","assets":[]}}'; exit 0;;
 esac
 exit 64
 "#,
         marker = marker.display(),
         tag_oid = tag_oid,
+        missing_tag_oid = additional_tag_oids[0],
+        wrong_tag_oid = additional_tag_oids[1],
+        partial_tag_oid = additional_tag_oids[2],
+        bad_tag_oid = additional_tag_oids[3],
+        race_tag_oid = additional_tag_oids[4],
+        changed_tag_oid = changed_tag_oid,
+        asset_source = asset_source.display(),
+        uploaded_body = uploaded_body.display(),
+        wrong_account_mode = wrong_account_mode.display(),
+        race_seen = race_seen.display(),
     );
     fs::write(&gh, script).unwrap();
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let curl = temporary.path().join("curl-fixture");
+    let curl_script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{curl_marker}'
+[ -z "$GH_TOKEN" ] || exit 71
+[ "$PERSONA_UPLOAD_TOKEN" = "synthetic-release-token" ] || exit 72
+[ "$1" = "--disable" ] || exit 73
+joined="$*"
+case "$joined" in *"--location --max-redirs 0 --proto =https --proto-redir =https"*) ;; *) exit 74;; esac
+case "$joined" in *"--variable %PERSONA_UPLOAD_TOKEN --expand-header Authorization: Bearer {{{{PERSONA_UPLOAD_TOKEN}}}}"*) ;; *) exit 75;; esac
+case "$joined" in *synthetic-release-token*) exit 76;; esac
+url=
+for argument in "$@"; do url="$argument"; done
+case "$url" in
+  *name=fixture.bin)
+    cat > '{uploaded_body}'
+    [ "$(cat '{uploaded_body}')" = "snapshot bytes" ] || exit 76
+    printf 'HTTP/2.0 201 Created\r\nContent-Type: application/json\r\n\r\n%s\n' '{{"id":456,"name":"fixture.bin","size":14,"state":"uploaded","digest":"{fixture_digest}"}}'
+    exit 0;;
+  *name=release%2Bnotes.bin)
+    cat > '{plus_uploaded_body}'
+    [ "$(cat '{plus_uploaded_body}')" = "plus snapshot" ] || exit 77
+    printf 'HTTP/2.0 201 Created\r\nContent-Type: application/json\r\n\r\n%s\n' '{{"id":460,"name":"release+notes.bin","size":13,"state":"uploaded","digest":null}}'
+    exit 0;;
+  *name=race.bin)
+    cat >/dev/null
+    printf 'HTTP/2.0 201 Created\r\n\r\n%s\n' '{{"id":457,"name":"race.bin","size":4,"state":"uploaded","digest":null}}'
+    exit 0;;
+  *name=first.bin)
+    cat > '{first_body}'
+    printf 'HTTP/2.0 201 Created\r\n\r\n%s\n' '{{"id":458,"name":"first.bin","size":5,"state":"uploaded","digest":null}}'
+    exit 0;;
+  *name=fail.bin)
+    cat >/dev/null
+    printf 'HTTP/2.0 502 Bad Gateway\r\n\r\n%s\n' '{{"message":"upload may have started"}}'
+    exit 0;;
+  *name=bad.bin)
+    cat >/dev/null
+    printf 'HTTP/2.0 201 Created\r\n\r\n%s\n' '{{"id":459,"name":"bad.bin","size":999,"state":"uploaded","digest":null}}'
+    exit 0;;
+esac
+exit 64
+"#,
+        curl_marker = curl_marker.display(),
+        uploaded_body = uploaded_body.display(),
+        plus_uploaded_body = plus_uploaded_body.display(),
+        first_body = temporary.path().join("first-body").display(),
+        fixture_digest = fixture_digest,
+    );
+    fs::write(&curl, curl_script).unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
     let config = xdg.join("persona/config.toml");
     write_private_config(&config, &repo);
     let enrollment = Command::new(persona())
@@ -1199,5 +1304,281 @@ exit 64
         "target_commitish={}",
         String::from_utf8_lossy(&git_run(&["rev-parse", "refs/tags/v1^{}"]).stdout).trim()
     )));
-    assert!(!calls.contains("synthetic-release-token"));
+
+    let shim_directory = temporary.path().join("installed-shims");
+    fs::create_dir(&shim_directory).unwrap();
+    fs::set_permissions(&shim_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["git", "gh", "ssh", "git-credential-persona"] {
+        std::os::unix::fs::symlink(persona(), shim_directory.join(name)).unwrap();
+    }
+    let call_installed = |arguments: &[&str]| {
+        Command::new(shim_directory.join("gh"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("XDG_STATE_HOME", &state)
+            .env("PATH", test_path)
+            .env("PERSONA_CONFIG_PATH", &config)
+            .env("PERSONA_SHIM_DIR", &shim_directory)
+            .env("PERSONA_GH", &gh)
+            .env("PERSONA_CURL", &curl)
+            .env("PERSONA_GIT", &git)
+            .current_dir(&repo)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let upload = call_installed(&[
+        "release",
+        "upload",
+        "v1",
+        "fixture.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(
+        upload.status.code(),
+        Some(0),
+        "stdout: {}; stderr: {}; curl fixture log: {}",
+        String::from_utf8_lossy(&upload.stdout),
+        String::from_utf8_lossy(&upload.stderr),
+        fs::read_to_string(&curl_marker).unwrap_or_else(|error| format!("<unavailable: {error}>"))
+    );
+    assert!(String::from_utf8_lossy(&upload.stdout).contains("Uploaded fixture.bin (id 456)"));
+    assert_eq!(fs::read(&uploaded_body).unwrap(), b"snapshot bytes");
+    assert_eq!(fs::read(&asset_source).unwrap(), b"mutated after snapshot");
+    let upload_calls = fs::read_to_string(&marker).unwrap();
+    assert!(upload_calls.contains("repos/org/repo/releases/tags/v1"));
+    assert!(!upload_calls.contains("synthetic-release-token"));
+    let curl_calls = fs::read_to_string(&curl_marker).unwrap();
+    assert!(curl_calls.contains(
+        "https://uploads.github.com/repos/org/repo/releases/123/assets?name=fixture.bin"
+    ));
+    assert!(curl_calls.contains("--location --max-redirs 0 --proto =https --proto-redir =https"));
+    assert!(!curl_calls.contains("synthetic-release-token"));
+
+    fs::write(&plus_asset_source, b"plus snapshot").unwrap();
+    let plus_upload = call_installed(&[
+        "release",
+        "upload",
+        "v1",
+        "release+notes.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(
+        plus_upload.status.code(),
+        Some(0),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&plus_upload.stdout),
+        String::from_utf8_lossy(&plus_upload.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&plus_upload.stdout)
+            .contains("Uploaded release+notes.bin (id 460)")
+    );
+    assert_eq!(fs::read(&plus_uploaded_body).unwrap(), b"plus snapshot");
+    let curl_calls = fs::read_to_string(&curl_marker).unwrap();
+    assert!(curl_calls.contains("name=release%2Bnotes.bin"));
+    assert!(!curl_calls.contains("Authorization: Bearer synthetic-release-token"));
+
+    let upload_calls = fs::read_to_string(&marker).unwrap();
+    let calls_before_denial = upload_calls.lines().count();
+    let curl_calls_before_denial = fs::read_to_string(&curl_marker).unwrap().lines().count();
+    let outside = temporary.path().join("outside.bin");
+    fs::write(&outside, b"outside").unwrap();
+    let escape = call_installed(&[
+        "release",
+        "upload",
+        "v1",
+        "../outside.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(escape.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&escape.stderr).contains("escapes"));
+    let after_denial = fs::read_to_string(&marker).unwrap();
+    assert_eq!(
+        after_denial.lines().count(),
+        calls_before_denial,
+        "invalid local paths must not retrieve credentials or invoke the GitHub fixture"
+    );
+    assert_eq!(
+        fs::read_to_string(&curl_marker).unwrap().lines().count(),
+        curl_calls_before_denial,
+        "invalid local paths must not invoke the upload transport"
+    );
+
+    let conflict = call_installed(&[
+        "release",
+        "upload",
+        "v1",
+        "fixture.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(conflict.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("already exists"));
+    let final_calls = fs::read_to_string(&marker).unwrap();
+    assert!(!final_calls.contains("synthetic-release-token"));
+
+    let api_call_count = |calls: &str| {
+        calls
+            .lines()
+            .filter(|line| line.starts_with("api "))
+            .count()
+    };
+    let before_policy_denials = final_calls.clone();
+    let wrong_repository = call_installed(&[
+        "release",
+        "upload",
+        "v1",
+        "fixture.bin",
+        "--repo",
+        "other/repo",
+    ]);
+    assert_eq!(wrong_repository.status.code(), Some(126));
+    let calls = fs::read_to_string(&marker).unwrap();
+    assert_eq!(calls.lines().count(), before_policy_denials.lines().count());
+
+    assert!(
+        git_run(&[
+            "-c",
+            "tag.gpgsign=false",
+            "tag",
+            "-a",
+            "-m",
+            "unsigned fixture",
+            "v-unsigned"
+        ])
+        .status
+        .success()
+    );
+    fs::write(repo.join("unsigned.bin"), b"unsigned").unwrap();
+    let unsigned_tag = call_installed(&[
+        "release",
+        "upload",
+        "v-unsigned",
+        "unsigned.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(unsigned_tag.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&unsigned_tag.stderr).contains("signature and scope audit"));
+    let calls = fs::read_to_string(&marker).unwrap();
+    assert_eq!(calls.lines().count(), before_policy_denials.lines().count());
+    let missing_tag = call_installed(&[
+        "release",
+        "upload",
+        "v-not-local",
+        "unsigned.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(missing_tag.status.code(), Some(126));
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().lines().count(),
+        before_policy_denials.lines().count()
+    );
+
+    let original_config = fs::read(&config).unwrap();
+    let config_text = String::from_utf8(original_config.clone()).unwrap();
+    assert!(config_text.contains("https://github.com/org/repo.git"));
+    fs::write(
+        &config,
+        config_text.replace(
+            "https://github.com/org/repo.git",
+            "https://github.com/other/repo.git",
+        ),
+    )
+    .unwrap();
+    let wrong_destination = call_installed(&[
+        "release",
+        "upload",
+        "v1",
+        "fixture.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(wrong_destination.status.code(), Some(126));
+    let calls = fs::read_to_string(&marker).unwrap();
+    assert_eq!(calls.lines().count(), before_policy_denials.lines().count());
+    fs::write(&config, original_config).unwrap();
+
+    fs::write(&wrong_account_mode, b"wrong selected account").unwrap();
+    let api_calls_before_account_mismatch = api_call_count(&fs::read_to_string(&marker).unwrap());
+    let wrong_account = call_installed(&[
+        "release",
+        "upload",
+        "v1",
+        "fixture.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(wrong_account.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&wrong_account.stderr).contains("does not match"));
+    assert_eq!(
+        api_call_count(&fs::read_to_string(&marker).unwrap()),
+        api_calls_before_account_mismatch,
+        "an account mismatch must not invoke GitHub API endpoints"
+    );
+    fs::remove_file(&wrong_account_mode).unwrap();
+
+    fs::write(repo.join("missing.bin"), b"missing release").unwrap();
+    let missing_release = call_installed(&[
+        "release",
+        "upload",
+        "v-missing",
+        "missing.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(missing_release.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&missing_release.stderr).contains("existing GitHub release"));
+    fs::write(repo.join("wrong.bin"), b"wrong release tag").unwrap();
+    let wrong_release = call_installed(&[
+        "release",
+        "upload",
+        "v-wrong",
+        "wrong.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(wrong_release.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&wrong_release.stderr).contains("existing GitHub release"));
+
+    fs::write(repo.join("bad.bin"), b"bad").unwrap();
+    let malformed_response = call_installed(&[
+        "release", "upload", "v-bad", "bad.bin", "--repo", "org/repo",
+    ]);
+    assert_eq!(malformed_response.status.code(), Some(126));
+    assert!(
+        String::from_utf8_lossy(&malformed_response.stderr).contains("uncertain asset: bad.bin")
+    );
+
+    fs::write(repo.join("first.bin"), b"first").unwrap();
+    fs::write(repo.join("fail.bin"), b"fail").unwrap();
+    let partial_failure = call_installed(&[
+        "release",
+        "upload",
+        "v-partial",
+        "first.bin",
+        "fail.bin",
+        "--repo",
+        "org/repo",
+    ]);
+    assert_eq!(partial_failure.status.code(), Some(126));
+    let partial_error = String::from_utf8_lossy(&partial_failure.stderr);
+    assert!(partial_error.contains("confirmed uploaded assets: first.bin (id 458)"));
+    assert!(partial_error.contains("uncertain asset: fail.bin"));
+    assert!(!partial_error.contains("synthetic-release-token"));
+
+    fs::write(repo.join("race.bin"), b"race").unwrap();
+    let concurrent_tag_move = call_installed(&[
+        "release", "upload", "v-race", "race.bin", "--repo", "org/repo",
+    ]);
+    assert_eq!(concurrent_tag_move.status.code(), Some(126));
+    let race_error = String::from_utf8_lossy(&concurrent_tag_move.stderr);
+    assert!(race_error.contains("changed concurrently"));
+    assert!(race_error.contains("confirmed uploaded assets: race.bin (id 457)"));
 }

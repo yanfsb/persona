@@ -8,6 +8,7 @@ pub enum GhOperation {
     Create,
     ServerMerge,
     AuditedRelease,
+    AuditedReleaseAssetUpload,
     Review,
     Checkout,
 }
@@ -20,6 +21,7 @@ pub struct GhRequest {
     pub clone_directory: Option<std::path::PathBuf>,
     pub merge: Option<GhMergeRequest>,
     pub release: Option<GhReleaseRequest>,
+    pub asset_upload: Option<GhAssetUploadRequest>,
     pub review: Option<GhReviewRequest>,
     pub checkout: Option<GhCheckoutRequest>,
 }
@@ -40,6 +42,13 @@ pub struct GhReleaseRequest {
     pub draft: bool,
     pub prerelease: bool,
     pub generate_notes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhAssetUploadRequest {
+    pub repository: String,
+    pub tag: String,
+    pub files: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +138,7 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
             ("release", "view") => (repo_option(&command[2..])?, GhOperation::Read, 1, flags(&["--json", "--jq"]), flags(&[])),
             ("release", "list") => (repo_option(&command[2..])?, GhOperation::Read, 0, flags(&["--json", "--jq", "--limit"]), flags(&[])),
             ("release", "create") => (repo_option(&command[2..])?, GhOperation::AuditedRelease, 1, flags(&["--title", "--notes"]), flags(&["--draft", "--prerelease", "--generate-notes"])),
+            ("release", "upload") => (repo_option(&command[2..])?, GhOperation::AuditedReleaseAssetUpload, usize::MAX, flags(&[]), flags(&[])),
             ("api", _) => parse_api(&command)?,
             ("auth", "status") => return Err("gh auth status is not a protected repository operation; use `persona auth verify` for API-free local verification".to_owned()),
             ("alias", _) | ("extension", _) | ("ext", _) => return Err("gh aliases and extensions are unsupported in managed mode".to_owned()),
@@ -165,6 +175,46 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
             return Err(
                 "managed release creation requires one explicit safe existing tag name".to_owned(),
             );
+        }
+        ("release", "upload") => {
+            if command
+                .iter()
+                .any(|word| word == "-R" || word == "--hostname")
+            {
+                return Err("release asset uploads require exactly --repo OWNER/REPO".to_owned());
+            }
+            if positionals.len() < 2
+                || !valid_component(positionals[0], false)
+                || positionals[1..].iter().any(|path| {
+                    *path == "-"
+                        || path.contains(['#', '*', '?', '[', ']'])
+                        || std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_none_or(|name| !crate::asset_upload::valid_asset_name(name))
+                })
+            {
+                return Err(
+                    "release upload requires one safe existing tag and explicit safe file paths"
+                        .to_owned(),
+                );
+            }
+            if positionals.len() - 1 > crate::asset_upload::MAX_ASSET_FILES {
+                return Err(format!(
+                    "release uploads accept at most {} files",
+                    crate::asset_upload::MAX_ASSET_FILES
+                ));
+            }
+            let mut names = BTreeSet::new();
+            for path in &positionals[1..] {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("validated asset basename");
+                if !names.insert(name.to_ascii_lowercase()) {
+                    return Err("release asset basenames must be unique".to_owned());
+                }
+            }
         }
         ("pr", "create")
             if !command
@@ -320,6 +370,22 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
     } else {
         None
     };
+    let asset_upload = if command[0] == "release" && command[1] == "upload" {
+        let positionals = positional_words(&command[2..]);
+        Some(GhAssetUploadRequest {
+            repository: repositories
+                .first()
+                .cloned()
+                .ok_or_else(|| "release upload request has no repository".to_owned())?,
+            tag: positionals[0].to_owned(),
+            files: positionals[1..]
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        })
+    } else {
+        None
+    };
     let release = if command[0] == "release" && command[1] == "create" {
         let tag = positional_words(&command[2..])
             .first()
@@ -375,6 +441,7 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
         clone_directory,
         merge,
         release,
+        asset_upload,
         review,
         checkout,
     })
@@ -905,6 +972,94 @@ mod tests {
             .is_err()
         );
         assert!(parse_words(&["release", "create", "v1.2.3", "--repo", "acme/persona"]).is_err());
+    }
+
+    #[test]
+    fn release_asset_upload_requires_an_explicit_tag_repo_and_file() {
+        let request = parse_words(&[
+            "release",
+            "upload",
+            "v1.2.3",
+            "dist.tar.gz",
+            "--repo",
+            "acme/persona",
+        ])
+        .unwrap();
+        assert_eq!(request.operation, GhOperation::AuditedReleaseAssetUpload);
+        assert_eq!(
+            request.asset_upload,
+            Some(GhAssetUploadRequest {
+                repository: "acme/persona".to_owned(),
+                tag: "v1.2.3".to_owned(),
+                files: vec![std::path::PathBuf::from("dist.tar.gz")],
+            })
+        );
+        assert!(parse_words(&["release", "upload", "v1", "--repo", "acme/persona"]).is_err());
+        assert!(
+            parse_words(&[
+                "release",
+                "upload",
+                "v1",
+                "dist.tar.gz#label",
+                "--repo",
+                "acme/persona"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_words(&[
+                "release",
+                "upload",
+                "v1",
+                "dist.tar.gz",
+                "--repo",
+                "acme/persona",
+                "--clobber"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_words(&[
+                "release",
+                "upload",
+                "v1",
+                "dist.tar.gz",
+                "-R",
+                "acme/persona"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_words(&[
+                "release",
+                "upload",
+                "v1",
+                "a.bin",
+                "b.bin",
+                "c.bin",
+                "d.bin",
+                "e.bin",
+                "f.bin",
+                "g.bin",
+                "h.bin",
+                "i.bin",
+                "--repo",
+                "acme/persona"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_words(&[
+                "release",
+                "upload",
+                "v1",
+                "same.bin",
+                "SAME.bin",
+                "--repo",
+                "acme/persona"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

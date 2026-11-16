@@ -9,7 +9,7 @@
       systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
 
-      runtimeTools = pkgs: [ pkgs.git pkgs.gnupg pkgs.openssh pkgs.gh ];
+      runtimeTools = pkgs: [ pkgs.git pkgs.gnupg pkgs.openssh pkgs.gh pkgs.curl ];
       testTools = pkgs: (runtimeTools pkgs) ++ [ pkgs.zsh pkgs.openssl pkgs.coreutils ];
 
       mkRustPackage = pkgs: extra:
@@ -101,6 +101,13 @@
             test "$status" -eq 126
             ! printf '%s' "$output" | grep -q 'absolute native GitHub CLI executable is required'
             printf '%s' "$output" | grep -q 'no Persona configuration'
+            mkdir "$HOME/project"
+            ${self.packages.${system}.persona}/bin/persona setup \
+              --profile smoke --scope-name smoke --scope "$HOME/project" \
+              --author-name "Synthetic Author" --author-email author@example.invalid \
+              --committer-name "Synthetic Committer" --committer-email committer@example.invalid
+            curl_version=$(${self.packages.${system}.persona}/bin/persona run --cwd "$HOME/project" -- curl --version)
+            printf '%s' "$curl_version" | grep -q '^curl '
             ${self.packages.${system}.persona}/bin/persona install refresh --apply
             remove_output=$(${self.packages.${system}.persona}/bin/persona install remove --apply)
             remove_backup=$(printf '%s\n' "$remove_output" | awk '/^Backup:/ { print $2 }')

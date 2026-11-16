@@ -3,7 +3,7 @@ use crate::runner::{RunError, RunRequest, SubprocessRunner};
 use crate::storage::{PersonaPaths, StorageError};
 use hmac::{Hmac, Mac};
 use serde_yaml::Value;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -34,6 +34,18 @@ pub enum CredentialError {
 }
 
 pub struct Secret(Vec<u8>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAssetContext {
+    pub release_id: u64,
+    pub asset_names: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetUploadError {
+    Rejected(u16),
+    Uncertain,
+}
 
 impl Secret {
     pub fn new(bytes: Vec<u8>) -> Self {
@@ -322,6 +334,147 @@ impl GithubSelector {
             .ok_or(CredentialError::InvalidMergeResponse)
     }
 
+    pub fn release_asset_context(
+        &self,
+        token: &Secret,
+        repository: &str,
+        tag: &str,
+    ) -> Result<ReleaseAssetContext, CredentialError> {
+        if crate::gh_adapter::normalize_repository(repository).as_deref() != Ok(repository)
+            || tag.is_empty()
+            || tag.len() > 255
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(CredentialError::InvalidMergeResponse);
+        }
+        let endpoint = format!("repos/{repository}/releases/tags/{tag}");
+        let output = self.run(&["api", &endpoint], &self.environment_with_token(&token.0))?;
+        if !output.status.success() {
+            return Err(CredentialError::AuthenticationUnavailable);
+        }
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| CredentialError::InvalidMergeResponse)?;
+        if response.get("tag_name").and_then(serde_json::Value::as_str) != Some(tag) {
+            return Err(CredentialError::InvalidMergeResponse);
+        }
+        let release_id = response
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(CredentialError::InvalidMergeResponse)?;
+        let assets = response
+            .get("assets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(CredentialError::InvalidMergeResponse)?;
+        let mut asset_names = std::collections::BTreeSet::new();
+        for asset in assets {
+            let name = asset
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or(CredentialError::InvalidMergeResponse)?;
+            if !asset_names.insert(name.to_ascii_lowercase()) {
+                return Err(CredentialError::InvalidMergeResponse);
+            }
+        }
+        Ok(ReleaseAssetContext {
+            release_id,
+            asset_names,
+        })
+    }
+
+    pub fn upload_release_asset(
+        &self,
+        token: &Secret,
+        repository: &str,
+        release_id: u64,
+        asset: &crate::asset_upload::AssetSnapshot,
+    ) -> Result<u64, AssetUploadError> {
+        if release_id == 0
+            || crate::gh_adapter::normalize_repository(repository).as_deref() != Ok(repository)
+            || !crate::asset_upload::valid_asset_name(&asset.name)
+            || asset.bytes.len() > crate::asset_upload::MAX_ASSET_FILE_BYTES
+        {
+            return Err(AssetUploadError::Uncertain);
+        }
+        let curl = upload_curl_executable().ok_or(AssetUploadError::Uncertain)?;
+        let encoded_name = encode_asset_query_value(&asset.name);
+        let endpoint = format!(
+            "https://uploads.github.com/repos/{repository}/releases/{release_id}/assets?name={encoded_name}"
+        );
+        let token = std::str::from_utf8(&token.0).map_err(|_| AssetUploadError::Uncertain)?;
+        let arguments = vec![
+            OsString::from("--disable"),
+            OsString::from("--location"),
+            OsString::from("--max-redirs"),
+            OsString::from("0"),
+            OsString::from("--proto"),
+            OsString::from("=https"),
+            OsString::from("--proto-redir"),
+            OsString::from("=https"),
+            OsString::from("--variable"),
+            OsString::from("%PERSONA_UPLOAD_TOKEN"),
+            OsString::from("--expand-header"),
+            OsString::from("Authorization: Bearer {{PERSONA_UPLOAD_TOKEN}}"),
+            OsString::from("--silent"),
+            OsString::from("--show-error"),
+            OsString::from("--include"),
+            OsString::from("--request"),
+            OsString::from("POST"),
+            OsString::from("--data-binary"),
+            OsString::from("@-"),
+            OsString::from("--header"),
+            OsString::from("Content-Type: application/octet-stream"),
+            OsString::from(endpoint),
+        ];
+        let upload_environment = [(
+            OsString::from("PERSONA_UPLOAD_TOKEN"),
+            OsString::from(token),
+        )];
+        let output = self
+            .run_executable_with_stdin(&curl, &arguments, &upload_environment, Some(&asset.bytes))
+            .map_err(|_| AssetUploadError::Uncertain)?;
+        let (status, body) =
+            parse_included_response(&output.stdout).ok_or(AssetUploadError::Uncertain)?;
+        if status == 422 {
+            return Err(AssetUploadError::Rejected(status));
+        }
+        if status != 201 || !output.status.success() {
+            return Err(AssetUploadError::Uncertain);
+        }
+        let response: serde_json::Value =
+            serde_json::from_slice(body).map_err(|_| AssetUploadError::Uncertain)?;
+        let asset_id = response
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(AssetUploadError::Uncertain)?;
+        if response.get("name").and_then(serde_json::Value::as_str) != Some(asset.name.as_str())
+            || response.get("size").and_then(serde_json::Value::as_u64)
+                != Some(asset.bytes.len() as u64)
+            || response.get("state").and_then(serde_json::Value::as_str) != Some("uploaded")
+        {
+            return Err(AssetUploadError::Uncertain);
+        }
+        let digest = response.get("digest").ok_or(AssetUploadError::Uncertain)?;
+        if !digest.is_null() {
+            let supplied = digest
+                .as_str()
+                .and_then(|value| value.strip_prefix("sha256:"))
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or(AssetUploadError::Uncertain)?;
+            let expected = format!("{:x}", Sha256::digest(&asset.bytes));
+            if !supplied.eq_ignore_ascii_case(&expected) {
+                return Err(AssetUploadError::Uncertain);
+            }
+        }
+        Ok(asset_id)
+    }
+
     pub fn create_release(
         &self,
         token: &Secret,
@@ -600,18 +753,37 @@ impl GithubSelector {
         args: &[&str],
         environment: &[(OsString, OsString)],
     ) -> Result<crate::runner::RunOutput, CredentialError> {
-        if !self.executable.is_absolute() {
+        self.run_with_stdin(args, environment, None)
+    }
+
+    fn run_with_stdin(
+        &self,
+        args: &[&str],
+        environment: &[(OsString, OsString)],
+        stdin: Option<&[u8]>,
+    ) -> Result<crate::runner::RunOutput, CredentialError> {
+        let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        self.run_executable_with_stdin(&self.executable, &args, environment, stdin)
+    }
+
+    fn run_executable_with_stdin(
+        &self,
+        executable: &Path,
+        args: &[OsString],
+        environment: &[(OsString, OsString)],
+        stdin: Option<&[u8]>,
+    ) -> Result<crate::runner::RunOutput, CredentialError> {
+        if !executable.is_absolute() {
             return Err(CredentialError::MissingGh);
         }
-        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
         let cwd = Path::new("/");
         self.runner
             .run(RunRequest {
-                executable: &self.executable,
-                args: &args,
+                executable,
+                args,
                 cwd,
                 environment,
-                stdin: None,
+                stdin,
             })
             .map_err(CredentialError::Command)
     }
@@ -641,6 +813,64 @@ impl GithubSelector {
             OsString::from(String::from_utf8_lossy(token).as_ref()),
         ));
         environment
+    }
+}
+
+fn upload_curl_executable() -> Option<PathBuf> {
+    let configured = env::var_os("PERSONA_CURL").map(PathBuf::from);
+    let selected = if let Some(path) = configured {
+        path
+    } else {
+        let search_path = env::var_os("PATH")?;
+        env::split_paths(&search_path)
+            .map(|directory| directory.join("curl"))
+            .find(|path| is_executable_file(path))?
+    };
+    if !selected.is_absolute() || !is_executable_file(&selected) {
+        return None;
+    }
+    fs::canonicalize(selected).ok()
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn encode_asset_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn parse_included_response(output: &[u8]) -> Option<(u16, &[u8])> {
+    let mut remaining = output;
+    loop {
+        let separator = remaining
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&remaining[..separator]).ok()?;
+        let status = headers
+            .lines()
+            .next()?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u16>()
+            .ok()?;
+        let body = &remaining[separator + 4..];
+        if body.starts_with(b"HTTP/") {
+            remaining = body;
+            continue;
+        }
+        return Some((status, body));
     }
 }
 
@@ -872,12 +1102,143 @@ fn read_private_key(path: &Path) -> Result<Vec<u8>, CredentialError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialError, GithubSelector, Secret, token_fingerprint, verify_fingerprint};
+    use super::{
+        CredentialError, GithubSelector, Secret, encode_asset_query_value, parse_included_response,
+        token_fingerprint, upload_curl_executable, verify_fingerprint,
+    };
     use crate::storage::PersonaPaths;
     use std::fs;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn included_api_responses_use_the_final_http_status_and_body() {
+        let response = b"HTTP/2.0 100 Continue\r\n\r\nHTTP/2.0 201 Created\r\nContent-Type: application/json\r\n\r\n{\"id\":1}";
+        assert_eq!(
+            parse_included_response(response),
+            Some((201, &b"{\"id\":1}"[..]))
+        );
+        assert_eq!(
+            parse_included_response(b"HTTP/2.0 422 Unprocessable Entity\r\n\r\n{}"),
+            Some((422, &b"{}"[..]))
+        );
+        assert_eq!(parse_included_response(b"not an HTTP response"), None);
+    }
+
+    #[test]
+    fn asset_query_values_encode_plus_as_data() {
+        assert_eq!(
+            encode_asset_query_value("release+notes.bin"),
+            "release%2Bnotes.bin"
+        );
+    }
+
+    #[test]
+    fn curl_upload_redirect_policy_never_sends_credentials_to_the_redirect_target() {
+        let curl = upload_curl_executable().expect("curl is required for managed asset uploads");
+        let redirect_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let redirect_port = redirect_listener.local_addr().unwrap().port();
+        let target_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        target_listener.set_nonblocking(true).unwrap();
+        redirect_listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let (mut stream, _) = loop {
+                match redirect_listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "curl did not connect");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("redirect fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = std::io::Read::read(&mut stream, &mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        let url = format!("http://127.0.0.1:{redirect_port}/upload");
+        let mut child = Command::new(curl)
+            .env_clear()
+            .args([
+                "--disable",
+                "--location",
+                "--max-redirs",
+                "0",
+                "--proto",
+                "=http",
+                "--proto-redir",
+                "=http",
+                "--variable",
+                "%PERSONA_UPLOAD_TOKEN",
+                "--expand-header",
+                "Authorization: Bearer {{PERSONA_UPLOAD_TOKEN}}",
+                "--silent",
+                "--show-error",
+                "--include",
+                "--request",
+                "POST",
+                "--data-binary",
+                "@-",
+                &url,
+            ])
+            .env("PERSONA_UPLOAD_TOKEN", "fixture-token")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"fixture upload body")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let initial_request = server.join().unwrap();
+        assert!(initial_request.contains("Authorization: Bearer fixture-token"));
+        assert!(
+            !output.status.success(),
+            "a zero-redirect policy must reject 302"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("HTTP/1.1 302 Found"),
+            "expected the first response, got stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            target_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "curl must not send a redirected request or the authorization header"
+        );
+    }
 
     #[test]
     fn hmac_fingerprints_are_stable_and_keyed() {

@@ -8,7 +8,7 @@ For behavior or security-boundary changes, open an issue first to discuss scope 
 
 ## Development setup
 
-Use Rust 1.85 or newer, Git, GnuPG, OpenSSH and GitHub CLI; test suites also need Zsh, OpenSSL and local SSH server tooling. The project has no requirement for a live GitHub account: provider tests use synthetic identities and local fixtures. Never run a contribution test against a real account or repository.
+Use Rust 1.85 or newer, Git, GnuPG, OpenSSH, GitHub CLI and curl 8.3 or newer; test suites also need Zsh, OpenSSL and local SSH server tooling. The project has no requirement for a live GitHub account: provider tests use synthetic identities and local fixtures. Never run a contribution test against a real account or repository.
 
 Useful commands:
 

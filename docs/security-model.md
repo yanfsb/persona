@@ -20,7 +20,9 @@ Persona stores account identifiers and a keyed token fingerprint for enrollment;
 
 A required mismatch blocks. Required `UNKNOWN`, missing, duplicate, or ambiguous evidence also blocks authorization. Unrelated unknown findings may remain visible without vetoing an operation that does not require them. Text diagnostic output is not a stable API; JSON output is versioned. Consult the CLI reference for exit statuses.
 
-Local checks do not prove remote reachability, successful authentication, future commits, provider-side authorization, or that the caller used the observed destination. Release creation has an unavoidable concurrent retag/deletion race because the provider API cannot atomically bind tag name to tag-object OID; the race is detectable only after the call.
+Local checks do not prove remote reachability, successful authentication, future commits, provider-side authorization, or that the caller used the observed destination. Release creation and asset upload have an unavoidable concurrent retag/deletion race because the provider API cannot atomically bind tag name to tag-object OID; the race is detectable only after the call.
+
+Managed asset upload reuses the release signing/account/destination gates. It snapshots bounded regular files using descriptor-relative no-follow opens within the physical worktree before selecting credentials. The upload transport disables curl configuration and inherited proxies, uses the fixed HTTPS GitHub upload endpoint, rejects redirects, and keeps the selected token out of argv. This is not a secrecy classifier: a worktree file may still contain material that must not be published. Review source archives and asset contents separately. Sequential uploads can partially succeed or have uncertain outcomes; Persona never automatically overwrites, deletes, or blindly retries them. See the [managed command restrictions](managed-commands.md#release-asset-upload).
 
 ## Safe use
 

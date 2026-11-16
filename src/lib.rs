@@ -1,3 +1,4 @@
+pub mod asset_upload;
 pub mod audit;
 pub mod authorization;
 pub mod config;

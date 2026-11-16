@@ -682,6 +682,23 @@ fn validate_managed_shim_directory() -> Result<PathBuf, String> {
     Ok(directory)
 }
 
+fn format_asset_upload_failure(
+    uploaded: &[String],
+    uncertain: Option<&str>,
+    reason: &str,
+) -> String {
+    let mut message = reason.to_owned();
+    if !uploaded.is_empty() {
+        message.push_str("; confirmed uploaded assets: ");
+        message.push_str(&uploaded.join(", "));
+    }
+    if let Some(name) = uncertain {
+        message.push_str("; uncertain asset: ");
+        message.push_str(name);
+    }
+    message
+}
+
 fn run_managed_gh() -> Result<u8, String> {
     let shim_directory = validate_managed_shim_directory()?;
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -791,21 +808,26 @@ fn run_managed_gh() -> Result<u8, String> {
                 .to_owned(),
         );
     }
-    let audited_release_tag_oid = if let Some(release) = &request.release {
-        if !profile.github.as_ref().is_some_and(|binding| {
-            binding.repositories.iter().any(|repository| {
-                persona::gh_adapter::normalize_repository(repository)
-                    .is_ok_and(|value| value == release.repository)
-            })
-        }) {
+    let release_target = request
+        .release
+        .as_ref()
+        .map(|release| (release.repository.as_str(), release.tag.as_str()))
+        .or_else(|| {
+            request
+                .asset_upload
+                .as_ref()
+                .map(|upload| (upload.repository.as_str(), upload.tag.as_str()))
+        });
+    let audited_release_tag_oid = if let Some((repository, tag)) = release_target {
+        if !allowed_repositories.contains(repository) {
             return Err("release repository is not in the enrolled profile allowlist".to_owned());
         }
         let push = profile.git.push.as_ref().ok_or_else(|| {
-            "release creation requires an explicit signed-tag publication policy".to_owned()
+            "release operations require an explicit signed-tag publication policy".to_owned()
         })?;
         if !push.allow_annotated_tags || profile.git.signing.is_none() {
             return Err(
-                "release creation requires explicit annotated-tag publication and signing policy"
+                "release operations require explicit annotated-tag publication and signing policy"
                     .to_owned(),
             );
         }
@@ -814,7 +836,7 @@ fn run_managed_gh() -> Result<u8, String> {
             .iter()
             .any(|destination| {
                 persona::gh_adapter::repository_from_destination(destination).as_deref()
-                    == Some(release.repository.as_str())
+                    == Some(repository)
             });
         if !has_destination {
             return Err(
@@ -827,7 +849,7 @@ fn run_managed_gh() -> Result<u8, String> {
             gpg: gpg_executable(),
             ssh_keygen: ssh_keygen_executable(),
         };
-        let (tag_report, _) = build_tag_report(&config, &cwd, &release.tag, &executables)?;
+        let (tag_report, _) = build_tag_report(&config, &cwd, tag, &executables)?;
         let tag_decision = authorize(
             AuthorizationOperation::GitTagVerification,
             vec![
@@ -845,7 +867,7 @@ fn run_managed_gh() -> Result<u8, String> {
             return Err("release tag failed local profile signature and scope audit".to_owned());
         }
         let git = GitClient::new(git_executable(), persona::git::safe_environment());
-        let reference = format!("refs/tags/{}", release.tag);
+        let reference = format!("refs/tags/{tag}");
         let oid = git
             .resolve_object_oid(&cwd, &reference)
             .map_err(|_| "release tag object is unavailable".to_owned())?;
@@ -855,7 +877,7 @@ fn run_managed_gh() -> Result<u8, String> {
             != "tag"
         {
             return Err(
-                "release creation accepts only an existing signed annotated tag".to_owned(),
+                "release operation accepts only an existing signed annotated tag".to_owned(),
             );
         }
         let commit_oid = git.tag_commit_target_oid(&cwd, &oid).map_err(|_| {
@@ -863,6 +885,18 @@ fn run_managed_gh() -> Result<u8, String> {
                 .to_owned()
         })?;
         Some((oid, commit_oid))
+    } else {
+        None
+    };
+    let asset_snapshots = if let Some(upload) = &request.asset_upload {
+        let git = GitClient::new(git_executable(), persona::git::safe_environment());
+        let root = git
+            .checkout_root(&cwd)
+            .map_err(|_| "release asset upload requires a managed Git worktree".to_owned())?;
+        Some(
+            persona::asset_upload::snapshot_files(&root, &cwd, &upload.files)
+                .map_err(|message| format!("cannot preflight release assets: {message}"))?,
+        )
     } else {
         None
     };
@@ -1076,6 +1110,122 @@ fn run_managed_gh() -> Result<u8, String> {
             "Submitted {:?} review {review_id} for {}#{}.",
             review.event, review.repository, review.pull_number
         );
+        return Ok(0);
+    }
+    if let (Some(upload), Some((local_tag_oid, _))) =
+        (&request.asset_upload, audited_release_tag_oid.as_ref())
+    {
+        let remote_tag_oid = selector
+            .tag_ref_oid(&selected_token, &upload.repository, &upload.tag)
+            .map_err(|_| "release tag is not present as an annotated tag on the allowlisted GitHub repository".to_owned())?;
+        if remote_tag_oid != *local_tag_oid {
+            return Err(
+                "remote GitHub tag object differs from the locally audited signed tag".to_owned(),
+            );
+        }
+        let release = selector
+            .release_asset_context(&selected_token, &upload.repository, &upload.tag)
+            .map_err(|_| {
+                "cannot verify an existing GitHub release for the exact audited tag".to_owned()
+            })?;
+        let snapshots = asset_snapshots
+            .as_ref()
+            .ok_or_else(|| "release asset snapshots are unavailable".to_owned())?;
+        if snapshots.iter().any(|asset| {
+            release
+                .asset_names
+                .contains(&asset.name.to_ascii_lowercase())
+        }) {
+            return Err(
+                "release asset name already exists; uploads never overwrite or clobber assets"
+                    .to_owned(),
+            );
+        }
+        let mut uploaded = Vec::new();
+        let mut upload_failure = None;
+        for asset in snapshots {
+            match selector.upload_release_asset(
+                &selected_token,
+                &upload.repository,
+                release.release_id,
+                asset,
+            ) {
+                Ok(asset_id) => uploaded.push(format!("{} (id {asset_id})", asset.name)),
+                Err(persona::credential::AssetUploadError::Rejected(status)) => {
+                    upload_failure = Some((
+                        None,
+                        format!(
+                            "GitHub rejected asset {} with HTTP {status}; no asset was overwritten",
+                            asset.name
+                        ),
+                    ));
+                    break;
+                }
+                Err(persona::credential::AssetUploadError::Uncertain) => {
+                    upload_failure = Some((
+                        Some(asset.name.clone()),
+                        format!(
+                            "upload of asset {} has an uncertain outcome; do not retry blindly",
+                            asset.name
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        let after_tag_oid = selector
+            .tag_ref_oid(&selected_token, &upload.repository, &upload.tag)
+            .map_err(|_| {
+                let reason = upload_failure
+                    .as_ref()
+                    .map(|(_, reason)| {
+                        format!("{reason}; post-upload remote tag verification failed")
+                    })
+                    .unwrap_or_else(|| {
+                        "assets were uploaded but post-upload remote tag verification failed"
+                            .to_owned()
+                    });
+                format_asset_upload_failure(
+                    &uploaded,
+                    upload_failure
+                        .as_ref()
+                        .and_then(|(uncertain, _)| uncertain.as_deref()),
+                    &reason,
+                )
+            })?;
+        if after_tag_oid != *local_tag_oid {
+            let reason = upload_failure
+                .as_ref()
+                .map(|(_, reason)| {
+                    format!("{reason}; remote tag changed concurrently during asset upload")
+                })
+                .unwrap_or_else(|| {
+                    "remote tag changed concurrently during asset upload".to_owned()
+                });
+            return Err(format_asset_upload_failure(
+                &uploaded,
+                upload_failure
+                    .as_ref()
+                    .and_then(|(uncertain, _)| uncertain.as_deref()),
+                &format!("{reason}; inspect the release before proceeding"),
+            ));
+        }
+        if let Some((uncertain, reason)) = upload_failure {
+            return Err(format_asset_upload_failure(
+                &uploaded,
+                uncertain.as_deref(),
+                &reason,
+            ));
+        }
+        println!(
+            "Uploaded {} asset(s) to existing release {}:{} after verifying its locally audited signed tag; no assets were overwritten.",
+            uploaded.len(),
+            upload.repository,
+            upload.tag
+        );
+        for asset in uploaded {
+            println!("Uploaded {asset}");
+        }
         return Ok(0);
     }
     if let (Some(release), Some((local_tag_oid, local_tag_commit_oid))) =

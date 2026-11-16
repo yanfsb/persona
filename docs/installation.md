@@ -5,7 +5,7 @@ Persona is a pre-release. This repository currently provides source and Nix pack
 ## Requirements
 
 - Rust 1.85 or newer to build from source (edition 2024).
-- Git, GnuPG, OpenSSH, and GitHub CLI for the integrations you use. Zsh is optional. Test suites additionally use OpenSSL and local SSH server tooling.
+- Git, GnuPG, OpenSSH, and GitHub CLI for the integrations you use. Managed release asset uploads also require curl 8.3 or newer; the Nix package includes it. Zsh is optional. Test suites additionally use OpenSSL and local SSH server tooling.
 - A supported build target: Apple Silicon macOS (`aarch64-darwin`), Linux arm64 (`aarch64-linux`), or Linux x86_64 (`x86_64-linux`). Current target declarations do not replace release-specific validation evidence.
 
 ## Build from source

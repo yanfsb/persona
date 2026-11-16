@@ -26,8 +26,11 @@ persona profile list
 persona scope show example
 persona install preview --bin-dir "$HOME/bin"
 persona run -- git status
+persona run -- gh release upload vX.Y.Z-rc.N target/release-artifacts/persona-vX.Y.Z-rc.N.tar.gz target/release-artifacts/SHA256SUMS --repo OWNER/REPO
 persona check --operation push --remote origin --destination https://example.invalid/org/repo.git < pre-push-tuples
 ```
+
+The upload example requires an existing release and matching locally audited, remotely published signed annotated tag; see the [bounded upload contract](managed-commands.md#release-asset-upload).
 
 The last command expects native Git pre-push tuples on standard input; without `--online-verified` it is an offline audit, not proof of remote reachability or credential validity. Adding `--online-verified` explicitly contacts GitHub to inspect outgoing commit verification; it still does not publish anything.
 

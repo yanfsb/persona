@@ -16,6 +16,16 @@ The managed `gh` adapter supports an explicit allowlist on GitHub.com, including
 
 PR checkout requires a clean worktree, fetches a specific PR head through managed transport, checks the fetched commit against API metadata, and refuses branch collisions/hooks that it cannot safely handle. Server-side merges require a separate explicit repository/base/strategy grant; the resulting server commit is not represented as locally signed. Release creation requires an already-published locally verified signed annotated tag, checks the remote tag before/after, and never creates or pushes that tag. The API does not atomically bind tag name to object ID, so a concurrent retag race can only be detected afterward.
 
+### Release asset upload
+
+`persona run -- gh release upload TAG FILE... --repo OWNER/REPO` uploads to an existing release only after the same enrolled-account, repository, publication-destination and signed-annotated-tag checks used by release creation. The remote tag must match the locally audited tag before and after upload. Upload never creates a release or tag.
+
+Supply one to eight explicit regular files within the selected physical Git worktree. Files are read through no-follow directory/file descriptors and snapshotted before credential selection or network activity. Limits are 64 MiB per file and 128 MiB total. Basenames must be unique (case-insensitively), at most 255 ASCII letters/digits or `.`, `_`, `+`, `-`, and cannot be `.`, `..`, or begin with `-`. Symlinks, paths escaping the worktree, directories, stdin, globs, labels and `--clobber` are refused. Review the actual asset contents before publishing; confinement does not establish that a file is safe to disclose.
+
+The uploader requires curl 8.3 or newer, disables curl configuration and inherited proxy settings, and sends snapshotted bytes only to the fixed HTTPS GitHub upload endpoint. All redirects are rejected; the selected token is never placed in command-line arguments. Returned asset IDs, names, sizes, states and supplied SHA-256 digests are validated.
+
+Uploads are sequential and non-transactional. Existing names are refused, assets are never overwritten/deleted, and failed requests are not automatically retried. An error identifies confirmed uploads and any uncertain asset. Inspect the release before retrying only missing assets: a timeout or server failure can leave an uploaded or empty `starter` asset. There is no managed asset deletion/replacement command. Pre/post tag checks detect a retag afterward but cannot prevent the provider's concurrent-retag race. Older/missing curl fails the upload rather than enabling native passthrough. These restrictions do not enable generic `gh api` headers, file inputs, or arbitrary upload URLs.
+
 ## Hooks, PATH and shell
 
 `persona run` adds temporary managed Git/gh shims for that invocation; it directly spawns the program without an implicit shell and preserves argv, cwd, stdio and exit status. Persistent adapter links are separately installed into an existing user-owned bin directory. Persona does not edit shell startup files. The optional Zsh prompt hook is visual convenience only.
