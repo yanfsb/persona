@@ -6,10 +6,10 @@ This matrix distinguishes source implementation, local tests, and hosted CI. A t
 
 | Item | Current evidence | Status |
 |---|---|---|
-| Version | `0.1.1-rc.1`; historical predecessor at [`releases/v0.1.0-rc.1.md`](releases/v0.1.0-rc.1.md); candidate note at [`releases/v0.1.1-rc.1.md`](releases/v0.1.1-rc.1.md) | Patch release candidate; do not treat as a stable or production-security release |
+| Version | `0.1.1-rc.2`; candidate predecessor at [`releases/v0.1.1-rc.1.md`](releases/v0.1.1-rc.1.md), historical release at [`releases/v0.1.0-rc.1.md`](releases/v0.1.0-rc.1.md); candidate note at [`releases/v0.1.1-rc.2.md`](releases/v0.1.1-rc.2.md) | Patch release candidate; do not treat as a stable or production-security release |
 | Declared targets | Apple Silicon macOS, Linux arm64, Linux x86_64 (`Cargo.toml`, CI matrix) | Target declaration only |
 | CI-fix branch | Run [43128664622](https://github.com/yanfsb/persona/actions/runs/43128664622), commit `e61a72d` on `fix/ci-fixtures` | Passed on Linux x86_64, Linux arm64, and macOS arm64; this run predates and does not cover the open-source-preparation candidate. |
-| Merged open-source-preparation baseline | Run [43489260619](https://github.com/yanfsb/persona/actions/runs/43489260619), merge commit `d43baba` on `main` | Passed on Linux x86_64, Linux arm64, and macOS arm64, including the workflow Nix checks. This is not evidence for the new patch candidate. |
+| Merged open-source-preparation baseline | Run [43489260619](https://github.com/yanfsb/persona/actions/runs/43489260619), merge commit `d43baba` on `main` | Passed on Linux x86_64, Linux arm64, and macOS arm64, including the workflow Nix checks. This is not evidence for `v0.1.1-rc.2`. |
 | Earlier failed run | Run `42851871730`: Linux stale-ref race assertion and macOS key-staging fixture failed | Historical failures resolved by the CI-fix branch; preserve the RC1 release-time record below. |
 | Real-provider pilot | Account binding, repository metadata read, and SSH fetch were checked in a limited local pilot | Managed publication and production use were **not** exercised; no release-readiness claim. |
 | Private vulnerability reporting | GitHub API readback reports the channel enabled; repository owner `yanfsb` has admin access | Channel enabled. Notification delivery and monitoring are not independently observable from this workflow; confirm maintainer coverage before making support commitments. |

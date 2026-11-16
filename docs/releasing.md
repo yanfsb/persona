@@ -32,6 +32,6 @@ After explicit maintainer authorization, create the tag/release from the reviewe
 
 ## Current baseline
 
-`v0.1.0-rc.1` is a historical release candidate; preserve its release-time evidence in [its notes](releases/v0.1.0-rc.1.md). Hosted run [43489260619](https://github.com/yanfsb/persona/actions/runs/43489260619) passed on all three matrix platforms for the merged open-source-preparation baseline. It is not evidence for the `v0.1.1-rc.1` candidate; require CI on the exact reviewed candidate commit before tagging.
+`v0.1.0-rc.1` is a historical release candidate; preserve its release-time evidence in [its notes](releases/v0.1.0-rc.1.md). Hosted run [43489260619](https://github.com/yanfsb/persona/actions/runs/43489260619) passed on all three matrix platforms for the merged open-source-preparation baseline. It is not evidence for the `v0.1.1-rc.2` candidate; require CI on the exact reviewed candidate commit before tagging.
 
 A limited real-account pilot verified account binding, repository metadata reads, and SSH fetch. Managed publication and production use remain untested. GitHub reports the repository public and Apache-2.0 metadata; the private vulnerability-reporting channel is enabled. The repository owner has admin access and is the sole account returned by GitHub's contributors endpoint. Notification monitoring and separate legal rights-holder authority are not independently verified.
