@@ -1180,6 +1180,39 @@ enum ManagedGitOperation {
 }
 
 impl ManagedGitOperation {
+    fn policy_selector(&self, arguments: &[OsString]) -> &'static str {
+        match self {
+            Self::RemoteAdd => "remote.add",
+            Self::BranchList => "branch.list",
+            Self::BranchCreate => "branch.create",
+            Self::WorktreeList => "worktree.list",
+            Self::WorktreeAdd => "worktree.add",
+            Self::TagList => "tag.list",
+            Self::SignedTag => "tag.signed",
+            Self::LightweightTag => "tag.lightweight",
+            Self::Fetch if arguments.iter().any(|argument| argument == "--all") => "fetch.all",
+            Self::Status => "status",
+            Self::Diff => "diff",
+            Self::Show => "show",
+            Self::Add => "add",
+            Self::Restore => "restore",
+            Self::Rm => "rm",
+            Self::Init => "init",
+            Self::Commit => "commit",
+            Self::Log => "log",
+            Self::Switch => "switch",
+            Self::Checkout => "checkout",
+            Self::Merge => "merge",
+            Self::CherryPick => "cherry-pick",
+            Self::Rebase => "rebase",
+            Self::Fetch => "fetch",
+            Self::Pull => "pull",
+            Self::Push => "push",
+            Self::Clone => "clone",
+            Self::RevParse => "rev-parse",
+        }
+    }
+
     fn name(&self) -> &'static str {
         match self {
             Self::Status => "status",
@@ -1232,7 +1265,11 @@ fn resolve_managed_git_operation(arguments: &[OsString]) -> Result<ManagedGitOpe
         }
         "commit" if safe_commit_arguments(args) => ManagedGitOperation::Commit,
         "log" if safe_log_arguments(args) => ManagedGitOperation::Log,
-        "branch" if args == [OsString::from("--list")] => ManagedGitOperation::BranchList,
+        "branch"
+            if args == [OsString::from("--list")] || args == [OsString::from("--show-current")] =>
+        {
+            ManagedGitOperation::BranchList
+        }
         "branch" if safe_branch_create_arguments(args) => ManagedGitOperation::BranchCreate,
         "switch" if safe_switch_arguments(args) => ManagedGitOperation::Switch,
         "checkout" if safe_checkout_arguments(args) => ManagedGitOperation::Checkout,
@@ -1247,7 +1284,7 @@ fn resolve_managed_git_operation(arguments: &[OsString]) -> Result<ManagedGitOpe
         "tag" if safe_signed_tag_arguments(args) => ManagedGitOperation::SignedTag,
         "tag" if safe_lightweight_tag_arguments(args) => ManagedGitOperation::LightweightTag,
         "fetch" if safe_fetch_arguments(args) => ManagedGitOperation::Fetch,
-        "pull" if safe_fetch_arguments(args) => ManagedGitOperation::Pull,
+        "pull" if safe_pull_arguments(args) => ManagedGitOperation::Pull,
         "push" if safe_push_arguments(args) => ManagedGitOperation::Push,
         "clone" if safe_clone_arguments(args) => ManagedGitOperation::Clone,
         "rev-parse"
@@ -1332,6 +1369,59 @@ fn run_managed_git() -> Result<u8, String> {
         (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
     ];
     let git_client = GitClient::new(native_git.clone(), preflight_environment.clone());
+    if matches!(
+        operation,
+        ManagedGitOperation::Fetch | ManagedGitOperation::Pull
+    ) && !(operation == ManagedGitOperation::Fetch
+        && git_arguments[1..]
+            .iter()
+            .any(|argument| argument == "--all"))
+        && !git_arguments[1..].iter().any(|argument| {
+            argument
+                .to_str()
+                .is_some_and(|value| !value.starts_with('-'))
+        })
+    {
+        let (remote, branch) = if operation == ManagedGitOperation::Pull {
+            git_client
+                .configured_upstream(&directory)
+                .map_err(|_| "pull requires one configured branch upstream".to_owned())?
+        } else {
+            (
+                git_client.default_fetch_remote(&directory).map_err(|_| {
+                    "cannot resolve Git's configured default fetch remote".to_owned()
+                })?,
+                String::new(),
+            )
+        };
+        let mut canonical = vec![git_arguments[0].clone()];
+        canonical.extend(git_arguments[1..].iter().cloned());
+        canonical.push(OsString::from(remote));
+        if !branch.is_empty() {
+            canonical.push(OsString::from(branch));
+        }
+        git_arguments = canonical;
+    }
+    if operation == ManagedGitOperation::Push
+        && !git_arguments[1..].iter().any(|argument| {
+            argument
+                .to_str()
+                .is_some_and(|value| !value.starts_with('-'))
+        })
+    {
+        let (remote, destination_branch) = git_client
+            .default_push_target(&directory)
+            .map_err(|_| "cannot resolve Git's configured default push remote/ref".to_owned())?;
+        let branch = git_client
+            .current_branch(&directory)
+            .map_err(|_| "push requires a current branch".to_owned())?;
+        let mut canonical = git_arguments;
+        canonical.push(OsString::from(remote));
+        canonical.push(OsString::from(format!(
+            "refs/heads/{branch}:refs/heads/{destination_branch}"
+        )));
+        git_arguments = canonical;
+    }
     let worktree_add = operation == ManagedGitOperation::WorktreeAdd;
     let checkout_mutation = matches!(
         operation,
@@ -1426,6 +1516,12 @@ fn run_managed_git() -> Result<u8, String> {
         .iter()
         .find(|profile| profile.name == selected_policy.profile)
         .ok_or_else(|| "managed Git profile is unavailable".to_owned())?;
+    let selector = operation.policy_selector(&git_arguments[1..]);
+    if !profile.git.commands.permits(selector) {
+        return Err(format!(
+            "Git operation `{selector}` is denied by the selected Persona profile"
+        ));
+    }
     let gh_parent_authorized = match std::env::var_os("PERSONA_GH_AUTHORIZED") {
         Some(marker) if marker == "1" => {
             if [
@@ -1500,6 +1596,11 @@ fn run_managed_git() -> Result<u8, String> {
             "inherited GitHub token override is not permitted for managed Git transport".to_owned(),
         );
     }
+    let fetch_all = operation == ManagedGitOperation::Fetch
+        && git_arguments[1..]
+            .iter()
+            .any(|argument| argument == "--all");
+    let mut managed_fetch_targets: Vec<(String, String, bool)> = Vec::new();
     let mut managed_destination = None;
     let mut use_managed_ssh = false;
     let mut managed_push_request = None;
@@ -1704,7 +1805,28 @@ fn run_managed_git() -> Result<u8, String> {
             return Err("inherited Git configuration redirects the commit worktree".to_owned());
         }
     }
-    if matches!(
+    if fetch_all {
+        let configured_remotes = git_client
+            .configured_remotes(&directory)
+            .map_err(|_| "cannot resolve configured Git remotes".to_owned())?;
+        if configured_remotes.is_empty() {
+            return Err("fetch --all requires at least one configured remote".to_owned());
+        }
+        if git_client
+            .has_unsafe_https_transport_config(&directory)
+            .map_err(|_| "cannot validate local Git HTTPS configuration".to_owned())?
+        {
+            return Err("unsafe local HTTPS transport configuration is present".to_owned());
+        }
+        for remote in git_client
+            .fetch_all_remotes(&directory)
+            .map_err(|_| "cannot resolve Git's eligible fetch-all remotes".to_owned())?
+        {
+            let (destination, uses_ssh) =
+                managed_fetch_destination(&git_client, profile, &directory, &remote)?;
+            managed_fetch_targets.push((remote, destination, uses_ssh));
+        }
+    } else if matches!(
         operation,
         ManagedGitOperation::Fetch | ManagedGitOperation::Pull
     ) {
@@ -1748,9 +1870,6 @@ fn run_managed_git() -> Result<u8, String> {
     } else if command == "push" {
         let push = persona::git_command::PushInvocation::parse(&git_arguments[1..])
             .map_err(str::to_owned)?;
-        if push.set_upstream {
-            return Err("managed push currently rejects implicit upstream tracking".to_owned());
-        }
         if push.refspecs.len() > 1 && !push.atomic {
             return Err("multi-ref publication requires explicit --atomic".to_owned());
         }
@@ -1758,6 +1877,9 @@ fn run_managed_git() -> Result<u8, String> {
         let mut canonical = vec![OsString::from("push")];
         if push.atomic {
             canonical.push(OsString::from("--atomic"));
+        }
+        if push.set_upstream {
+            canonical.push(OsString::from("--set-upstream"));
         }
         for lease in &push.leases {
             canonical.push(OsString::from(format!(
@@ -1976,7 +2098,11 @@ fn run_managed_git() -> Result<u8, String> {
         }
     }
     if gh_parent_authorized {
-        if let Some(destination) = &managed_destination {
+        if fetch_all {
+            for (_, destination, _) in &managed_fetch_targets {
+                validate_nested_gh_git_destination(profile, destination)?;
+            }
+        } else if let Some(destination) = &managed_destination {
             validate_nested_gh_git_destination(profile, destination)?;
         }
     }
@@ -2043,9 +2169,27 @@ fn run_managed_git() -> Result<u8, String> {
             return Err("managed SSH adapter target is unexpected".to_owned());
         }
     }
-    let managed_path =
-        std::env::join_paths([shim_dir, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
-            .map_err(|_| "cannot construct managed Git helper PATH".to_owned())?;
+    let managed_path = std::env::join_paths([
+        shim_dir.clone(),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ])
+    .map_err(|_| "cannot construct managed Git helper PATH".to_owned())?;
+    if fetch_all {
+        return execute_managed_fetch_all(ManagedFetchAllContext {
+            native_git: &native_git,
+            directory: &directory,
+            git_arguments: &git_arguments,
+            global_arguments: &global_arguments,
+            targets: &managed_fetch_targets,
+            config_path: &config_path,
+            isolated_home: home.path(),
+            managed_path: &managed_path,
+            ssh_adapter: &ssh_adapter,
+            shim_directory: &shim_dir,
+            native_gh: native_gh.as_deref(),
+        });
+    }
     let commit_operation = operation == ManagedGitOperation::Commit;
     let preserve_cherry_pick_author = selected_policy
         .git
@@ -2161,7 +2305,27 @@ fn run_managed_git() -> Result<u8, String> {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("PERSONA_CONFIG_PATH", &config_path)
-        .env("PERSONA_GIT", &native_git);
+        .env("PERSONA_GIT", &native_git)
+        .env(
+            "PERSONA_GIT_CREDENTIAL_DIRECTION",
+            if matches!(
+                operation,
+                ManagedGitOperation::Fetch | ManagedGitOperation::Pull | ManagedGitOperation::Clone
+            ) {
+                "fetch"
+            } else {
+                "push"
+            },
+        )
+        .env("PERSONA_GIT_OPERATION_SELECTOR", selector);
+    if matches!(
+        operation,
+        ManagedGitOperation::Fetch | ManagedGitOperation::Pull
+    ) {
+        if let Some(remote) = git_arguments.get(1).and_then(|value| value.to_str()) {
+            command.env("PERSONA_GIT_CREDENTIAL_REMOTE", remote);
+        }
+    }
     if let Some(path) = &expected_ssh_push_path {
         command.env("PERSONA_EXPECTED_SSH_PUSH_PATH", path);
     }
@@ -2284,6 +2448,14 @@ fn run_managed_git() -> Result<u8, String> {
             .arg(command_name)
             .arg("--no-ext-diff")
             .arg("--no-textconv")
+            .args(&git_arguments[1..]);
+    } else if matches!(
+        operation,
+        ManagedGitOperation::Fetch | ManagedGitOperation::Pull
+    ) {
+        command
+            .arg(command_name)
+            .args(managed_fetch_safety_arguments(&git_arguments[1..]))
             .args(&git_arguments[1..]);
     } else {
         if operation == ManagedGitOperation::Commit
@@ -2551,10 +2723,18 @@ fn safe_status_arguments(arguments: &[OsString]) -> bool {
                 "--short"
                     | "-s"
                     | "--porcelain"
+                    | "--porcelain=v1"
+                    | "--porcelain=v2"
                     | "--branch"
                     | "--show-stash"
+                    | "--ahead-behind"
+                    | "--no-renames"
                     | "--untracked-files=no"
+                    | "--untracked-files=normal"
+                    | "--untracked-files=all"
                     | "--ignore-submodules=none"
+                    | "--ignore-submodules=dirty"
+                    | "--ignored=no"
             )
         )
     })
@@ -2798,11 +2978,13 @@ fn safe_clone_arguments(arguments: &[OsString]) -> bool {
 }
 
 fn safe_push_arguments(arguments: &[OsString]) -> bool {
+    if arguments.is_empty() {
+        return true;
+    }
     let Ok(push) = persona::git_command::PushInvocation::parse(arguments) else {
         return false;
     };
-    !push.set_upstream
-        && (push.refspecs.len() == 1 || push.atomic)
+    (push.refspecs.len() == 1 || push.atomic)
         && push.refspecs.iter().all(|refspec| {
             let destination_namespace = if refspec.destination.starts_with("refs/heads/") {
                 "refs/heads/"
@@ -2817,27 +2999,206 @@ fn safe_push_arguments(arguments: &[OsString]) -> bool {
         })
 }
 
+struct ManagedFetchAllContext<'a> {
+    native_git: &'a Path,
+    directory: &'a Path,
+    git_arguments: &'a [OsString],
+    global_arguments: &'a [OsString],
+    targets: &'a [(String, String, bool)],
+    config_path: &'a Path,
+    isolated_home: &'a Path,
+    managed_path: &'a std::ffi::OsStr,
+    ssh_adapter: &'a Path,
+    shim_directory: &'a Path,
+    native_gh: Option<&'a Path>,
+}
+
+fn managed_fetch_safety_arguments(arguments: &[OsString]) -> Vec<&'static str> {
+    let mut safety_arguments = Vec::with_capacity(3);
+    if !arguments.iter().any(|argument| argument == "--prune") {
+        safety_arguments.push("--no-prune");
+    }
+    safety_arguments.push("--no-prune-tags");
+    safety_arguments.push("--no-recurse-submodules");
+    safety_arguments
+}
+
+fn execute_managed_fetch_all(context: ManagedFetchAllContext<'_>) -> Result<u8, String> {
+    let ManagedFetchAllContext {
+        native_git,
+        directory,
+        git_arguments,
+        global_arguments,
+        targets,
+        config_path,
+        isolated_home,
+        managed_path,
+        ssh_adapter,
+        shim_directory,
+        native_gh,
+    } = context;
+    let original_home = std::env::var_os("HOME").map(PathBuf::from);
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| original_home.as_ref().map(|home| home.join(".config")));
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| original_home.as_ref().map(|home| home.join(".local/state")));
+    let mut failed = false;
+
+    for (index, (remote, _destination, use_ssh)) in targets.iter().enumerate() {
+        let mut child = Command::new(native_git);
+        child
+            .arg("--no-pager")
+            .arg("-c")
+            .arg("core.pager=cat")
+            .arg("-c")
+            .arg("core.fsmonitor=false");
+        for (key, value) in persona::git_https::required_git_http_overrides() {
+            child.arg("-c").arg(format!("{key}={value}"));
+        }
+        if *use_ssh {
+            child.arg("-c").arg("ssh.variant=ssh");
+        }
+        child
+            .arg("-c")
+            .arg("fetch.prune=false")
+            .arg("-c")
+            .arg("fetch.pruneTags=false")
+            .arg("-c")
+            .arg("fetch.recurseSubmodules=false")
+            .arg("-c")
+            .arg("credential.helper=persona")
+            .arg("-c")
+            .arg("fetch.bundleURI=")
+            .args(global_arguments)
+            .arg("fetch")
+            .args(managed_fetch_safety_arguments(&git_arguments[1..]))
+            .arg("--no-auto-gc")
+            .arg("--no-write-commit-graph");
+        child.args(
+            git_arguments[1..]
+                .iter()
+                .filter(|argument| *argument != "--all"),
+        );
+        if index > 0 {
+            child.arg("--append");
+        }
+        child
+            .arg(remote)
+            .current_dir(directory)
+            .env_clear()
+            .env("HOME", isolated_home)
+            .env("PATH", managed_path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("PERSONA_CONFIG_PATH", config_path)
+            .env("PERSONA_GIT", native_git)
+            .env("PERSONA_GIT_CREDENTIAL_DIRECTION", "fetch")
+            .env("PERSONA_GIT_CREDENTIAL_REMOTE", remote)
+            .env("PERSONA_GIT_OPERATION_SELECTOR", "fetch.all")
+            .env("PERSONA_SHIM_DIR", shim_directory);
+        if let Some(config_home) = &config_home {
+            child.env("XDG_CONFIG_HOME", config_home).env(
+                "GH_CONFIG_DIR",
+                std::env::var_os("GH_CONFIG_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| config_home.join("gh")),
+            );
+        }
+        if let Some(state_home) = &state_home {
+            child.env("XDG_STATE_HOME", state_home);
+        }
+        if let Some(gh) = native_gh {
+            child.env("PERSONA_GH", gh);
+        }
+        if *use_ssh {
+            child
+                .env("GIT_SSH", ssh_adapter)
+                .env("GIT_SSH_VARIANT", "ssh");
+            if let Some(ssh) = std::env::var_os("PERSONA_SSH") {
+                child.env("PERSONA_SSH", ssh);
+            }
+            if let Some(ssh_keygen) = std::env::var_os("PERSONA_SSH_KEYGEN") {
+                child.env("PERSONA_SSH_KEYGEN", ssh_keygen);
+            }
+        }
+        match child.status() {
+            Ok(status) if status.success() => {}
+            Ok(_) => failed = true,
+            Err(error) => {
+                eprintln!("cannot launch managed fetch for remote `{remote}`: {error}");
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed { 1 } else { 0 })
+}
+
 fn safe_fetch_arguments(arguments: &[OsString]) -> bool {
-    let Some(remote) = arguments.first().and_then(|value| value.to_str()) else {
+    safe_transfer_arguments(arguments, false)
+}
+
+fn safe_pull_arguments(arguments: &[OsString]) -> bool {
+    safe_transfer_arguments(arguments, true)
+}
+
+fn safe_transfer_arguments(arguments: &[OsString], pull: bool) -> bool {
+    let mut positional = Vec::new();
+    let mut saw_all = false;
+    for argument in arguments {
+        let Some(value) = argument.to_str() else {
+            return false;
+        };
+        let allowed = matches!(value, "--prune" | "--no-tags" | "--quiet" | "--verbose")
+            || (pull && value == "--ff-only")
+            || (!pull && value == "--all");
+        if allowed {
+            if value == "--all" {
+                if saw_all {
+                    return false;
+                }
+                saw_all = true;
+            }
+            continue;
+        }
+        positional.push(value);
+    }
+    if saw_all && !positional.is_empty() {
         return false;
-    };
+    }
+    if positional.is_empty() {
+        return true;
+    }
+    if positional.len() > 2 {
+        return false;
+    }
+    let remote = positional[0];
     let valid_remote = !remote.is_empty()
         && !remote.starts_with('-')
         && remote.len() <= 128
         && remote
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    valid_remote
-        && (arguments.len() == 1
-            || (arguments.len() == 2
-                && arguments[1].to_str().is_some_and(|refspec| {
-                    refspec
-                        .strip_prefix("refs/pull/")
-                        .and_then(|value| value.strip_suffix("/head"))
-                        .is_some_and(|number| {
-                            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-                        })
-                })))
+    if !valid_remote {
+        return false;
+    }
+    positional.get(1).is_none_or(|refspec| {
+        refspec
+            .strip_prefix("refs/pull/")
+            .and_then(|value| value.strip_suffix("/head"))
+            .is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            || (refspec.starts_with("refs/heads/")
+                && !refspec[11..].is_empty()
+                && !refspec[11..].contains(['*', '?', '[', '\\']))
+            || (!refspec.starts_with('-')
+                && !refspec.contains(['/', ':', '*', '?', '[', '\\'])
+                && !refspec.is_empty())
+    })
 }
 
 fn is_supported_https_destination(destination: &str) -> bool {
@@ -3114,16 +3475,46 @@ fn run_managed_ssh() -> Result<u8, String> {
         .iter()
         .find(|policy| policy.name == scope.name)
         .ok_or_else(|| "SSH scope has no Git policy".to_owned())?;
-    let push = policy
-        .git
-        .push
-        .as_ref()
-        .ok_or_else(|| "SSH requires an explicit allowed destination policy".to_owned())?;
     let profile = config
         .profiles()
         .iter()
         .find(|profile| profile.name == policy.profile)
         .ok_or_else(|| "SSH profile is unavailable".to_owned())?;
+    let fallback_selector = if expected_program == "git-receive-pack" {
+        "push"
+    } else {
+        "fetch"
+    };
+    let operation_selector = std::env::var("PERSONA_GIT_OPERATION_SELECTOR")
+        .unwrap_or_else(|_| fallback_selector.to_owned());
+    if !profile.git.commands.permits(&operation_selector) {
+        return Err(format!(
+            "SSH transport operation `{operation_selector}` is denied by the selected Persona profile"
+        ));
+    }
+    let allowed_destinations = if expected_program == "git-receive-pack" {
+        policy
+            .git
+            .push
+            .as_ref()
+            .ok_or_else(|| "SSH push requires an explicit allowed destination policy".to_owned())?
+            .destinations
+            .clone()
+    } else if !profile.git.remotes.is_empty() {
+        profile
+            .git
+            .remotes
+            .iter()
+            .flat_map(|remote| remote.fetch_destinations.iter().cloned())
+            .collect::<Vec<_>>()
+    } else {
+        policy
+            .git
+            .push
+            .as_ref()
+            .map(|push| push.destinations.clone())
+            .unwrap_or_default()
+    };
     let ssh_policy = profile
         .ssh
         .as_ref()
@@ -3131,7 +3522,7 @@ fn run_managed_ssh() -> Result<u8, String> {
     let candidates = ssh_destination_candidates(user, host, port, path);
     if !candidates
         .iter()
-        .any(|candidate| push.destinations.contains(candidate))
+        .any(|candidate| allowed_destinations.contains(candidate))
     {
         return Err("SSH destination is not explicitly allowed".to_owned());
     }
@@ -4383,6 +4774,7 @@ fn setup(args: SetupArgs) -> Result<u8, String> {
             signing: None,
             push: None,
             remotes: Vec::new(),
+            commands: persona::config::GitCommandPolicy::default(),
         },
     };
     let config = Config::single_scope(profile, args.scope_name, scope_root)
@@ -4548,10 +4940,45 @@ fn git_credential_helper(action: &str) -> Result<u8, String> {
         .github
         .as_ref()
         .ok_or_else(|| "managed Persona profile has no GitHub credential binding".to_owned())?;
-    let push_policy =
-        policy.git.push.as_ref().ok_or_else(|| {
-            "managed Persona profile has no allowed HTTPS destinations".to_owned()
-        })?;
+    let direction = match std::env::var("PERSONA_GIT_CREDENTIAL_DIRECTION").as_deref() {
+        Ok("fetch") => "fetch",
+        Ok("push") | Err(_) => "push",
+        _ => return Err("unsupported managed Git credential direction".to_owned()),
+    };
+    let requested_remote = std::env::var("PERSONA_GIT_CREDENTIAL_REMOTE").ok();
+    let allowed_destinations = if direction == "push" {
+        policy
+            .git
+            .push
+            .as_ref()
+            .ok_or_else(|| "managed Persona profile has no allowed push destinations".to_owned())?
+            .destinations
+            .clone()
+    } else if let Some(remote) = requested_remote.as_deref() {
+        configured_fetch_destinations(profile, remote)
+            .ok_or_else(|| format!("managed Persona profile has no fetch policy for `{remote}`"))?
+            .to_vec()
+    } else if !profile.git.remotes.is_empty() {
+        let mut destinations = profile
+            .git
+            .remotes
+            .iter()
+            .flat_map(|remote| remote.fetch_destinations.iter().cloned())
+            .collect::<Vec<_>>();
+        destinations.sort();
+        destinations.dedup();
+        destinations
+    } else {
+        policy
+            .git
+            .push
+            .as_ref()
+            .map(|push| push.destinations.clone())
+            .unwrap_or_default()
+    };
+    if allowed_destinations.is_empty() {
+        return Err("managed Persona profile has no allowed HTTPS destinations".to_owned());
+    }
     let gh = gh_executable().ok_or_else(|| "GitHub CLI is unavailable".to_owned())?;
     let paths =
         PersonaPaths::discover().map_err(|_| "cannot resolve Persona private state".to_owned())?;
@@ -4562,7 +4989,7 @@ fn git_credential_helper(action: &str) -> Result<u8, String> {
         action,
         input.expose(),
         binding,
-        push_policy,
+        &allowed_destinations,
         &selector,
         &mut output,
     )
@@ -4717,6 +5144,38 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
                 .map_err(|error| format!("cannot remove profile: {error:?}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
+    }
+}
+
+fn managed_fetch_destination(
+    git: &GitClient,
+    profile: &Profile,
+    directory: &Path,
+    remote: &str,
+) -> Result<(String, bool), String> {
+    let allowed = configured_fetch_destinations(profile, remote).ok_or_else(|| {
+        format!("fetch remote `{remote}` has no profile-bound destination policy")
+    })?;
+    if allowed.is_empty() {
+        return Err(format!("fetch remote `{remote}` is not authorized"));
+    }
+    let destinations = git
+        .effective_fetch_destinations(directory, remote)
+        .map_err(|_| format!("cannot resolve effective destination for fetch remote `{remote}`"))?;
+    if destinations.len() != 1 || !allowed.contains(&destinations[0]) {
+        return Err(format!(
+            "fetch remote `{remote}` does not resolve to one exact allowed destination"
+        ));
+    }
+    let destination = destinations[0].clone();
+    if is_supported_https_destination(&destination) {
+        Ok((destination, false))
+    } else {
+        validate_managed_ssh_destination(profile.ssh.as_ref(), &destination, "git-upload-pack")
+            .map_err(|reason| {
+                format!("fetch remote `{remote}` has no valid managed SSH transport: {reason}")
+            })?;
+        Ok((destination, true))
     }
 }
 
@@ -5051,6 +5510,9 @@ fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Resul
             signing,
             push,
             remotes,
+            commands: existing
+                .map(|profile| profile.git.commands.clone())
+                .unwrap_or_default(),
         },
     })
 }
@@ -5359,5 +5821,50 @@ fn absolute_path(path: &Path, base: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         base.join(path)
+    }
+}
+
+#[cfg(test)]
+mod managed_git_argument_tests {
+    use super::{managed_fetch_safety_arguments, safe_fetch_arguments, safe_pull_arguments};
+    use std::ffi::OsString;
+
+    #[test]
+    fn fetch_all_accepts_only_a_bounded_option_set_without_remotes_or_refspecs() {
+        assert!(safe_fetch_arguments(&[OsString::from("--all")]));
+        assert!(safe_fetch_arguments(&[
+            OsString::from("--prune"),
+            OsString::from("--all"),
+            OsString::from("--quiet")
+        ]));
+        assert!(!safe_fetch_arguments(&[
+            OsString::from("--all"),
+            OsString::from("origin")
+        ]));
+        assert!(!safe_fetch_arguments(&[
+            OsString::from("--all"),
+            OsString::from("main")
+        ]));
+    }
+
+    #[test]
+    fn managed_fetch_explicitly_disables_unpreflighted_remote_side_effects() {
+        assert_eq!(
+            managed_fetch_safety_arguments(&[]),
+            ["--no-prune", "--no-prune-tags", "--no-recurse-submodules"]
+        );
+        assert_eq!(
+            managed_fetch_safety_arguments(&[OsString::from("--prune")]),
+            ["--no-prune-tags", "--no-recurse-submodules"]
+        );
+    }
+
+    #[test]
+    fn bounded_gui_transfer_flags_remain_supported() {
+        assert!(safe_fetch_arguments(&[
+            OsString::from("--prune"),
+            OsString::from("origin")
+        ]));
+        assert!(safe_pull_arguments(&[OsString::from("--ff-only")]));
     }
 }

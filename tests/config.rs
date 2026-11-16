@@ -106,6 +106,79 @@ fn v2_profiles_can_be_reused_by_scopes_without_inheritance() {
 }
 
 #[test]
+fn git_command_policy_supports_allow_deny_precedence_and_round_trips() {
+    let input = VALID_V3.replace(
+        "remotes = [{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }, { name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }]",
+        "remotes = [{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }, { name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }]\n[profiles.git.commands]\nallow = [\"status\", \"fetch.all\"]\ndeny = [\"push\"]",
+    );
+    let config = Config::parse(&input).expect("valid command policy");
+    let commands = &config.profiles()[0].git.commands;
+    assert!(commands.permits("status"));
+    assert!(commands.permits("fetch.all"));
+    assert!(!commands.permits("fetch"));
+    assert!(!commands.permits("push"));
+
+    let serialized = config.to_v3_toml().expect("serialize v3");
+    let reparsed = Config::parse(&serialized).expect("reparse v3");
+    assert_eq!(reparsed.profiles()[0].git.commands, *commands);
+}
+
+#[test]
+fn git_command_policy_rejects_unknown_and_duplicate_selectors() {
+    for commands in [
+        "[profiles.git.commands]\nallow = [\"arbitrary-shell\"]",
+        "[profiles.git.commands]\ndeny = [\"status\", \"status\"]",
+    ] {
+        let input = VALID_V3.replace(
+            "remotes = [{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }, { name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }]",
+            &format!("remotes = [{{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }}, {{ name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }}]\n{commands}"),
+        );
+        assert!(Config::parse(&input).is_err());
+    }
+}
+
+#[test]
+fn command_policy_empty_allowlist_denies_all_and_broad_deny_wins() {
+    let empty_allow = persona::config::GitCommandPolicy {
+        allow: Some(Vec::new()),
+        deny: Vec::new(),
+    };
+    assert!(!empty_allow.permits("status"));
+
+    let deny_fetch = persona::config::GitCommandPolicy {
+        allow: Some(vec!["fetch.all".to_owned()]),
+        deny: vec!["fetch".to_owned()],
+    };
+    assert!(!deny_fetch.permits("fetch.all"));
+
+    let allow_fetch = persona::config::GitCommandPolicy {
+        allow: Some(vec!["fetch".to_owned()]),
+        deny: Vec::new(),
+    };
+    assert!(allow_fetch.permits("fetch.all"));
+}
+
+#[test]
+fn legacy_command_policy_defaults_to_current_supported_surface() {
+    let config = Config::parse(VALID_CONFIG).expect("valid legacy policy");
+    assert!(config.profiles()[0].git.commands.permits("status"));
+    assert!(config.profiles()[0].git.commands.permits("push"));
+}
+
+#[test]
+fn command_policy_survives_legacy_v1_migration() {
+    let input = VALID_CONFIG.replace(
+        "committer = { name = \"Test Committer\", email = \"committer@example.invalid\" }",
+        "committer = { name = \"Test Committer\", email = \"committer@example.invalid\" }\n[scopes.git.commands]\nallow = [\"status\"]\ndeny = [\"push\"]",
+    );
+    let config = Config::parse(&input).expect("valid v1 command policy");
+    let migrated = config.to_v3_toml().expect("migrate to v3");
+    let reparsed = Config::parse(&migrated).expect("parse migrated v3");
+    assert!(reparsed.profiles()[0].git.commands.permits("status"));
+    assert!(!reparsed.profiles()[0].git.commands.permits("push"));
+}
+
+#[test]
 fn v3_remotes_and_github_merge_policy_round_trip_without_implicit_grants() {
     let config = Config::parse(VALID_V3).expect("valid v3 policy");
     assert_eq!(config.version(), 3);

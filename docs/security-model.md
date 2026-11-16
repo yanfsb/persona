@@ -2,7 +2,7 @@
 
 ## Intended protection
 
-Persona reduces accidental identity and destination mistakes in explicitly managed Git/GitHub CLI paths. It associates local identity policy with physical directory/worktree scopes, checks bounded command forms, and fails closed when required evidence is missing, ambiguous, unsupported, or unbounded. A PASS applies only to the named evidence checked for that operation.
+Persona reduces accidental identity and destination mistakes in explicitly managed Git/GitHub CLI paths. It associates local identity policy with physical directory/worktree scopes, checks bounded command forms, and fails closed when required evidence is missing, ambiguous, unsupported, or unbounded. Optional profile command allow/deny lists only narrow the implemented Git surface; they do not turn unsupported commands into protected native pass-through. A PASS applies only to the named evidence checked for that operation.
 
 ## Boundaries
 
@@ -27,5 +27,5 @@ Local checks do not prove remote reachability, successful authentication, future
 - Start with offline diagnostics and synthetic fixtures.
 - Inspect every preview and use disposable repositories for installation/hook tests.
 - Keep configuration, backups, tokens and private keys out of source control and public issue reports.
-- Treat unsupported commands as unmanaged/blocked, not as implicitly protected.
+- Treat unsupported commands as unmanaged/blocked, not as implicitly protected. `git fetch --all` preflights every eligible remote's exact destination before transport, but independent runtime transfers are not atomic: earlier remotes may have fetched before a later network failure.
 - A limited real-account pilot verified binding, repository metadata reads, and SSH fetch only. Managed publication and production use have not been exercised. Do not use this release candidate as a security boundary for production publishing.

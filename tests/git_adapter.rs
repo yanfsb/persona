@@ -34,6 +34,36 @@ fn managed_fetch_routes_ssh_only_through_the_profile_transport() {
     let temporary = tempdir().unwrap();
     let repo = temporary.path().join("repo");
     fs::create_dir(&repo).unwrap();
+    let https_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let https_port = https_listener.local_addr().unwrap().port();
+    https_listener.set_nonblocking(true).unwrap();
+    let https_destination = format!("https://127.0.0.1:{https_port}/org/mixed.git");
+    let tls_server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut hellos = 0;
+        while Instant::now() < deadline {
+            match https_listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut bytes = [0; 8];
+                    let count = stream.read(&mut bytes).unwrap_or(0);
+                    if count > 0 && bytes[0] == 0x16 {
+                        hellos += 1;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+            if hellos > 1 {
+                break;
+            }
+        }
+        hellos
+    });
     let key = temporary.path().join("client-key");
     let generated = Command::new(&ssh_keygen)
         .env_clear()
@@ -70,7 +100,7 @@ fn managed_fetch_routes_ssh_only_through_the_profile_transport() {
     fs::write(
         &fake_ssh,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 71\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexit 71\n",
             marker.display()
         ),
     )
@@ -78,6 +108,8 @@ fn managed_fetch_routes_ssh_only_through_the_profile_transport() {
     fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).unwrap();
 
     let remote = "git@github.com:org/repo.git";
+    let upstream = "git@github.com:org/upstream.git";
+    let skipped = "git@github.com:org/skipped.git";
     let policy = persona::config::SshPolicy {
         host: "github.com".to_owned(),
         user: "git".to_owned(),
@@ -102,13 +134,27 @@ fn managed_fetch_routes_ssh_only_through_the_profile_transport() {
         .output()
         .unwrap();
     assert!(init.status.success());
-    let added = fixture_git(&git, temporary.path())
+    for (name, url) in [
+        ("origin", remote),
+        ("https", https_destination.as_str()),
+        ("upstream", upstream),
+        ("skipped", skipped),
+    ] {
+        let added = fixture_git(&git, temporary.path())
+            .args(["-C"])
+            .arg(&repo)
+            .args(["remote", "add", name, url])
+            .output()
+            .unwrap();
+        assert!(added.status.success());
+    }
+    let skipped_remote = fixture_git(&git, temporary.path())
         .args(["-C"])
         .arg(&repo)
-        .args(["remote", "add", "origin", remote])
+        .args(["config", "remote.skipped.skipFetchAll", "true"])
         .output()
         .unwrap();
-    assert!(added.status.success());
+    assert!(skipped_remote.status.success());
 
     let scope_path = toml::Value::String(repo.to_string_lossy().into_owned());
     let remote_value = toml::Value::String(remote.to_owned());
@@ -126,6 +172,12 @@ name = "fixture"
 [profiles.git]
 author = {{ name = "Fixture", email = "fixture@example.invalid" }}
 committer = {{ name = "Fixture", email = "fixture@example.invalid" }}
+remotes = [
+  {{ name = "origin", fetch_destinations = ["{remote}"], push_destinations = ["{remote}"] }},
+  {{ name = "https", fetch_destinations = ["{https_destination}"], push_destinations = [] }},
+  {{ name = "upstream", fetch_destinations = ["{upstream}"], push_destinations = [] }},
+  {{ name = "skipped", fetch_destinations = ["{skipped}"], push_destinations = [] }}
+]
 [profiles.git.push]
 remote = "origin"
 destinations = [{remote_value}]
@@ -177,6 +229,67 @@ profile = "fixture"
     assert!(ssh_args.contains("git-upload-pack 'org/repo.git'"));
 
     fs::remove_file(&marker).unwrap();
+    let all_fetch = Command::new(env!("CARGO_BIN_EXE_persona"))
+        .env_clear()
+        .env("HOME", temporary.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("PERSONA_GIT", &git)
+        .env("PERSONA_SSH", &fake_ssh)
+        .env("PERSONA_SSH_KEYGEN", &ssh_keygen)
+        .current_dir(&repo)
+        .args(["run", "--config"])
+        .arg(&config)
+        .args(["--cwd"])
+        .arg(&repo)
+        .args(["--", "git", "fetch", "--prune", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        !all_fetch.status.success(),
+        "fake SSH exits before any transfer"
+    );
+    let all_ssh_args = fs::read_to_string(&marker).unwrap();
+    assert!(all_ssh_args.contains("git-upload-pack 'org/repo.git'"));
+    assert!(
+        all_ssh_args.contains("git-upload-pack 'org/upstream.git'"),
+        "fetch-all SSH calls were: {all_ssh_args}; stderr: {}",
+        String::from_utf8_lossy(&all_fetch.stderr)
+    );
+    assert!(!all_ssh_args.contains("org/skipped.git"));
+
+    fs::remove_file(&marker).unwrap();
+    let mut denied_config = fs::read_to_string(&config).unwrap();
+    denied_config = denied_config.replace(
+        &format!("  {{ name = \"upstream\", fetch_destinations = [\"{upstream}\"], push_destinations = [] }},\n"),
+        "",
+    );
+    fs::write(&config, denied_config).unwrap();
+    let unauthorized = Command::new(env!("CARGO_BIN_EXE_persona"))
+        .env_clear()
+        .env("HOME", temporary.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("PERSONA_GIT", &git)
+        .env("PERSONA_SSH", &fake_ssh)
+        .env("PERSONA_SSH_KEYGEN", &ssh_keygen)
+        .current_dir(&repo)
+        .args(["run", "--config"])
+        .arg(&config)
+        .args(["--cwd"])
+        .arg(&repo)
+        .args(["--", "git", "fetch", "--all"])
+        .output()
+        .unwrap();
+    assert!(!unauthorized.status.success());
+    assert!(
+        !marker.exists(),
+        "all remotes must be authorized before transport"
+    );
+    assert_eq!(
+        tls_server.join().unwrap(),
+        1,
+        "mixed fetch should reach HTTPS once, while unauthorized preflight sends no second request"
+    );
+
     let clone_target = repo.join("ssh-clone");
     let clone = Command::new(env!("CARGO_BIN_EXE_persona"))
         .env_clear()

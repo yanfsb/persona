@@ -149,9 +149,15 @@ impl PushInvocation {
                     if refspecs.len() == MAX_REFSPECS {
                         return Err("push refspec count exceeds the limit");
                     }
-                    let (source, destination) = word
-                        .split_once(':')
-                        .ok_or("push refspec must specify source and destination")?;
+                    let (source, destination) =
+                        if let Some((source, destination)) = word.split_once(':') {
+                            (source, destination)
+                        } else {
+                            // Git accepts `git push <remote> <branch>` as the
+                            // same-name refspec. Preserve that bounded spelling by
+                            // canonicalizing it before authorization.
+                            (word, word)
+                        };
                     if source.starts_with('+') || destination.is_empty() {
                         return Err("unsupported push refspec");
                     }
@@ -415,6 +421,14 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_git_push_same_name_refspec_spelling() {
+        let parsed = PushInvocation::parse(&args(&["origin", "main"])).unwrap();
+        assert_eq!(parsed.remote, "origin");
+        assert_eq!(parsed.refspecs[0].source, "refs/heads/main");
+        assert_eq!(parsed.refspecs[0].destination, "refs/heads/main");
     }
 
     #[test]

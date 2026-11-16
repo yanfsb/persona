@@ -68,7 +68,87 @@ pub struct GitPolicy {
     pub push: Option<PushPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remotes: Vec<RemotePolicy>,
+    #[serde(default, skip_serializing_if = "GitCommandPolicy::is_default")]
+    pub commands: GitCommandPolicy,
 }
+
+/// Optional allowlist and denylist for supported managed Git operations.
+/// These lists restrict the adapter's existing command surface; they never
+/// enable native pass-through or skip operation-specific security checks.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitCommandPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl GitCommandPolicy {
+    fn is_default(&self) -> bool {
+        self.allow.is_none() && self.deny.is_empty()
+    }
+
+    pub fn permits(&self, selector: &str) -> bool {
+        if !GIT_COMMAND_SELECTORS.contains(&selector) {
+            return false;
+        }
+        let broad = selector.split_once('.').map(|(command, _)| command);
+        if self
+            .deny
+            .iter()
+            .any(|entry| entry == selector || broad.is_some_and(|command| entry == command))
+        {
+            return false;
+        }
+        self.allow.as_ref().is_none_or(|allowed| {
+            allowed
+                .iter()
+                .any(|entry| entry == selector || broad.is_some_and(|command| entry == command))
+        })
+    }
+
+    fn is_valid(&self) -> bool {
+        let valid = |values: &[String]| {
+            let mut seen = HashSet::new();
+            values
+                .iter()
+                .all(|value| GIT_COMMAND_SELECTORS.contains(&value.as_str()) && seen.insert(value))
+        };
+        self.allow.as_deref().is_none_or(valid) && valid(&self.deny)
+    }
+}
+
+const GIT_COMMAND_SELECTORS: &[&str] = &[
+    "status",
+    "diff",
+    "show",
+    "add",
+    "restore",
+    "rm",
+    "remote.add",
+    "init",
+    "commit",
+    "log",
+    "branch.list",
+    "branch.create",
+    "switch",
+    "checkout",
+    "merge",
+    "cherry-pick",
+    "rebase",
+    "worktree.list",
+    "worktree.add",
+    "tag.list",
+    "tag.signed",
+    "tag.lightweight",
+    "fetch",
+    "fetch.all",
+    "pull",
+    "push",
+    "clone",
+    "rev-parse",
+];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -255,6 +335,7 @@ pub enum ConfigError {
     InvalidGithubBinding { profile: String },
     InvalidGithubMergePolicy { profile: String },
     InvalidRemotePolicy { scope: String },
+    InvalidGitCommandPolicy { scope: String },
     InvalidSshPolicy { profile: String },
 }
 
@@ -344,6 +425,7 @@ impl Config {
         validate_github_binding(&profile)?;
         validate_ssh_policy(&profile)?;
         validate_github_merge_policy(&profile)?;
+        validate_git_command_policy(&profile.name, &profile.git.commands)?;
         for scope in self
             .scopes
             .iter()
@@ -602,6 +684,7 @@ impl Config {
         let mut profile_indexes = std::collections::HashMap::new();
         for (index, profile) in config.profiles.iter().enumerate() {
             validate_github_binding(profile)?;
+            validate_git_command_policy(&profile.name, &profile.git.commands)?;
             validate_ssh_policy(profile)?;
             validate_github_merge_policy(profile)?;
             if profile.name.trim().is_empty() || profile.name.trim() != profile.name {
@@ -662,6 +745,7 @@ impl Config {
         let mut indexes = std::collections::HashMap::new();
         for (index, profile) in config.profiles.iter().enumerate() {
             validate_github_binding(profile)?;
+            validate_git_command_policy(&profile.name, &profile.git.commands)?;
             validate_ssh_policy(profile)?;
             validate_github_merge_policy(profile)?;
             if profile.git.push.as_ref().is_some_and(|push| {
@@ -710,6 +794,19 @@ impl Config {
             profiles: config.profiles,
             scope_profiles,
             scopes,
+        })
+    }
+}
+
+fn validate_git_command_policy(
+    scope: &str,
+    commands: &GitCommandPolicy,
+) -> Result<(), ConfigError> {
+    if commands.is_valid() {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidGitCommandPolicy {
+            scope: scope.to_owned(),
         })
     }
 }
@@ -896,6 +993,7 @@ fn validate_ssh_policy(profile: &Profile) -> Result<(), ConfigError> {
 }
 
 fn validate_git_policy(scope: &str, git: &GitPolicy) -> Result<(), ConfigError> {
+    validate_git_command_policy(scope, &git.commands)?;
     for (role, identity) in [("author", &git.author), ("committer", &git.committer)] {
         if identity.name.trim().is_empty() || identity.email.trim().is_empty() {
             return Err(ConfigError::EmptyIdentity {

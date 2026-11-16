@@ -44,7 +44,7 @@ A historical release's private-repository token instructions are not valid for a
 
 ## Optional PATH adapters and hooks
 
-Persona's adapters are opt-in, independent of building the package. `persona install preview --bin-dir EXISTING_USER_BIN` shows the planned links; `apply` installs them. The directory must already exist and be owned by you. Add it to your PATH yourself. `persona hooks install` separately targets an explicitly selected worktree. See [managed commands](managed-commands.md).
+Persona's adapters are opt-in, independent of building the package. `persona install preview --bin-dir EXISTING_USER_BIN` shows the planned links; `apply` installs them. The directory must already exist and be owned by you. Add it to your PATH yourself. The managed `git` shim accepts ordinary bounded Git defaults and common GUI forms, so clients such as LazyGit need no command override; unsupported or ambiguous forms still fail closed. `persona hooks install` separately targets an explicitly selected worktree. See [managed commands](managed-commands.md).
 
 Persona records owned paths and backups, refuses unexpected changes, and supports explicit refresh/remove/rollback. Review each preview and backup path. Never use these commands as an unattended global installer.
 

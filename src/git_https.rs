@@ -1,4 +1,4 @@
-use crate::config::{GitHubBinding, PushPolicy};
+use crate::config::GitHubBinding;
 use crate::credential::{CredentialError, GithubSelector, Secret};
 use std::io::{self, Write};
 
@@ -173,13 +173,13 @@ pub fn parse_credential_request(input: &[u8]) -> Result<CredentialRequest, Https
 }
 
 /// Resolve a credential only after the request host/path matches an explicitly
-/// configured HTTPS destination, then verify the selected native gh token
+/// configured fetch or push HTTPS destination, then verify the selected native gh token
 /// against the profile's local HMAC binding. No provider is contacted.
 pub fn select_https_credential(
     action: &str,
     input: &[u8],
     binding: &GitHubBinding,
-    push_policy: &PushPolicy,
+    allowed_destinations: &[String],
     selector: &GithubSelector,
 ) -> Result<Option<Secret>, HttpsCredentialError> {
     match action {
@@ -194,7 +194,7 @@ pub fn select_https_credential(
     if request.host != binding.host {
         return Err(HttpsCredentialError::DestinationNotAllowed);
     }
-    let allowed = push_policy.destinations.iter().any(|destination| {
+    let allowed = allowed_destinations.iter().any(|destination| {
         parse_https_destination(destination)
             .is_ok_and(|(host, path)| host == request.host && path == request.path)
     });
@@ -214,11 +214,12 @@ pub fn handle_credential_helper<W: Write>(
     action: &str,
     input: &[u8],
     binding: &GitHubBinding,
-    push_policy: &PushPolicy,
+    allowed_destinations: &[String],
     selector: &GithubSelector,
     output: &mut W,
 ) -> Result<(), HttpsCredentialError> {
-    let Some(token) = select_https_credential(action, input, binding, push_policy, selector)?
+    let Some(token) =
+        select_https_credential(action, input, binding, allowed_destinations, selector)?
     else {
         return Ok(());
     };

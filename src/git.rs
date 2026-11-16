@@ -123,6 +123,230 @@ impl GitClient {
         self.effective_identity(directory, "GIT_COMMITTER_IDENT")
     }
 
+    pub fn current_branch(&self, directory: &Path) -> Result<String, GitError> {
+        self.validate_environment()?;
+        let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
+        let output = self.run(&directory, ["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        if !output.status.success() {
+            return Err(GitError::InvalidPushConfig);
+        }
+        let branch = String::from_utf8(output.stdout)
+            .map_err(|_| GitError::InvalidOutput)?
+            .trim_end_matches('\n')
+            .to_owned();
+        if branch.is_empty()
+            || branch.contains(['\n', '\r'])
+            || !self.valid_refname(&directory, &format!("refs/heads/{branch}"))?
+        {
+            return Err(GitError::InvalidPushConfig);
+        }
+        Ok(branch)
+    }
+
+    /// Resolve the single configured upstream for the current branch. Git's
+    /// default push/pull behavior is intentionally rejected when it cannot be
+    /// represented as one explicit remote and branch.
+    pub fn configured_upstream(&self, directory: &Path) -> Result<(String, String), GitError> {
+        self.validate_environment()?;
+        let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
+        let output = self.run(
+            &directory,
+            [
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(GitError::InvalidPushConfig);
+        }
+        let upstream = String::from_utf8(output.stdout)
+            .map_err(|_| GitError::InvalidOutput)?
+            .trim_end_matches('\n')
+            .to_owned();
+        let (remote, branch) = upstream
+            .split_once('/')
+            .ok_or(GitError::InvalidPushConfig)?;
+        if remote.is_empty()
+            || branch.is_empty()
+            || remote.len() > 128
+            || !remote
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !self.valid_refname(&directory, &format!("refs/heads/{branch}"))?
+        {
+            return Err(GitError::InvalidPushConfig);
+        }
+        Ok((remote.to_owned(), branch.to_owned()))
+    }
+
+    /// Resolve Git's default push remote/ref for the supported single-branch
+    /// push modes. Ambiguous multi-ref modes and missing upstreams fail closed.
+    pub fn default_push_target(&self, directory: &Path) -> Result<(String, String), GitError> {
+        self.validate_environment()?;
+        let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
+        let current = self.current_branch(&directory)?;
+        let mode = self
+            .config_value(&directory, "push.default")?
+            .unwrap_or_else(|| "simple".to_owned());
+        if !matches!(mode.as_str(), "simple" | "upstream" | "current") {
+            return Err(GitError::InvalidPushConfig);
+        }
+        let upstream = if mode == "current" {
+            None
+        } else {
+            Some(self.configured_upstream(&directory)?)
+        };
+        let (upstream_remote, upstream_branch) = upstream
+            .as_ref()
+            .map(|(remote, branch)| (Some(remote.as_str()), Some(branch.as_str())))
+            .unwrap_or((None, None));
+        let remote = match self.config_value(&directory, &format!("branch.{current}.pushRemote"))? {
+            Some(remote) => remote,
+            None => match self.config_value(&directory, "remote.pushDefault")? {
+                Some(remote) => remote,
+                None => match upstream_remote {
+                    Some(remote) => remote.to_owned(),
+                    None => self.default_fetch_remote(&directory)?,
+                },
+            },
+        };
+        if remote.is_empty()
+            || remote.len() > 128
+            || !remote
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !self
+                .configured_remotes(&directory)?
+                .iter()
+                .any(|name| name == &remote)
+        {
+            return Err(GitError::InvalidPushConfig);
+        }
+        let destination = match mode.as_str() {
+            "simple"
+                if Some(remote.as_str()) != upstream_remote
+                    || Some(current.as_str()) == upstream_branch =>
+            {
+                current
+            }
+            "simple" => return Err(GitError::InvalidPushConfig),
+            "upstream" => upstream_branch
+                .ok_or(GitError::InvalidPushConfig)?
+                .to_owned(),
+            "current" => current,
+            _ => return Err(GitError::InvalidPushConfig),
+        };
+        Ok((remote, destination))
+    }
+
+    fn config_value(&self, directory: &Path, key: &str) -> Result<Option<String>, GitError> {
+        let output = self.run(directory, ["config", "--get", key])?;
+        match output.status.code() {
+            Some(0) => {
+                let value =
+                    String::from_utf8(output.stdout).map_err(|_| GitError::InvalidOutput)?;
+                let value = value.strip_suffix('\n').ok_or(GitError::InvalidOutput)?;
+                if value.is_empty() || value.contains(['\n', '\r']) {
+                    return Err(GitError::InvalidPushConfig);
+                }
+                Ok(Some(value.to_owned()))
+            }
+            Some(1) => Ok(None),
+            _ => Err(GitError::CommandFailed(output.status.code())),
+        }
+    }
+
+    /// Resolve Git's default fetch remote from the current branch's configured
+    /// remote, falling back to the conventional `origin` only when present.
+    /// This avoids rejecting unambiguous upstreams in multi-remote repositories.
+    pub fn default_fetch_remote(&self, directory: &Path) -> Result<String, GitError> {
+        self.validate_environment()?;
+        let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
+        let branch = self.current_branch(&directory)?;
+        let key = format!("branch.{branch}.remote");
+        let configured = self.run(&directory, ["config", "--get", key.as_str()])?;
+        let remote = match configured.status.code() {
+            Some(0) => {
+                let value =
+                    String::from_utf8(configured.stdout).map_err(|_| GitError::InvalidOutput)?;
+                value
+                    .strip_suffix('\n')
+                    .ok_or(GitError::InvalidOutput)?
+                    .to_owned()
+            }
+            Some(1) => "origin".to_owned(),
+            _ => return Err(GitError::CommandFailed(configured.status.code())),
+        };
+        if remote.is_empty()
+            || remote.len() > 128
+            || !remote
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !self
+                .configured_remotes(&directory)?
+                .iter()
+                .any(|name| name == &remote)
+        {
+            return Err(GitError::InvalidPushConfig);
+        }
+        Ok(remote)
+    }
+
+    /// Return remotes Git would include in `fetch --all`, respecting the
+    /// repository's `remote.<name>.skipFetchAll` boolean.
+    pub fn fetch_all_remotes(&self, directory: &Path) -> Result<Vec<String>, GitError> {
+        self.validate_environment()?;
+        let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
+        let mut eligible = Vec::new();
+        for remote in self.configured_remotes(&directory)? {
+            let key = format!("remote.{remote}.skipFetchAll");
+            let output = self.run(&directory, ["config", "--bool", "--get", key.as_str()])?;
+            let skip = match output.status.code() {
+                Some(0) => {
+                    let value =
+                        String::from_utf8(output.stdout).map_err(|_| GitError::InvalidOutput)?;
+                    match value.strip_suffix('\n').ok_or(GitError::InvalidOutput)? {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(GitError::InvalidPushConfig),
+                    }
+                }
+                Some(1) => false,
+                _ => return Err(GitError::CommandFailed(output.status.code())),
+            };
+            if !skip {
+                eligible.push(remote);
+            }
+        }
+        Ok(eligible)
+    }
+
+    /// Return configured remote names after validating their bounded syntax.
+    pub fn configured_remotes(&self, directory: &Path) -> Result<Vec<String>, GitError> {
+        self.validate_environment()?;
+        let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
+        let output = self.run(&directory, ["remote"])?;
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(output.status.code()));
+        }
+        let text = String::from_utf8(output.stdout).map_err(|_| GitError::InvalidOutput)?;
+        let mut remotes = Vec::new();
+        for remote in text.lines() {
+            if remote.is_empty()
+                || remote.len() > 128
+                || !remote
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(GitError::InvalidPushConfig);
+            }
+            remotes.push(remote.to_owned());
+        }
+        Ok(remotes)
+    }
+
     pub fn effective_fetch_destinations(
         &self,
         directory: &Path,
@@ -1464,4 +1688,118 @@ fn is_sensitive_environment_name(name: &str) -> bool {
     ) || name.ends_with("_TOKEN")
         || name.ends_with("_PASSWORD")
         || name.ends_with("_SECRET")
+}
+
+#[cfg(test)]
+mod default_fetch_remote_tests {
+    use super::GitClient;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    #[test]
+    fn git_defaults_resolve_branch_fetch_and_supported_push_targets() {
+        let git = std::env::var_os("PERSONA_TEST_GIT")
+            .map(PathBuf::from)
+            .or_else(|| {
+                ["/usr/bin/git", "/bin/git"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|p| p.is_file())
+            })
+            .expect("Git executable is required");
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let run_git = |arguments: &[&str]| {
+            let output = Command::new(&git)
+                .env_clear()
+                .env("HOME", temporary.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(&repository)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "--quiet"]);
+        run_git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        run_git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--message=initial",
+        ]);
+        run_git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/org/repo.git",
+        ]);
+        run_git(&[
+            "remote",
+            "add",
+            "upstream",
+            "https://example.invalid/upstream/repo.git",
+        ]);
+        run_git(&["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        run_git(&["config", "branch.main.remote", "upstream"]);
+        run_git(&["config", "branch.main.merge", "refs/heads/main"]);
+        run_git(&["config", "remote.upstream.skipFetchAll", "true"]);
+
+        let client = GitClient::new(
+            git.clone(),
+            vec![
+                (
+                    OsString::from("HOME"),
+                    temporary.path().as_os_str().to_owned(),
+                ),
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+                (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+                (
+                    OsString::from("GIT_CONFIG_GLOBAL"),
+                    OsString::from("/dev/null"),
+                ),
+            ],
+        );
+        assert_eq!(
+            client.default_fetch_remote(&repository).unwrap(),
+            "upstream"
+        );
+        assert_eq!(
+            client.fetch_all_remotes(&repository).unwrap(),
+            ["origin".to_owned()]
+        );
+        assert_eq!(
+            client.default_push_target(&repository).unwrap(),
+            ("upstream".to_owned(), "main".to_owned())
+        );
+        run_git(&["config", "push.default", "current"]);
+        run_git(&["config", "branch.main.pushRemote", "origin"]);
+        assert_eq!(
+            client.default_push_target(&repository).unwrap(),
+            ("origin".to_owned(), "main".to_owned())
+        );
+        run_git(&["config", "push.default", "matching"]);
+        assert!(client.default_push_target(&repository).is_err());
+        run_git(&["config", "push.default", "current"]);
+        run_git(&["config", "--unset", "branch.main.remote"]);
+        run_git(&["config", "--unset", "branch.main.merge"]);
+        assert_eq!(
+            client.default_push_target(&repository).unwrap(),
+            ("origin".to_owned(), "main".to_owned())
+        );
+
+        run_git(&["config", "--unset", "branch.main.pushRemote"]);
+        assert_eq!(client.default_fetch_remote(&repository).unwrap(), "origin");
+    }
 }

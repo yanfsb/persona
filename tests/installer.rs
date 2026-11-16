@@ -273,6 +273,8 @@ path = {root}
 [scopes.git]
 author = {{ name = "Test Author", email = "author@example.invalid" }}
 committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
+[scopes.git.commands]
+allow = ["status", "branch.list"]
 "#
         ),
     )
@@ -307,14 +309,19 @@ committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
 
     let path = std::env::join_paths([&bin, Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
     let status = Command::new(bin.join("git"))
-        .args(["status", "--short"])
+        .args([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+        ])
         .current_dir(&scope)
         .env_clear()
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state)
         .env("PERSONA_GIT", &native_git)
-        .env("PATH", path)
+        .env("PATH", path.clone())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -324,6 +331,63 @@ committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
         Some(0),
         "{}",
         String::from_utf8_lossy(&status.stderr)
+    );
+    let branch = Command::new(bin.join("git"))
+        .args(["branch", "--show-current"])
+        .current_dir(&scope)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state)
+        .env("PERSONA_GIT", &native_git)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        branch.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&branch.stderr)
+    );
+    let fetch_denied = Command::new(bin.join("git"))
+        .args(["fetch", "--all"])
+        .current_dir(&scope)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state)
+        .env("PERSONA_GIT", &native_git)
+        .env(
+            "PATH",
+            std::env::join_paths([&bin, Path::new("/usr/bin"), Path::new("/bin")]).unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(!fetch_denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&fetch_denied.stderr).contains("fetch.all` is denied"),
+        "{}",
+        String::from_utf8_lossy(&fetch_denied.stderr)
+    );
+    let flag_order_alias = Command::new(bin.join("git"))
+        .args(["fetch", "--prune", "--all"])
+        .current_dir(&scope)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state)
+        .env("PERSONA_GIT", &native_git)
+        .env(
+            "PATH",
+            std::env::join_paths([&bin, Path::new("/usr/bin"), Path::new("/bin")]).unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(!flag_order_alias.status.success());
+    assert!(
+        String::from_utf8_lossy(&flag_order_alias.stderr).contains("fetch.all` is denied"),
+        "equivalent flag order must receive the same command policy: {}",
+        String::from_utf8_lossy(&flag_order_alias.stderr)
     );
 }
 

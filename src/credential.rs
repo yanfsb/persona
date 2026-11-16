@@ -1012,14 +1012,17 @@ mod tests {
         );
         let binding = selector.enroll(true, "synthetic-user").unwrap();
         fs::remove_file(&marker).unwrap();
-        let policy = crate::config::PushPolicy {
-            remote: "origin".to_owned(),
-            destinations: vec!["https://github.com/org/repo.git".to_owned()],
-            ..crate::config::PushPolicy::default()
-        };
+        let fetch_destinations = vec!["https://github.com/org/repo.git".to_owned()];
+        let push_destinations = vec!["https://github.com/other/repo.git".to_owned()];
         let invalid = b"protocol=https\nhost=github.com\npath=org/other.git\n\n";
         assert!(matches!(
-            crate::git_https::select_https_credential("get", invalid, &binding, &policy, &selector),
+            crate::git_https::select_https_credential(
+                "get",
+                invalid,
+                &binding,
+                &fetch_destinations,
+                &selector
+            ),
             Err(crate::git_https::HttpsCredentialError::DestinationNotAllowed)
         ));
         assert!(
@@ -1029,7 +1032,11 @@ mod tests {
         let redirected = b"protocol=https\nhost=attacker.example\npath=org/repo.git\n\n";
         assert!(matches!(
             crate::git_https::select_https_credential(
-                "get", redirected, &binding, &policy, &selector
+                "get",
+                redirected,
+                &binding,
+                &fetch_destinations,
+                &selector
             ),
             Err(crate::git_https::HttpsCredentialError::DestinationNotAllowed)
         ));
@@ -1042,7 +1049,7 @@ mod tests {
             "store",
             invalid,
             &binding,
-            &policy,
+            &fetch_destinations,
             &selector,
             &mut ignored,
         )
@@ -1060,7 +1067,7 @@ mod tests {
             "get",
             request,
             &binding,
-            &policy,
+            &fetch_destinations,
             &selector,
             &mut output,
         )
@@ -1070,6 +1077,22 @@ mod tests {
             b"username=x-access-token\npassword=synthetic-token\n\n"
         );
         assert!(marker.exists());
+
+        fs::remove_file(&marker).unwrap();
+        assert!(matches!(
+            crate::git_https::select_https_credential(
+                "get",
+                request,
+                &binding,
+                &push_destinations,
+                &selector,
+            ),
+            Err(crate::git_https::HttpsCredentialError::DestinationNotAllowed)
+        ));
+        assert!(
+            !marker.exists(),
+            "fetch-only destination must not select push credentials"
+        );
     }
 
     #[test]

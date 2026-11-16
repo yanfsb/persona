@@ -37,7 +37,15 @@ Signing is optional. A signing policy names an expected full fingerprint and a p
 
 ## Remotes and publication policy
 
-Named remotes have exact fetch and push destination allowlists. A push policy is explicit and controls initial pushes, fast-forwards, annotated/lightweight tags, deletions, and exact-lease rewrites. Defaults are conservative; changing policy records consent, not proof that every transport form is implemented. Review the [managed command reference](managed-commands.md) and [security boundaries](security-model.md).
+Named remotes have exact fetch and push destination allowlists. A push policy is explicit and controls initial pushes, fast-forwards, annotated/lightweight tags, deletions, and exact-lease rewrites. Optional `[profiles.git.commands]` lists restrict the supported managed Git operations; omitting `allow` keeps today's supported surface, while `allow = []` denies every operation. `deny` entries always take precedence. For example:
+
+```toml
+[profiles.git.commands]
+allow = ["status", "fetch", "pull", "branch.list"]
+deny = ["push"]
+```
+
+Selectors are semantic operations such as `branch.list`, `branch.create`, `tag.signed`, `worktree.add`, and `fetch.all`; `fetch` allows both ordinary fetch and `fetch.all`, while `deny = ["fetch"]` blocks both. Command lists never enable unsupported native pass-through or replace destination/account/identity/signing/publication checks. Defaults are conservative; changing policy records consent, not proof that every transport form is implemented. Review the [managed command reference](managed-commands.md) and [security boundaries](security-model.md).
 
 ## Migration and rollback
 
