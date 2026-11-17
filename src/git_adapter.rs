@@ -1520,10 +1520,15 @@ pub fn run_managed_git() -> Result<u8, String> {
             .arg("--no-ext-diff")
             .arg("--no-textconv")
             .args(&git_arguments[1..]);
-    } else if matches!(subcommand, GitSubcommand::Fetch | GitSubcommand::Pull) {
+    } else if subcommand == GitSubcommand::Fetch {
         command
             .arg(&command_name)
             .args(managed_fetch_safety_arguments(&git_arguments[1..]))
+            .args(&git_arguments[1..]);
+    } else if subcommand == GitSubcommand::Pull {
+        command
+            .arg(&command_name)
+            .args(managed_pull_safety_arguments(&git_arguments[1..]))
             .args(&git_arguments[1..]);
     } else {
         if subcommand == GitSubcommand::Commit
@@ -2239,6 +2244,18 @@ pub fn managed_fetch_safety_arguments(arguments: &[OsString]) -> Vec<&'static st
     safety_arguments
 }
 
+pub fn managed_pull_safety_arguments(arguments: &[OsString]) -> Vec<&'static str> {
+    let mut safety_arguments = Vec::with_capacity(2);
+    if !arguments
+        .iter()
+        .any(|argument| argument == "--prune" || argument == "-p")
+    {
+        safety_arguments.push("--no-prune");
+    }
+    safety_arguments.push("--no-recurse-submodules");
+    safety_arguments
+}
+
 fn managed_fetch_destination(
     git: &GitClient,
     profile: &Profile,
@@ -2498,7 +2515,9 @@ fn commit_cherry_pick_with_policy(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_git_command, managed_fetch_safety_arguments};
+    use super::{
+        classify_git_command, managed_fetch_safety_arguments, managed_pull_safety_arguments,
+    };
     use crate::git_command::GitSubcommand;
     use std::ffi::OsString;
 
@@ -2530,6 +2549,14 @@ mod tests {
         assert_eq!(
             managed_fetch_safety_arguments(&[OsString::from("--prune")]),
             ["--no-prune-tags", "--no-recurse-submodules"]
+        );
+        assert_eq!(
+            managed_pull_safety_arguments(&[]),
+            ["--no-prune", "--no-recurse-submodules"]
+        );
+        assert_eq!(
+            managed_pull_safety_arguments(&[OsString::from("-p")]),
+            ["--no-recurse-submodules"]
         );
     }
 }

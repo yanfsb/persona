@@ -2,7 +2,7 @@
 
 Persona is a directory-scoped Git/GitHub identity guardrail for developers who use more than one identity on the same macOS or Linux account. Its managed adapters enforce identity, signing, destination, SSH, and GitHub account separation while letting each profile configure allowed/denied commands for everyday workflows.
 
-> **Release candidate:** `0.2.0-rc.3` hotfixes `--git-dir` / `--work-tree` resolution and unmanaged-directory passthrough (unblocking Neovim plugins like `blink.cmp` and `lazy.nvim`) on top of `0.2.0-rc.2`'s `clig.dev`-aligned CLI ergonomics and `0.2.0-rc.1`'s configurable allowlist/denylist command policies. Production use has not been evaluated. Do not rely on this release candidate as a production security boundary.
+> **Release candidate:** `0.2.0-rc.4` fixes `git pull` safety flag injection (omitting fetch-only `--no-prune-tags` while keeping `-c fetch.pruneTags=false`) on top of `0.2.0-rc.3` (`--git-dir`/`--work-tree` & unmanaged passthrough), `0.2.0-rc.2` (`clig.dev` ergonomics), and `0.2.0-rc.1` (configurable allowlist/denylist command policies). Production use has not been evaluated. Do not rely on this release candidate as a production security boundary.
 
 Persona is **not** a sandbox, firewall, anonymity system, or universal Git/GitHub replacement. Direct native binaries and hostile processes running as the same OS user can bypass its managed paths. See the [security model](docs/security-model.md) before use.
 

@@ -3955,4 +3955,177 @@ profile = "work"
         .output()
         .unwrap();
     assert_eq!(cross_scope_redirect.status.code(), Some(126));
+
+    // 8. `git pull` works without passing fetch-only `--no-prune-tags` to `git pull`.
+    let pull_remote = temporary.path().join("pull-remote.git");
+    let pull_local = temporary.path().join("pull-local");
+    let pull_other = temporary.path().join("pull-other");
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&pull_remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["clone"])
+            .arg(&pull_remote)
+            .arg(&pull_other)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for args in [
+        vec!["config", "user.name", "Test Author"],
+        vec!["config", "user.email", "author@example.invalid"],
+    ] {
+        assert!(
+            Command::new(&git)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&pull_other)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::write(pull_other.join("seed.txt"), "one\n").unwrap();
+    for args in [
+        vec!["add", "seed.txt"],
+        vec!["commit", "-m", "seed"],
+        vec!["push", "origin", "main"],
+    ] {
+        assert!(
+            Command::new(&git)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&pull_other)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["clone"])
+            .arg(&pull_remote)
+            .arg(&pull_local)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(pull_other.join("seed.txt"), "two\n").unwrap();
+    for args in [
+        vec!["add", "seed.txt"],
+        vec!["commit", "-m", "second"],
+        vec!["push", "origin", "main"],
+    ] {
+        assert!(
+            Command::new(&git)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&pull_other)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    // 8a. Native `git pull` accepts `managed_pull_safety_arguments` and completes cleanly.
+    let direct_pull = Command::new(&git)
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(&pull_local)
+        .arg("pull")
+        .args(persona::git_adapter::managed_pull_safety_arguments(&[]))
+        .output()
+        .unwrap();
+    assert!(
+        direct_pull.status.success(),
+        "direct git pull with safety args failed: {}",
+        String::from_utf8_lossy(&direct_pull.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(pull_local.join("seed.txt")).unwrap(),
+        "two\n"
+    );
+
+    // 8b. Managed `git pull` through shim does not pass fetch-only `--no-prune-tags`.
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&pull_local)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://127.0.0.1:1/org/repo.git",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let pull_config = temporary.path().join("pull-config.toml");
+    let pull_local_canon = pull_local.canonicalize().unwrap();
+    fs::write(
+        &pull_config,
+        format!(
+            r#"version = 3
+
+[[profiles]]
+name = "work"
+[profiles.git]
+author = {{ name = "Test Author", email = "author@example.invalid" }}
+committer = {{ name = "Test Author", email = "author@example.invalid" }}
+[[profiles.git.remotes]]
+name = "origin"
+fetch_destinations = ["https://127.0.0.1:1/org/repo.git"]
+push_destinations = []
+
+[[scopes]]
+name = "pull"
+path = {scope:?}
+profile = "work"
+"#,
+            scope = pull_local_canon.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&pull_config, fs::Permissions::from_mode(0o600)).unwrap();
+    let pull_out = Command::new(&git_shim)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &pull_config)
+        .env("PERSONA_GIT", &git)
+        .env("PERSONA_SHIM_DIR", &bin_dir)
+        .current_dir(&pull_local)
+        .arg("pull")
+        .output()
+        .unwrap();
+    let pull_stderr = String::from_utf8_lossy(&pull_out.stderr);
+    assert!(
+        !pull_stderr.contains("unknown option") && !pull_stderr.contains("no-prune-tags"),
+        "managed git pull passed unsupported option: {pull_stderr}"
+    );
 }

@@ -1,5 +1,6 @@
 # Release notes
 
+- [Persona v0.2.0-rc.4](v0.2.0-rc.4.md) — fix `git pull` failing with `unknown option 'no-prune-tags'`.
 - [Persona v0.2.0-rc.3](v0.2.0-rc.3.md) — hotfix for `--git-dir` / `--work-tree` scope resolution and unmanaged-directory passthrough (unblocking Neovim `blink.cmp`, `lazy.nvim`, and IDEs).
 - [Persona v0.2.0-rc.2](v0.2.0-rc.2.md) — `clig.dev` CLI ergonomics, universal `git`/`gh` `--version` and `--help` compatibility, healthy-repo exit `0`, human-readable errors, partial `profile update`, `--json` / `NO_COLOR` / `-q` / `-n` support, `completions`, and `SIGINT`-safe child waiting.
 - [Persona v0.2.0-rc.1](v0.2.0-rc.1.md) — configurable allowlist/denylist command policies, cross-profile identity guardrails, wildcard destination/repository rules, `baseline update`, and `hooks refresh`.
