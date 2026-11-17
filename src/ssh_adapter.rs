@@ -3,6 +3,7 @@ use crate::git::GitClient;
 use crate::runtime::{
     gh_executable, git_executable, isolated_git_environment, resolve_config_path, ssh_executable,
     ssh_keygen_executable, status_exit_code, validate_managed_shim_directory,
+    wait_child_ignoring_sigint,
 };
 use std::path::PathBuf;
 
@@ -241,8 +242,7 @@ pub fn run_managed_ssh() -> Result<u8, String> {
     let mut command = crate::ssh_transport::ManagedSshTransport::new(ssh, ssh_keygen)
         .command(ssh_policy, &ssh_url, &remote_command)
         .map_err(|_| "managed SSH transport rejected the request".to_owned())?;
-    let status = command
-        .status()
+    let status = wait_child_ignoring_sigint(&mut command)
         .map_err(|_| "cannot spawn managed SSH transport".to_owned())?;
     Ok(status_exit_code(status))
 }

@@ -10,6 +10,26 @@ pub enum PathError {
     },
 }
 
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RelativePath(path) => {
+                write!(
+                    f,
+                    "path `{}` must be an absolute directory path",
+                    path.display()
+                )
+            }
+            Self::NotDirectory(path) => {
+                write!(f, "path `{}` is not a directory", path.display())
+            }
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for PathError {}
+
 pub fn canonical_directory(path: &Path) -> Result<PathBuf, PathError> {
     if path.is_relative() {
         return Err(PathError::RelativePath(path.to_path_buf()));

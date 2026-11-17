@@ -6,7 +6,7 @@ use crate::git_command::{GitInvocation, GitSubcommand, PushInvocation, normalize
 use crate::runtime::{
     build_managed_path, gh_executable, git_executable, gpg_executable, isolated_git_environment,
     persona_dispatcher_executable, resolve_config_path, sha256_file, ssh_keygen_executable,
-    status_exit_code, validate_managed_shim_directory,
+    status_exit_code, validate_managed_shim_directory, wait_child_ignoring_sigint,
 };
 use crate::ssh_adapter::validate_managed_ssh_destination;
 use crate::storage::PersonaPaths;
@@ -268,19 +268,6 @@ pub fn run_managed_git() -> Result<u8, String> {
     let global_arguments = invocation.global_arguments;
     let mut git_arguments = invocation.arguments;
 
-    let config_path = match std::env::var_os("PERSONA_CONFIG_PATH") {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            if !path.is_absolute() {
-                return Err("PERSONA_CONFIG_PATH must be absolute for managed Git".to_owned());
-            }
-            path
-        }
-        None => resolve_config_path(None)?,
-    };
-    let config =
-        Config::load(&config_path).map_err(|error| format!("cannot load policy: {error:?}"))?;
-    let config_digest_at_load = sha256_file(&config_path)?;
     let native_git = git_executable();
     if !native_git.is_absolute() || !native_git.is_file() {
         return Err("Persona requires an absolute, existing native Git executable".to_owned());
@@ -292,6 +279,99 @@ pub fn run_managed_git() -> Result<u8, String> {
 
     let classified = classify_git_command(&subcommand, &git_arguments[1..]);
     let primary_selector = classified.selectors[0].clone();
+    let selector_refs = classified
+        .selectors
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let flag_refs = classified
+        .flags
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    let has_help_flag = git_arguments[1..]
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--help")
+        || (git_arguments.len() == 2 && git_arguments[1] == "-h");
+    let is_readonly_help_or_version =
+        matches!(command_name.as_str(), "version" | "help") || has_help_flag;
+    if is_readonly_help_or_version {
+        let maybe_config_path = match std::env::var_os("PERSONA_CONFIG_PATH") {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                if !path.is_absolute() {
+                    return Err("PERSONA_CONFIG_PATH must be absolute for managed Git".to_owned());
+                }
+                Some(path)
+            }
+            None => resolve_config_path(None).ok(),
+        };
+        if let Some(cfg_path) = maybe_config_path {
+            if let Ok(cfg) = Config::load(&cfg_path) {
+                let candidate_dir = git_client
+                    .checkout_root(&directory)
+                    .unwrap_or_else(|_| directory.clone());
+                if let Ok(Some(scope)) =
+                    crate::context::resolve_context(&candidate_dir, &cfg.scopes())
+                {
+                    if let Some(policy) = cfg.policies().iter().find(|p| p.name == scope.name) {
+                        if let Some(prof) = cfg.profiles().iter().find(|p| p.name == policy.profile)
+                        {
+                            prof.git
+                                .commands
+                                .evaluate(&selector_refs, &flag_refs)
+                                .map_err(|denial| denial.describe("Git", &classified.display))?;
+                        }
+                    }
+                }
+            }
+        }
+        let mut command = Command::new(&native_git);
+        command
+            .arg("--no-pager")
+            .arg("-c")
+            .arg("core.pager=cat")
+            .args(&global_arguments)
+            .args(&git_arguments)
+            .current_dir(&directory)
+            .env_clear();
+        for (key, value) in isolated_git_environment(home.path()) {
+            command.env(key, value);
+        }
+        for variable in [
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "NO_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+            "COLORTERM",
+        ] {
+            if let Some(value) = std::env::var_os(variable) {
+                command.env(variable, value);
+            }
+        }
+        let status = wait_child_ignoring_sigint(&mut command)
+            .map_err(|error| format!("cannot launch managed Git: {error}"))?;
+        return Ok(status_exit_code(status));
+    }
+
+    let config_path = match std::env::var_os("PERSONA_CONFIG_PATH") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err("PERSONA_CONFIG_PATH must be absolute for managed Git".to_owned());
+            }
+            path
+        }
+        None => resolve_config_path(None)?,
+    };
+    let config =
+        Config::load(&config_path).map_err(|error| format!("cannot load policy: {error}"))?;
+    let config_digest_at_load = sha256_file(&config_path)?;
 
     let worktree_add = subcommand == GitSubcommand::Worktree
         && classified.selectors.iter().any(|s| s == "worktree.add");
@@ -355,16 +435,6 @@ pub fn run_managed_git() -> Result<u8, String> {
         .find(|profile| profile.name == selected_policy.profile)
         .ok_or_else(|| "managed Git profile is unavailable".to_owned())?;
 
-    let selector_refs = classified
-        .selectors
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let flag_refs = classified
-        .flags
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
     profile
         .git
         .commands
@@ -1310,7 +1380,18 @@ pub fn run_managed_git() -> Result<u8, String> {
         "TERM",
         "LANG",
         "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
         "SSH_AUTH_SOCK",
+        "GPG_TTY",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "COLORTERM",
+        "PAGER",
+        "GIT_PAGER",
+        "LESS",
+        "TMPDIR",
     ] {
         if let Some(value) = std::env::var_os(variable) {
             command.env(variable, value);
@@ -1386,8 +1467,7 @@ pub fn run_managed_git() -> Result<u8, String> {
         command.args(git_arguments);
     }
 
-    let status = command
-        .status()
+    let status = wait_child_ignoring_sigint(&mut command)
         .map_err(|error| format!("cannot launch managed Git: {error}"))?;
     if !status.success() {
         return Ok(status_exit_code(status));
@@ -2226,7 +2306,22 @@ fn execute_managed_fetch_all(context: ManagedFetchAllContext<'_>) -> Result<u8, 
                 child.env("PERSONA_SSH_KEYGEN", ssh_keygen);
             }
         }
-        match child.status() {
+        for variable in [
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "NO_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+            "COLORTERM",
+            "TMPDIR",
+        ] {
+            if let Some(value) = std::env::var_os(variable) {
+                child.env(variable, value);
+            }
+        }
+        match wait_child_ignoring_sigint(&mut child) {
             Ok(status) if status.success() => {}
             Ok(_) => failed = true,
             Err(error) => {
@@ -2308,9 +2403,24 @@ fn commit_cherry_pick_with_policy(
             }
         }
     }
+    for variable in [
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "GPG_TTY",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "COLORTERM",
+        "TMPDIR",
+    ] {
+        if let Some(value) = std::env::var_os(variable) {
+            command.env(variable, value);
+        }
+    }
     command.args(["commit", "--reset-author", "--allow-empty", "-C", oid]);
-    command
-        .status()
+    wait_child_ignoring_sigint(&mut command)
         .map_err(|error| format!("cannot create policy-identity cherry-pick commit: {error}"))
 }
 

@@ -33,6 +33,55 @@ pub enum CredentialError {
     Io { path: PathBuf, source: io::Error },
 }
 
+impl std::fmt::Display for CredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OnlineConfirmationRequired => {
+                write!(
+                    f,
+                    "pass `--confirm-online` to contact GitHub and enroll the account"
+                )
+            }
+            Self::InvalidHost => write!(f, "unsupported GitHub host (expected `github.com`)"),
+            Self::MissingHome => write!(f, "HOME environment variable is not set"),
+            Self::RelativeGhConfig(path) => write!(
+                f,
+                "GH_CONFIG_DIR `{}` must be an absolute path",
+                path.display()
+            ),
+            Self::EnvironmentTokenPresent => write!(
+                f,
+                "unset GH_TOKEN/GITHUB_TOKEN environment overrides before enrolling or verifying native credentials"
+            ),
+            Self::UnknownNativeStore => write!(
+                f,
+                "native `gh` credential store could not be inspected; run `gh auth status` natively"
+            ),
+            Self::PlaintextTokenStore => write!(
+                f,
+                "native `gh` hosts.yml contains a plaintext oauth_token; migrate `gh` to the system keyring (`gh auth login`)"
+            ),
+            Self::MissingGh => write!(f, "native `gh` executable is unavailable"),
+            Self::Command(_) => write!(f, "native `gh` or `curl` command failed"),
+            Self::AuthenticationUnavailable => write!(
+                f,
+                "selected native `gh` account is not authenticated or does not match the requested user"
+            ),
+            Self::InvalidAccountId => write!(f, "GitHub returned an invalid numeric account ID"),
+            Self::InvalidMergeResponse => write!(f, "GitHub returned an invalid merge response"),
+            Self::KeyUnavailable => write!(f, "private HMAC binding key is unavailable"),
+            Self::UnsafeKeyFile => write!(
+                f,
+                "private HMAC binding key file has unsafe ownership or permissions"
+            ),
+            Self::Storage(error) => write!(f, "{error}"),
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for CredentialError {}
+
 pub struct Secret(Vec<u8>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

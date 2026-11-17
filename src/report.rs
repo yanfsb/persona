@@ -71,19 +71,56 @@ pub struct Report {
     pub findings: Vec<Finding>,
 }
 
+fn is_informational_unless_fail(finding: &Finding) -> bool {
+    match finding.property.as_str() {
+        "git.remote.transport"
+        | "git.signature.remote_verified"
+        | "git.tag.remote_verified"
+        | "git.push.signature.remote_verified"
+        | "github.account"
+        | "github.credential.binding"
+        | "publication"
+        | "ssh"
+        | "integration.managed_shims"
+        | "integration.pre_push_hook" => finding.status != Status::Fail,
+        "git.signing.config"
+        | "git.signature.present"
+        | "git.signature.valid"
+        | "git.signature.fingerprint" => {
+            finding.status == Status::Unknown && finding.expected.is_none()
+        }
+        _ => false,
+    }
+}
+
 impl Report {
     pub fn new(mut findings: Vec<Finding>) -> Self {
         findings.sort_by(|left, right| left.property.cmp(&right.property));
         let status = findings
             .iter()
+            .filter(|finding| !is_informational_unless_fail(finding))
             .map(|finding| finding.status)
             .max_by_key(|status| status.rank())
-            .unwrap_or(Status::Unknown);
+            .unwrap_or_else(|| {
+                findings
+                    .iter()
+                    .map(|finding| finding.status)
+                    .max_by_key(|status| status.rank())
+                    .unwrap_or(Status::Unknown)
+            });
         Self {
             version: REPORT_VERSION,
             status,
             findings,
         }
+    }
+
+    pub fn strict_status(&self) -> Status {
+        self.findings
+            .iter()
+            .map(|finding| finding.status)
+            .max_by_key(|status| status.rank())
+            .unwrap_or(Status::Unknown)
     }
 }
 

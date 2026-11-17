@@ -3570,3 +3570,273 @@ profile = "yanfsb"
     assert_eq!(baselines[0].oid, expected_oid);
     assert_eq!(baselines[1].oid, "2222222222222222222222222222222222222222");
 }
+
+#[test]
+fn clig_ergonomics_shims_exit_codes_json_partial_update_and_completions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let config_home = temporary.path().join("config");
+    let state_home = temporary.path().join("state");
+    let repo = temporary.path().join("repo");
+    let outside = temporary.path().join("outside");
+    let bin_dir = temporary.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let git = std::env::var_os("PERSONA_TEST_GIT").expect("PERSONA_TEST_GIT");
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "Test Author"],
+        vec!["config", "user.email", "author@example.invalid"],
+    ] {
+        assert!(
+            Command::new(&git)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&repo)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::write(repo.join("README.md"), "hello\n").unwrap();
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let custom_config = temporary.path().join("custom.toml");
+    let repo_canon = repo.canonicalize().unwrap();
+    fs::write(
+        &custom_config,
+        format!(
+            r#"version = 3
+
+[[profiles]]
+name = "work"
+[profiles.git]
+author = {{ name = "Test Author", email = "author@example.invalid" }}
+committer = {{ name = "Test Author", email = "author@example.invalid" }}
+[profiles.git.push]
+remote = "origin"
+destinations = ["https://github.com/example/*"]
+
+[[scopes]]
+name = "repo"
+path = {scope:?}
+profile = "work"
+"#,
+            scope = repo_canon.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&custom_config, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // 1. Healthy managed Git worktree exits 0 on status/doctor; --strict exits 3.
+    let healthy_status = persona_command(&repo)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &custom_config)
+        .env("NO_COLOR", "1")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(
+        healthy_status.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&healthy_status.stdout),
+        String::from_utf8_lossy(&healthy_status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&healthy_status.stdout).contains("Pass"));
+
+    let strict_status = persona_command(&repo)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &custom_config)
+        .args(["doctor", "--strict"])
+        .output()
+        .unwrap();
+    assert_eq!(strict_status.status.code(), Some(3));
+
+    // 2. Non-verbose `check --operation push` prints blockers directly.
+    let mut blocked_check = persona_command(&repo)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &custom_config)
+        .args([
+            "check",
+            "--operation",
+            "push",
+            "--remote",
+            "origin",
+            "--destination",
+            "https://github.com/wrong/repo.git",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(blocked_check.stdin.take());
+    let blocked_out = blocked_check.wait_with_output().unwrap();
+    assert_eq!(blocked_out.status.code(), Some(1));
+    let blocked_stdout = String::from_utf8_lossy(&blocked_out.stdout);
+    assert!(blocked_stdout.contains("authorization: BLOCK"));
+    assert!(blocked_stdout.contains("blocked "));
+
+    // 3. --config and --json work on profile/scope inspection.
+    let prof_json = persona_command(&repo)
+        .args(["profile", "list", "--config"])
+        .arg(&custom_config)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(prof_json.status.success());
+    let names: Vec<String> = serde_json::from_slice(&prof_json.stdout).unwrap();
+    assert_eq!(names, vec!["work"]);
+
+    let scope_json = persona_command(&repo)
+        .args(["scope", "show", "repo", "--config"])
+        .arg(&custom_config)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(scope_json.status.success());
+    let scope_val: serde_json::Value = serde_json::from_slice(&scope_json.stdout).unwrap();
+    assert_eq!(scope_val["profile"], "work");
+
+    // 4. Partial `profile update` works without re-specifying author/committer.
+    let private_cfg_dir = config_home.join("persona");
+    fs::create_dir_all(&private_cfg_dir).unwrap();
+    fs::set_permissions(&private_cfg_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let private_cfg = private_cfg_dir.join("config.toml");
+    fs::copy(&custom_config, &private_cfg).unwrap();
+    fs::set_permissions(&private_cfg, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let partial_update = persona_command(&repo)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .args([
+            "profile",
+            "update",
+            "work",
+            "--allow-force-with-lease",
+            "true",
+            "-n",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        partial_update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&partial_update.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&partial_update.stdout).contains("allow_force_with_lease = true")
+    );
+
+    // 5. Shims allow git --version / -v / --help / -h / -P and gh --version / --help even outside a scope.
+    let persona_exe = PathBuf::from(env!("CARGO_BIN_EXE_persona"));
+    fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    for shim_name in ["git", "gh", "ssh", "git-credential-persona"] {
+        std::os::unix::fs::symlink(&persona_exe, bin_dir.join(shim_name)).unwrap();
+    }
+    let git_shim = bin_dir.join("git");
+    for args in [
+        vec!["--version"],
+        vec!["-v"],
+        vec!["--help"],
+        vec!["-h"],
+        vec!["version"],
+    ] {
+        let out = Command::new(&git_shim)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PERSONA_GIT", &git)
+            .env("PERSONA_SHIM_DIR", &bin_dir)
+            .current_dir(&outside)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed outside scope: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let git_p = Command::new(&git_shim)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &custom_config)
+        .env("PERSONA_GIT", &git)
+        .env("PERSONA_SHIM_DIR", &bin_dir)
+        .current_dir(&repo)
+        .args(["-P", "status", "-sb"])
+        .output()
+        .unwrap();
+    assert!(
+        git_p.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git_p.stderr)
+    );
+
+    if let Some(native_gh) = std::env::var_os("PERSONA_TEST_NATIVE_GH") {
+        let gh_shim = bin_dir.join("gh");
+        let gh_ver = Command::new(&gh_shim)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PERSONA_GIT", &git)
+            .env("PERSONA_GH", &native_gh)
+            .env("PERSONA_SHIM_DIR", &bin_dir)
+            .current_dir(&outside)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            gh_ver.status.success(),
+            "{}",
+            String::from_utf8_lossy(&gh_ver.stderr)
+        );
+    }
+
+    // 6. Completions generate non-empty scripts.
+    for shell in ["bash", "zsh", "fish"] {
+        let comp = persona_command(&repo)
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        assert!(comp.status.success());
+        assert!(!comp.stdout.is_empty());
+    }
+}

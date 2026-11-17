@@ -353,6 +353,118 @@ pub enum ConfigLoadError {
     Invalid(ConfigError),
 }
 
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidToml => write!(f, "configuration file contains invalid TOML syntax"),
+            Self::Serialization => write!(f, "cannot serialize configuration to TOML"),
+            Self::UnsupportedVersion(version) => write!(
+                f,
+                "unsupported configuration version {version} (UnsupportedVersion({version})); run `persona config migrate --preview`"
+            ),
+            Self::EmptyProfiles => write!(f, "configuration must define at least one profile"),
+            Self::EmptyScopes => write!(f, "configuration must define at least one scope"),
+            Self::InvalidProfileName => write!(f, "profile name is empty or invalid"),
+            Self::DuplicateProfileName(name) => write!(f, "duplicate profile `{name}`"),
+            Self::MissingProfile(name) => write!(f, "profile `{name}` does not exist"),
+            Self::ProfileInUse(name) => write!(
+                f,
+                "cannot remove profile `{name}` while it is referenced by one or more scopes"
+            ),
+            Self::UnknownProfile { scope, profile } => write!(
+                f,
+                "scope `{scope}` references unknown profile `{profile}` (UnknownProfile)"
+            ),
+            Self::UnknownScope(name) => write!(f, "scope `{name}` does not exist"),
+            Self::InvalidScopeName => write!(f, "scope name is empty or invalid"),
+            Self::DuplicateScopeName(name) => write!(f, "duplicate scope `{name}`"),
+            Self::DuplicateScopeRoot(path) => {
+                write!(f, "duplicate scope directory `{}`", path.display())
+            }
+            Self::RelativeScopePath(path) => write!(
+                f,
+                "scope path `{}` must be an absolute directory path",
+                path.display()
+            ),
+            Self::EmptyIdentity { scope, role } => {
+                write!(
+                    f,
+                    "profile/scope `{scope}` has an empty Git {role} identity"
+                )
+            }
+            Self::InvalidSigningFingerprint { scope } => write!(
+                f,
+                "profile/scope `{scope}` has an invalid signing key fingerprint"
+            ),
+            Self::RelativeSigningKey { scope, path } => write!(
+                f,
+                "profile/scope `{scope}` signing key path `{}` must be absolute",
+                path.display()
+            ),
+            Self::EmptyPushRemote { scope } => {
+                write!(f, "profile/scope `{scope}` push remote cannot be empty")
+            }
+            Self::EmptyPushDestinations { scope } => write!(
+                f,
+                "profile/scope `{scope}` push policy requires at least one destination"
+            ),
+            Self::EmptyPushDestination { scope } => write!(
+                f,
+                "profile/scope `{scope}` contains an empty or invalid push destination"
+            ),
+            Self::AnnotatedTagsRequireSigning { scope } => write!(
+                f,
+                "profile/scope `{scope}` allows annotated tags without a signing policy"
+            ),
+            Self::InvalidUpstreamBaseline { scope } => write!(
+                f,
+                "profile/scope `{scope}` contains an invalid upstream baseline entry"
+            ),
+            Self::InvalidGithubBinding { profile } => write!(
+                f,
+                "profile `{profile}` has an invalid GitHub account binding or repository rule"
+            ),
+            Self::InvalidGithubMergePolicy { profile } => write!(
+                f,
+                "profile `{profile}` has an invalid GitHub server-side merge policy"
+            ),
+            Self::InvalidRemotePolicy { scope } => {
+                write!(f, "profile/scope `{scope}` has an invalid remote policy")
+            }
+            Self::InvalidGitCommandPolicy { scope } => write!(
+                f,
+                "profile/scope `{scope}` has an invalid Git command allowlist/denylist rule"
+            ),
+            Self::InvalidRunCommandPolicy { profile } => write!(
+                f,
+                "profile `{profile}` has an invalid `persona run` command allowlist/denylist rule"
+            ),
+            Self::InvalidSshPolicy { profile } => {
+                write!(f, "profile `{profile}` has an invalid SSH transport policy")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl std::fmt::Display for ConfigLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, source } => {
+                write!(
+                    f,
+                    "cannot read configuration at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Invalid(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigLoadError {}
+
 impl Config {
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
         let version: VersionProbe = toml::from_str(input).map_err(|_| ConfigError::InvalidToml)?;

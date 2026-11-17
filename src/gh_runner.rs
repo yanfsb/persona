@@ -5,6 +5,7 @@ use crate::git::GitClient;
 use crate::runtime::{
     absolute_path, build_managed_path, gh_executable, git_executable, gpg_executable,
     resolve_config_path, ssh_keygen_executable, status_exit_code, validate_managed_shim_directory,
+    wait_child_ignoring_sigint,
 };
 use crate::storage::PersonaPaths;
 use std::io::IsTerminal;
@@ -46,16 +47,112 @@ pub fn run_managed_gh() -> Result<u8, String> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let cwd = std::env::current_dir()
         .map_err(|_| "cannot resolve the GitHub operation directory".to_owned())?;
-    let inferred_repository = infer_github_repository_from_cwd(&cwd);
-    let request = crate::gh_adapter::parse_with_inferred_repository(
-        &arguments,
-        inferred_repository.as_deref(),
-    )?;
     let native_gh = gh_executable()
         .ok_or_else(|| "an absolute native GitHub CLI executable is required".to_owned())?;
     if !native_gh.is_absolute() || !native_gh.is_file() {
         return Err("native GitHub CLI executable is unavailable".to_owned());
     }
+
+    let is_help_or_version = {
+        let words: Option<Vec<&str>> = arguments.iter().map(|arg| arg.to_str()).collect();
+        words.is_some_and(|w| {
+            !w.is_empty()
+                && (matches!(
+                    w[0],
+                    "--version" | "-v" | "version" | "--help" | "-h" | "help" | "completion"
+                ) || w
+                    .iter()
+                    .take_while(|arg| **arg != "--")
+                    .any(|arg| matches!(*arg, "--help" | "-h" | "--version")))
+        })
+    };
+    if is_help_or_version {
+        let inferred_repository = infer_github_repository_from_cwd(&cwd);
+        let maybe_config_path = match std::env::var_os("PERSONA_CONFIG_PATH") {
+            Some(path) => Some(PathBuf::from(path)),
+            None => resolve_config_path(None).ok(),
+        };
+        if let Some(cfg_path) = maybe_config_path {
+            let cfg_path = absolute_path(&cfg_path, &cwd);
+            if let Ok(cfg) = Config::load(&cfg_path) {
+                if let Ok(Some(scope)) =
+                    crate::context::resolve_operation_context(&cwd, None, &cfg.scopes())
+                {
+                    if let Some(policy) = cfg.policies().iter().find(|p| p.name == scope.name) {
+                        if let Some(profile) =
+                            cfg.profiles().iter().find(|p| p.name == policy.profile)
+                        {
+                            if let Some(binding) = &profile.github {
+                                if let Ok(request) =
+                                    crate::gh_adapter::parse_with_inferred_repository(
+                                        &arguments,
+                                        inferred_repository.as_deref(),
+                                    )
+                                {
+                                    let flag_refs = request
+                                        .flags
+                                        .iter()
+                                        .map(String::as_str)
+                                        .collect::<Vec<_>>();
+                                    binding
+                                        .commands
+                                        .evaluate(&[request.selector.as_str()], &flag_refs)
+                                        .map_err(|denial| {
+                                            denial.describe("GitHub CLI", &request.selector)
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let isolated_home =
+            tempfile::tempdir().map_err(|_| "cannot create isolated GitHub CLI HOME".to_owned())?;
+        let managed_path = build_managed_path(&shim_directory)?;
+        let mut command = Command::new(&native_gh);
+        command
+            .args(&arguments)
+            .current_dir(&cwd)
+            .env_clear()
+            .env("HOME", isolated_home.path())
+            .env("XDG_CONFIG_HOME", isolated_home.path().join("config"))
+            .env("XDG_STATE_HOME", isolated_home.path().join("state"))
+            .env("GH_CONFIG_DIR", isolated_home.path().join("gh"))
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("GH_PAGER", "cat")
+            .env("PATH", managed_path)
+            .env("PERSONA_SHIM_DIR", &shim_directory)
+            .env("PERSONA_GH", &native_gh)
+            .env("PERSONA_GIT", git_executable())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        for variable in [
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "NO_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+            "COLORTERM",
+        ] {
+            if let Some(value) = std::env::var_os(variable) {
+                command.env(variable, value);
+            }
+        }
+        let status = wait_child_ignoring_sigint(&mut command)
+            .map_err(|_| "cannot launch the validated native GitHub CLI operation".to_owned())?;
+        return Ok(status_exit_code(status));
+    }
+
+    let inferred_repository = infer_github_repository_from_cwd(&cwd);
+    let request = crate::gh_adapter::parse_with_inferred_repository(
+        &arguments,
+        inferred_repository.as_deref(),
+    )?;
     for variable in [
         "GH_TOKEN",
         "GITHUB_TOKEN",
@@ -93,7 +190,7 @@ pub fn run_managed_gh() -> Result<u8, String> {
         None => resolve_config_path(None)?,
     };
     let config_path = absolute_path(&config_path, &cwd);
-    let config = Config::load(&config_path).map_err(|error| format!("{error:?}"))?;
+    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
     let target_directory = request.clone_directory.as_ref().map(|clone_directory| {
         if clone_directory.is_absolute() {
             clone_directory.clone()
@@ -681,6 +778,19 @@ pub fn run_managed_gh() -> Result<u8, String> {
         "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "PERSONA_CONFIG_PATH",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "EDITOR",
+        "VISUAL",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "COLORTERM",
+        "PAGER",
+        "GH_PAGER",
+        "TMPDIR",
     ] {
         if let Some(value) = std::env::var_os(variable) {
             command.env(variable, value);
@@ -688,8 +798,7 @@ pub fn run_managed_gh() -> Result<u8, String> {
     }
     command.env("PERSONA_GH", &native_gh);
     command.env("PERSONA_GIT", git_executable());
-    let status = command
-        .status()
+    let status = wait_child_ignoring_sigint(&mut command)
         .map_err(|_| "cannot launch the validated native GitHub CLI operation".to_owned())?;
     Ok(status_exit_code(status))
 }

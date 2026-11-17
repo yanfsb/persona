@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use persona::audit::{ExecutablePaths, PushRequest, build_report, build_tag_report};
 use persona::authorization::{
     Operation as AuthorizationOperation, OperationDecision, Verdict, authorize,
@@ -16,89 +16,145 @@ use persona::runtime::{
     EXIT_ERROR, absolute_path, build_managed_path, gh_executable, git_executable, gpg_executable,
     hook_git_client, load_config, persona_dispatcher_executable, record_invoked_shim_directory,
     resolve_config_path, ssh_executable, ssh_keygen_executable, status_exit_code,
+    wait_child_ignoring_sigint,
 };
 use persona::ssh_adapter::run_managed_ssh;
 use persona::storage::{ConfigUpdateLock, PersonaPaths};
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const MAX_PUSH_INPUT_BYTES: usize = 1024 * 1024;
 
+const TOP_LEVEL_AFTER_HELP: &str = "\
+EXAMPLES:
+  persona status
+  persona doctor --json
+  persona profile list
+  persona profile commands my-profile --git-deny push.force --preview
+  persona baseline update
+  persona run -- git status
+
+DOCUMENTATION:
+  Repository & guides: https://github.com/yanfsb/persona (see docs/cli.md)";
+
 #[derive(Parser)]
 #[command(
     name = "persona",
     version,
-    about = "Directory-scoped identity guardrail"
+    about = "Directory-scoped Git and GitHub identity guardrail",
+    after_help = TOP_LEVEL_AFTER_HELP
 )]
 struct Cli {
+    /// Disable ANSI color codes in terminal output (also respects NO_COLOR).
+    #[arg(long, global = true)]
+    no_color: bool,
+    /// Suppress non-essential confirmation messages.
+    #[arg(short, long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    Status(AuditArgs),
+    /// Show the resolved Persona scope, profile, and local status for a directory.
+    Status(StatusArgs),
+    /// Evaluate local status, outgoing Git push updates, or signed tag policy.
     Check(AuditArgs),
-    Doctor(AuditArgs),
+    /// Run a verbose offline diagnostic audit of scope, Git, SSH, and shim state.
+    Doctor(StatusArgs),
+    /// Execute a command with temporary managed Git/GitHub/SSH shims on PATH.
     Run(RunArgs),
+    /// Create the initial private Persona configuration and first scope/profile.
     Setup(SetupArgs),
+    /// Migrate or roll back Persona's private configuration file.
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Inspect, create, update, or configure command policies on profiles.
     Profile {
         #[command(subcommand)]
         command: ProfileCommands,
     },
+    /// Inspect, add, update, verify, or remove directory scopes.
     Scope {
         #[command(subcommand)]
         command: ScopeCommands,
     },
+    /// Enroll, verify, or unbind a profile's GitHub CLI account binding.
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
     },
     /// Serve Git's HTTPS credential-helper protocol for protected repositories.
     CredentialHelper {
+        /// Credential helper operation (`get`, `store`, or `erase`).
         action: String,
     },
+    /// Install, refresh, or remove the repository-local Persona pre-push hook.
     Hooks {
         #[command(subcommand)]
         command: HookCommands,
     },
+    /// Manage pinned upstream commit baselines on the active profile.
     Baseline {
         #[command(subcommand)]
         command: BaselineCommands,
     },
+    /// Preview, apply, refresh, remove, or roll back user-owned PATH shims.
     Install {
         #[command(subcommand)]
         command: InstallCommands,
     },
+    /// Generate shell prompt hooks or tab-completion scripts.
     Shell {
         #[command(subcommand)]
         command: ShellCommands,
     },
+    /// Print shell tab-completion script for bash, zsh, or fish.
+    Completions {
+        /// Target shell (`bash`, `zsh`, or `fish`).
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Subcommand)]
 enum BaselineCommands {
     /// Update pinned upstream baselines in the active profile to match current remote-tracking refs.
     Update {
+        /// Working directory inside the target Git repository.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        #[arg(long)]
+        /// Preview the updated configuration without writing changes to disk.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum ShellCommands {
+    /// Print optional Zsh prompt integration helpers.
     Zsh {
         #[command(subcommand)]
         command: ZshCommands,
+    },
+    /// Print shell tab-completion script for bash, zsh, or fish.
+    Completions {
+        /// Target shell (`bash`, `zsh`, or `fish`).
+        #[arg(value_enum)]
+        shell: CompletionShell,
     },
 }
 
@@ -112,27 +168,37 @@ enum ZshCommands {
 
 #[derive(Subcommand)]
 enum HookCommands {
+    /// Install the Persona pre-push hook into a managed Git worktree.
     Install {
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Working directory inside the target Git worktree.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        #[arg(long)]
+        /// Preview the hook installation without modifying the worktree.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
     /// Refresh an installed pre-push hook to point at this Persona executable.
     Refresh {
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Working directory inside the target Git worktree.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        #[arg(long)]
+        /// Preview the hook refresh without modifying the worktree.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
+    /// Remove a Persona-managed pre-push hook and restore any preserved hook.
     Remove {
+        /// Working directory inside the target Git worktree.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        #[arg(long)]
+        /// Preview the hook removal without modifying the worktree.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
 }
@@ -141,34 +207,61 @@ enum HookCommands {
 enum InstallCommands {
     /// Show exactly which owned-bin adapters would be created.
     Preview {
+        /// Existing user-owned directory to inspect for adapter installation.
         #[arg(long)]
         bin_dir: PathBuf,
     },
     /// Install adapter symlinks into an existing, user-owned bin directory.
     Apply {
+        /// Existing user-owned directory where adapter symlinks will be placed.
         #[arg(long)]
         bin_dir: PathBuf,
     },
     /// Point existing owned adapters at this Persona executable.
     Refresh {
-        #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
+        /// Preview the adapter refresh without modifying symlinks.
+        #[arg(
+            long,
+            short = 'n',
+            visible_alias = "dry-run",
+            conflicts_with = "apply",
+            required_unless_present = "apply"
+        )]
         preview: bool,
+        /// Apply the adapter refresh and update registered worktree hooks.
         #[arg(long, conflicts_with = "preview")]
         apply: bool,
     },
     /// Remove only unchanged adapters recorded in the private manifest.
     Remove {
-        #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
+        /// Preview adapter removal without deleting symlinks.
+        #[arg(
+            long,
+            short = 'n',
+            visible_alias = "dry-run",
+            conflicts_with = "apply",
+            required_unless_present = "apply"
+        )]
         preview: bool,
+        /// Remove the recorded Persona adapter symlinks.
         #[arg(long, conflicts_with = "preview")]
         apply: bool,
     },
     /// Restore a private installation backup created by an earlier mutation.
     Rollback {
+        /// Path to the installation backup file under Persona's state directory.
         #[arg(long)]
         backup: PathBuf,
-        #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
+        /// Preview the rollback without modifying symlinks.
+        #[arg(
+            long,
+            short = 'n',
+            visible_alias = "dry-run",
+            conflicts_with = "apply",
+            required_unless_present = "apply"
+        )]
         preview: bool,
+        /// Apply the rollback from the specified backup.
         #[arg(long, conflicts_with = "preview")]
         apply: bool,
     },
@@ -176,17 +269,27 @@ enum InstallCommands {
 
 #[derive(Subcommand)]
 enum ConfigCommands {
-    /// Print a v3 migration preview without modifying the source file.
+    /// Migrate configuration to the v3 schema (preview or apply).
     Migrate {
+        /// Explicit configuration file to preview migration for.
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
+        /// Print the v3 TOML preview without modifying the configuration file.
+        #[arg(
+            long,
+            short = 'n',
+            visible_alias = "dry-run",
+            conflicts_with = "apply",
+            required_unless_present = "apply"
+        )]
         preview: bool,
+        /// Atomically write the migrated v3 configuration to the private config store.
         #[arg(long, conflicts_with = "preview")]
         apply: bool,
     },
     /// Restore a backup created by Persona's private config store.
     Rollback {
+        /// Path to the backup file inside Persona's private state backups directory.
         #[arg(long)]
         backup: PathBuf,
     },
@@ -226,97 +329,157 @@ impl From<CliProvenanceMode> for UpstreamProvenanceMode {
 
 #[derive(Args)]
 struct ProfileCommandsArgs {
+    /// Profile name to update command policies on.
     name: String,
+    /// Command policy mode for managed `git` commands (`denylist` or `allowlist`).
     #[arg(long, value_enum)]
     git_mode: Option<CliCommandMode>,
+    /// Allowed `git` command selector or `<selector> <flag>` rule (repeatable).
     #[arg(long = "git-allow")]
     git_allow: Vec<String>,
+    /// Denied `git` command selector or `<selector> <flag>` rule (repeatable).
     #[arg(long = "git-deny")]
     git_deny: Vec<String>,
+    /// Reset managed `git` command rules back to the default denylist.
     #[arg(long)]
     clear_git: bool,
+    /// Command policy mode for managed `gh` commands (`denylist` or `allowlist`).
     #[arg(long, value_enum)]
     gh_mode: Option<CliCommandMode>,
+    /// Allowed `gh` command selector or `<selector> <flag>` rule (repeatable).
     #[arg(long = "gh-allow")]
     gh_allow: Vec<String>,
+    /// Denied `gh` command selector or `<selector> <flag>` rule (repeatable).
     #[arg(long = "gh-deny")]
     gh_deny: Vec<String>,
+    /// Reset managed `gh` command rules back to the default denylist.
     #[arg(long)]
     clear_gh: bool,
+    /// Command policy mode for `persona run` commands (`denylist` or `allowlist`).
     #[arg(long, value_enum)]
     run_mode: Option<CliCommandMode>,
+    /// Allowed `persona run` program selector or `<selector> <flag>` rule (repeatable).
     #[arg(long = "run-allow")]
     run_allow: Vec<String>,
+    /// Denied `persona run` program selector or `<selector> <flag>` rule (repeatable).
     #[arg(long = "run-deny")]
     run_deny: Vec<String>,
+    /// Reset `persona run` command rules back to the default denylist.
     #[arg(long)]
     clear_run: bool,
-    #[arg(long)]
+    /// Preview the resulting TOML configuration without writing to disk.
+    #[arg(long, short = 'n', visible_alias = "dry-run")]
     preview: bool,
 }
 
 #[derive(Subcommand)]
 enum ProfileCommands {
+    /// List configured profile names.
     List {
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Output the profile list as JSON.
+        #[arg(long)]
+        json: bool,
     },
+    /// Show details and policy summary for a profile.
     Show {
+        /// Profile name to inspect.
         name: String,
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Output the profile details as JSON.
+        #[arg(long)]
+        json: bool,
     },
+    /// Verify that a profile is structurally valid and report its scope mappings.
     Verify {
+        /// Profile name to verify.
         name: String,
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Add a new reusable identity profile to the private configuration.
     Add(Box<ProfileEditArgs>),
+    /// Update an existing reusable identity profile (omitted fields keep current values).
     Update(Box<ProfileEditArgs>),
     /// Configure allowlist/denylist command policies (`git`, `gh`, `run`) on a profile.
     Commands(Box<ProfileCommandsArgs>),
+    /// Remove an unused profile from the private configuration.
     Remove {
+        /// Profile name to remove.
         name: String,
-        #[arg(long)]
+        /// Preview the removal without modifying the configuration file.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum ScopeCommands {
+    /// List configured directory scopes and their bound profiles.
     List {
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Output the scope list as JSON.
+        #[arg(long)]
+        json: bool,
     },
+    /// Show configured scope details without requiring the directory to exist on disk.
     Show {
+        /// Scope name to inspect.
         name: String,
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Output the scope details as JSON.
+        #[arg(long)]
+        json: bool,
     },
+    /// Verify that a scope's directory exists on disk and resolves to its canonical root.
     Verify {
+        /// Scope name to verify.
         name: String,
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Bind a directory tree to an existing profile.
     Add {
+        /// Unique name for the scope.
         name: String,
+        /// Directory path for the scope root.
         path: PathBuf,
+        /// Profile name to bind to this scope.
         #[arg(long)]
         profile: String,
-        #[arg(long)]
+        /// Preview the new scope without modifying the configuration file.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
+    /// Update an existing scope's directory path or bound profile.
     Update {
+        /// Existing scope name to update.
         name: String,
+        /// Updated directory path for the scope root.
         path: PathBuf,
+        /// Updated profile name for this scope.
         #[arg(long)]
         profile: String,
-        #[arg(long)]
+        /// Preview the updated scope without modifying the configuration file.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
+    /// Remove a directory scope from the private configuration.
     Remove {
+        /// Scope name to remove.
         name: String,
-        #[arg(long)]
+        /// Preview the removal without modifying the configuration file.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
 }
@@ -325,212 +488,383 @@ enum ScopeCommands {
 enum AuthCommands {
     /// Explicitly contact GitHub to bind the currently selected native gh account.
     Enroll {
+        /// Profile name to bind the GitHub account to.
         #[arg(long)]
         profile: String,
+        /// GitHub hostname (currently `github.com`).
         #[arg(long, default_value = "github.com")]
         host: String,
+        /// Expected GitHub username in the native `gh` credential store.
         #[arg(long, required = true)]
         user: String,
+        /// Confirm contacting GitHub's API to resolve the stable numeric account ID.
         #[arg(long, required = true)]
         confirm_online: bool,
     },
     /// Compare the local gh token selector to the saved HMAC binding (no API call).
     Verify {
+        /// Profile name whose GitHub binding should be verified.
         #[arg(long)]
         profile: String,
+        /// Output the verification result as JSON.
+        #[arg(long)]
+        json: bool,
     },
+    /// Remove the GitHub account binding from a profile.
     Unbind {
+        /// Profile name to unbind.
         #[arg(long)]
         profile: String,
-        #[arg(long)]
+        /// Preview the unbind operation without writing changes.
+        #[arg(long, short = 'n', visible_alias = "dry-run")]
         preview: bool,
     },
 }
 
 #[derive(Args)]
 struct RunArgs {
+    /// Explicit Persona configuration file path.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Working directory in which to resolve the active scope and launch the command.
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
+    /// Program and arguments to execute (pass after `--`).
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<OsString>,
 }
 
 #[derive(Args)]
 struct ProfileEditArgs {
+    /// Profile name.
     name: String,
-    #[arg(long)]
-    author_name: String,
-    #[arg(long)]
-    author_email: String,
-    #[arg(long)]
-    committer_name: String,
-    #[arg(long)]
-    committer_email: String,
-    #[arg(long)]
+    /// Expected Git author name (required on `add`; kept if omitted on `update`).
+    #[arg(long, help_heading = "Identity")]
+    author_name: Option<String>,
+    /// Expected Git author email (required on `add`; kept if omitted on `update`).
+    #[arg(long, help_heading = "Identity")]
+    author_email: Option<String>,
+    /// Expected Git committer name (defaults to `--author-name` on `add`; kept on `update`).
+    #[arg(long, help_heading = "Identity")]
+    committer_name: Option<String>,
+    /// Expected Git committer email (defaults to `--author-email` on `add`; kept on `update`).
+    #[arg(long, help_heading = "Identity")]
+    committer_email: Option<String>,
+    /// Authorized signing key fingerprint (40-hex OpenPGP or `SHA256:...` SSH).
+    #[arg(long, help_heading = "Signing")]
     signing_fingerprint: Option<String>,
-    #[arg(long)]
+    /// Absolute path to the public key file for offline signature verification.
+    #[arg(long, help_heading = "Signing")]
     public_key: Option<PathBuf>,
-    #[arg(long, value_parser = ["openpgp", "ssh"])]
+    /// Cryptographic signing format (`openpgp` or `ssh`).
+    #[arg(long, value_parser = ["openpgp", "ssh"], help_heading = "Signing")]
     signing_format: Option<String>,
-    #[arg(long)]
+    /// Remove the signing policy from this profile.
+    #[arg(long, help_heading = "Signing")]
+    clear_signing: bool,
+    /// Authorized Git push remote name (or `*` for any remote matching allowed destinations).
+    #[arg(long, help_heading = "Push & Remotes")]
     push_remote: Option<String>,
-    #[arg(long)]
-    ssh_host: Option<String>,
-    #[arg(long)]
-    ssh_user: Option<String>,
-    #[arg(long)]
-    ssh_port: Option<u16>,
-    #[arg(long)]
-    ssh_fingerprint: Option<String>,
-    #[arg(long)]
-    ssh_public_key: Option<PathBuf>,
-    #[arg(long)]
-    ssh_identity_file: Option<PathBuf>,
-    #[arg(long)]
-    ssh_agent_socket: Option<PathBuf>,
-    #[arg(long)]
-    ssh_known_hosts_file: Option<PathBuf>,
-    #[arg(long)]
-    clear_ssh: bool,
-    #[arg(long = "push-destination")]
+    /// Allowed push destination URL or pattern such as `git@github.com:OWNER/*` (repeatable).
+    #[arg(long = "push-destination", help_heading = "Push & Remotes")]
     push_destinations: Vec<String>,
-    #[arg(long = "github-repo")]
-    github_repositories: Vec<String>,
     /// Exact profile-bound remote: NAME|FETCH_URLS|PUSH_URLS (comma-separated, '-' for none).
-    #[arg(long = "remote-policy", value_name = "NAME|FETCH_URLS|PUSH_URLS")]
+    #[arg(
+        long = "remote-policy",
+        value_name = "NAME|FETCH_URLS|PUSH_URLS",
+        help_heading = "Push & Remotes"
+    )]
     remote_policies: Vec<String>,
-    #[arg(long, conflicts_with = "remote_policies")]
+    /// Clear all explicit `[[profiles.git.remotes]]` entries.
+    #[arg(
+        long,
+        conflicts_with = "remote_policies",
+        help_heading = "Push & Remotes"
+    )]
     clear_remote_policies: bool,
-    /// Explicit server-side merge grant: OWNER/REPO|BASE_BRANCH|merge|squash|rebase.
-    #[arg(long = "allow-github-merge", value_name = "REPO|BASE|STRATEGY")]
-    github_merge_rules: Vec<String>,
-    #[arg(long, conflicts_with = "github_merge_rules")]
-    clear_github_merges: bool,
-    #[arg(long, conflicts_with = "github_repositories")]
-    clear_github_repositories: bool,
-    #[arg(long, conflicts_with = "strict_authors")]
-    preserve_authors: bool,
-    #[arg(long, conflicts_with = "preserve_authors")]
-    strict_authors: bool,
-    #[arg(long = "deny-destination", conflicts_with = "clear_deny_destinations")]
+    /// Explicitly denied Git destination URL or wildcard pattern (repeatable).
+    #[arg(
+        long = "deny-destination",
+        conflicts_with = "clear_deny_destinations",
+        help_heading = "Push & Remotes"
+    )]
     deny_destinations: Vec<String>,
-    #[arg(long, conflicts_with = "deny_destinations")]
+    /// Clear all denied Git destination patterns.
+    #[arg(
+        long,
+        conflicts_with = "deny_destinations",
+        help_heading = "Push & Remotes"
+    )]
     clear_deny_destinations: bool,
+    /// Allow foreign commit authors while still enforcing active committer and signing identity.
+    #[arg(
+        long,
+        conflicts_with = "strict_authors",
+        help_heading = "Push & Remotes"
+    )]
+    preserve_authors: bool,
+    /// Require outgoing commit authors to match the active profile's author identity.
+    #[arg(
+        long,
+        conflicts_with = "preserve_authors",
+        help_heading = "Push & Remotes"
+    )]
+    strict_authors: bool,
+    /// SSH hostname for managed Git SSH transport (e.g. `github.com`).
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_host: Option<String>,
+    /// SSH username for managed Git SSH transport (e.g. `git`).
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_user: Option<String>,
+    /// SSH port for managed Git SSH transport (e.g. `22`).
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_port: Option<u16>,
+    /// Expected SSH key fingerprint (`SHA256:...`).
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_fingerprint: Option<String>,
+    /// Absolute path to the SSH public key file.
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_public_key: Option<PathBuf>,
+    /// Absolute path to the SSH private identity file (`-i`).
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_identity_file: Option<PathBuf>,
+    /// Absolute path to a dedicated `SSH_AUTH_SOCK` agent socket.
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_agent_socket: Option<PathBuf>,
+    /// Absolute path to a dedicated `known_hosts` file.
+    #[arg(long, help_heading = "SSH Transport")]
+    ssh_known_hosts_file: Option<PathBuf>,
+    /// Remove the SSH transport policy from this profile.
+    #[arg(long, help_heading = "SSH Transport")]
+    clear_ssh: bool,
+    /// Allowed GitHub repository `OWNER/REPO` or `OWNER/*` pattern for `gh` (repeatable).
+    #[arg(long = "github-repo", help_heading = "GitHub")]
+    github_repositories: Vec<String>,
+    /// Clear the allowed GitHub repository list on the enrolled binding.
+    #[arg(long, conflicts_with = "github_repositories", help_heading = "GitHub")]
+    clear_github_repositories: bool,
+    /// Explicitly denied GitHub repository `OWNER/REPO` or `OWNER/*` pattern (repeatable).
     #[arg(
         long = "deny-github-repo",
-        conflicts_with = "clear_deny_github_repositories"
+        conflicts_with = "clear_deny_github_repositories",
+        help_heading = "GitHub"
     )]
     deny_github_repositories: Vec<String>,
-    #[arg(long, conflicts_with = "deny_github_repositories")]
+    /// Clear all denied GitHub repository patterns.
+    #[arg(
+        long,
+        conflicts_with = "deny_github_repositories",
+        help_heading = "GitHub"
+    )]
     clear_deny_github_repositories: bool,
-    #[arg(long, value_enum)]
+    /// Explicit server-side merge grant: OWNER/REPO|BASE_BRANCH|merge|squash|rebase.
+    #[arg(
+        long = "allow-github-merge",
+        value_name = "REPO|BASE|STRATEGY",
+        help_heading = "GitHub"
+    )]
+    github_merge_rules: Vec<String>,
+    /// Clear all server-side GitHub merge grants.
+    #[arg(long, conflicts_with = "github_merge_rules", help_heading = "GitHub")]
+    clear_github_merges: bool,
+    /// Command policy mode for managed `git` commands (`denylist` or `allowlist`).
+    #[arg(long, value_enum, help_heading = "Command Policies")]
     git_command_mode: Option<CliCommandMode>,
-    #[arg(long = "git-allow")]
+    /// Allowed `git` command selector or `<selector> <flag>` rule (repeatable).
+    #[arg(long = "git-allow", help_heading = "Command Policies")]
     git_allow: Vec<String>,
-    #[arg(long = "git-deny")]
+    /// Denied `git` command selector or `<selector> <flag>` rule (repeatable).
+    #[arg(long = "git-deny", help_heading = "Command Policies")]
     git_deny: Vec<String>,
-    #[arg(long)]
+    /// Reset managed `git` command rules to default.
+    #[arg(long, help_heading = "Command Policies")]
     clear_git_commands: bool,
-    #[arg(long, value_enum)]
+    /// Command policy mode for managed `gh` commands (`denylist` or `allowlist`).
+    #[arg(long, value_enum, help_heading = "Command Policies")]
     gh_command_mode: Option<CliCommandMode>,
-    #[arg(long = "gh-allow")]
+    /// Allowed `gh` command selector or `<selector> <flag>` rule (repeatable).
+    #[arg(long = "gh-allow", help_heading = "Command Policies")]
     gh_allow: Vec<String>,
-    #[arg(long = "gh-deny")]
+    /// Denied `gh` command selector or `<selector> <flag>` rule (repeatable).
+    #[arg(long = "gh-deny", help_heading = "Command Policies")]
     gh_deny: Vec<String>,
-    #[arg(long)]
+    /// Reset managed `gh` command rules to default.
+    #[arg(long, help_heading = "Command Policies")]
     clear_gh_commands: bool,
-    #[arg(long, value_enum)]
+    /// Command policy mode for `persona run` (`denylist` or `allowlist`).
+    #[arg(long, value_enum, help_heading = "Command Policies")]
     run_command_mode: Option<CliCommandMode>,
-    #[arg(long = "run-allow")]
+    /// Allowed `persona run` program selector or `<selector> <flag>` rule (repeatable).
+    #[arg(long = "run-allow", help_heading = "Command Policies")]
     run_allow: Vec<String>,
-    #[arg(long = "run-deny")]
+    /// Denied `persona run` program selector or `<selector> <flag>` rule (repeatable).
+    #[arg(long = "run-deny", help_heading = "Command Policies")]
     run_deny: Vec<String>,
-    #[arg(long)]
+    /// Reset `persona run` command rules to default.
+    #[arg(long, help_heading = "Command Policies")]
     clear_run_commands: bool,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow creating new remote branches on push (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_initial_push: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow fast-forward branch updates on push (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_fast_forward: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow pushing signed annotated tags (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_annotated_tags: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow creating and pushing lightweight tags (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_lightweight_tags: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow deleting remote branches on push (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_branch_deletion: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow deleting remote tags on push (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_tag_deletion: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow `--force-with-lease` branch updates (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_force_with_lease: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Allow unleased `--force` push updates (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     allow_force_push: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Require an explicit remote ref lease when pushing new tags (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Push & Remotes")]
     require_tag_lease_on_create: Option<bool>,
-    #[arg(long, value_enum)]
+    /// Upstream commit provenance mode (`remote-tracking`, `pinned`, or `off`).
+    #[arg(long, value_enum, help_heading = "Push & Remotes")]
     upstream_provenance: Option<CliProvenanceMode>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Block checkout mutations when non-Persona repository hooks exist (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Hardening")]
     strict_repo_hooks: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Block mutations/HTTPS when external Git filter/textconv commands exist (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Hardening")]
     strict_git_filters: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Block sequenced operations when custom merge drivers exist (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Hardening")]
     strict_merge_drivers: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Inherit global/user Git config for local non-network commands (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Hardening")]
     inherit_git_config: Option<bool>,
-    #[arg(long, action = clap::ArgAction::Set)]
+    /// Block commits/pushes authored or committed by another Persona profile's email (`true` or `false`).
+    #[arg(long, action = clap::ArgAction::Set, help_heading = "Hardening")]
     cross_profile_identity_check: Option<bool>,
+    /// Pinned upstream baseline `<DESTINATION>|<refs/remotes/REMOTE/BRANCH>=<OID>` (repeatable).
     #[arg(
         long = "upstream-baseline",
-        conflicts_with = "clear_upstream_baselines"
+        conflicts_with = "clear_upstream_baselines",
+        help_heading = "Push & Remotes"
     )]
     upstream_baselines: Vec<String>,
-    #[arg(long, conflicts_with = "upstream_baselines")]
+    /// Clear all pinned upstream baselines on this profile.
+    #[arg(
+        long,
+        conflicts_with = "upstream_baselines",
+        help_heading = "Push & Remotes"
+    )]
     clear_upstream_baselines: bool,
-    #[arg(long)]
+    /// Preview the resulting TOML configuration without writing to disk.
+    #[arg(long, short = 'n', visible_alias = "dry-run")]
     preview: bool,
 }
 
 #[derive(Args)]
 struct SetupArgs {
+    /// Initial profile name to create.
     #[arg(long, default_value = "default")]
     profile: String,
+    /// Initial directory scope name to create.
     #[arg(long, default_value = "default")]
     scope_name: String,
+    /// Directory path to bind to the initial scope.
     #[arg(long, default_value = ".")]
     scope: PathBuf,
+    /// Git author name for the initial profile.
     #[arg(long)]
     author_name: Option<String>,
+    /// Git author email for the initial profile.
     #[arg(long)]
     author_email: Option<String>,
+    /// Git committer name (defaults to `--author-name` if omitted).
     #[arg(long)]
     committer_name: Option<String>,
+    /// Git committer email (defaults to `--author-email` if omitted).
     #[arg(long)]
     committer_email: Option<String>,
+    /// Do not prompt on stdin; fail if required options are missing.
+    #[arg(long)]
+    no_input: bool,
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// Explicit Persona configuration file path (also respects PERSONA_CONFIG_PATH).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Directory to inspect.
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+    /// Output format (`text` or `json`).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+    /// Alias for `--format json`.
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
+    /// Print per-property offline diagnostic findings.
+    #[arg(long)]
+    verbose: bool,
+    /// Exit non-zero (3 or 4) even when only informational offline indicators are UNKNOWN/WARN.
+    #[arg(long)]
+    strict: bool,
+    #[arg(long, value_enum, hide = true)]
+    operation: Option<Operation>,
+    #[arg(long, hide = true)]
+    remote: Option<String>,
+    #[arg(long, hide = true, conflicts_with = "destination_stdin")]
+    destination: Option<String>,
+    #[arg(long, hide = true, conflicts_with = "destination")]
+    destination_stdin: bool,
+    #[arg(long, hide = true)]
+    primary_handoff: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    tag: Option<String>,
+    #[arg(long, hide = true)]
+    online_verified: bool,
 }
 
 #[derive(Args)]
 struct AuditArgs {
+    /// Explicit Persona configuration file path (also respects PERSONA_CONFIG_PATH).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Directory or Git worktree to inspect.
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
+    /// Output format (`text` or `json`).
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
-    /// Alias for --format json.
+    /// Alias for `--format json`.
     #[arg(long, conflicts_with = "format")]
     json: bool,
-    #[arg(long, conflicts_with_all = ["json", "format"])]
+    /// Print per-property offline diagnostic findings in text mode.
+    #[arg(long)]
     verbose: bool,
+    /// Exit non-zero (3 or 4) even when only informational offline indicators are UNKNOWN/WARN.
+    #[arg(long)]
+    strict: bool,
+    /// Audit operation to perform (`status`, `push`, or `tag`).
     #[arg(long, value_enum)]
     operation: Option<Operation>,
+    /// Remote name for `--operation push`.
     #[arg(long)]
     remote: Option<String>,
+    /// Effective remote destination URL for `--operation push`.
     #[arg(long, conflicts_with = "destination_stdin")]
     destination: Option<String>,
     #[arg(long, hide = true, conflicts_with = "destination")]
     destination_stdin: bool,
     #[arg(long, hide = true)]
     primary_handoff: Option<PathBuf>,
+    /// Annotated tag name to verify for `--operation tag`.
     #[arg(long)]
     tag: Option<String>,
     /// Explicitly query GitHub's commit verification status for outgoing commits.
@@ -551,11 +885,58 @@ enum OutputFormat {
     Json,
 }
 
+static NO_COLOR_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static QUIET_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn env_disables_color() -> bool {
+    NO_COLOR_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+        || std::env::var("CLICOLOR").is_ok_and(|value| value == "0")
+}
+
+fn stdout_color_enabled() -> bool {
+    !env_disables_color() && std::io::stdout().is_terminal()
+}
+
+fn stderr_color_enabled() -> bool {
+    !env_disables_color() && std::io::stderr().is_terminal()
+}
+
+fn is_quiet() -> bool {
+    QUIET_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn style_status(text: &str, status: Status, color: bool) -> String {
+    if !color {
+        return text.to_owned();
+    }
+    let code = match status {
+        Status::Pass => "\x1b[32m",
+        Status::Warn => "\x1b[33m",
+        Status::Unknown => "\x1b[36m",
+        Status::Fail => "\x1b[31m",
+    };
+    format!("{code}{text}\x1b[0m")
+}
+
+fn style_verdict(allowed: bool, color: bool) -> &'static str {
+    match (allowed, color) {
+        (true, false) => "ALLOW",
+        (false, false) => "BLOCK",
+        (true, true) => "\x1b[32mALLOW\x1b[0m",
+        (false, true) => "\x1b[31mBLOCK\x1b[0m",
+    }
+}
+
 fn main() -> ExitCode {
     if let Some(exit) = managed_shim_dispatch() {
         return exit;
     }
     let cli = Cli::parse();
+    NO_COLOR_REQUESTED.store(cli.no_color, std::sync::atomic::Ordering::Relaxed);
+    QUIET_REQUESTED.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
     let result = (|| -> Result<u8, String> {
         match cli.command {
             None => {
@@ -564,6 +945,7 @@ fn main() -> ExitCode {
                     &config,
                     Path::new("."),
                     OutputFormat::Text,
+                    false,
                     false,
                     None,
                     None,
@@ -588,8 +970,9 @@ fn main() -> ExitCode {
                 show_status(
                     &config,
                     &args.cwd,
-                    output_format(&args),
+                    status_output_format(&args),
                     args.verbose,
+                    args.strict,
                     None,
                     None,
                     false,
@@ -599,14 +982,35 @@ fn main() -> ExitCode {
                 let format = output_format(&args);
                 let operation = args.operation.unwrap_or(Operation::Status);
                 match operation {
-                    Operation::Status if args.remote.is_some() || args.destination.is_some() || args.destination_stdin || args.primary_handoff.is_some() || args.tag.is_some() || args.online_verified => {
-                        Err("--remote/--destination require --operation push; --tag requires --operation tag".to_owned())
+                    Operation::Status
+                        if args.remote.is_some()
+                            || args.destination.is_some()
+                            || args.destination_stdin
+                            || args.primary_handoff.is_some()
+                            || args.tag.is_some()
+                            || args.online_verified =>
+                    {
+                        Err(
+                            "--remote/--destination require --operation push; --tag requires --operation tag"
+                                .to_owned(),
+                        )
                     }
                     Operation::Status => {
                         let config = resolve_config_path(args.config.as_deref())?;
-                        show_status(&config, &args.cwd, format, args.verbose, None, None, false)
+                        show_status(
+                            &config,
+                            &args.cwd,
+                            format,
+                            args.verbose,
+                            args.strict,
+                            None,
+                            None,
+                            false,
+                        )
                     }
-                    Operation::Push if args.tag.is_some() => Err("--tag cannot be combined with --operation push".to_owned()),
+                    Operation::Push if args.tag.is_some() => {
+                        Err("--tag cannot be combined with --operation push".to_owned())
+                    }
                     Operation::Push => {
                         let remote = args.remote.ok_or_else(|| {
                             "--remote is required with --operation push".to_owned()
@@ -615,12 +1019,14 @@ fn main() -> ExitCode {
                             read_push_request_stdin()?
                         } else {
                             let destination = args.destination.ok_or_else(|| {
-                                "--destination or --destination-stdin is required with --operation push".to_owned()
+                                "--destination or --destination-stdin is required with --operation push"
+                                    .to_owned()
                             })?;
                             (destination, read_push_tuples()?)
                         };
                         let config = resolve_config_path(args.config.as_deref())?;
-                        let current = std::env::current_dir().map_err(|_| "cannot resolve check working directory".to_owned())?;
+                        let current = std::env::current_dir()
+                            .map_err(|_| "cannot resolve check working directory".to_owned())?;
                         let config = absolute_path(&config, &current);
                         let directory = absolute_path(&args.cwd, &current);
                         let mut request = PushRequest {
@@ -631,13 +1037,25 @@ fn main() -> ExitCode {
                             allow_unleased_force: false,
                         };
                         let primary_handoff = args.primary_handoff;
-                        let validated_handoff = primary_handoff.as_deref().map(|path| {
-                            validate_primary_handoff(path, &config, &directory, &mut request)
-                        }).transpose()?;
+                        let validated_handoff = primary_handoff
+                            .as_deref()
+                            .map(|path| {
+                                validate_primary_handoff(path, &config, &directory, &mut request)
+                            })
+                            .transpose()?;
                         let handoff_binding = validated_handoff
                             .as_ref()
                             .and_then(|handoff| handoff.github_binding.clone());
-                        let exit = show_status(&config, &directory, format, args.verbose, Some(request), handoff_binding, args.online_verified)?;
+                        let exit = show_status(
+                            &config,
+                            &directory,
+                            format,
+                            args.verbose,
+                            args.strict,
+                            Some(request),
+                            handoff_binding,
+                            args.online_verified,
+                        )?;
                         if exit == 0 {
                             if let Some(path) = primary_handoff {
                                 consume_primary_handoff(&path)?;
@@ -645,9 +1063,20 @@ fn main() -> ExitCode {
                         }
                         Ok(exit)
                     }
-                    Operation::Tag if args.remote.is_some() || args.destination.is_some() || args.destination_stdin || args.primary_handoff.is_some() || args.online_verified => Err("--remote/--destination cannot be combined with --operation tag".to_owned()),
+                    Operation::Tag
+                        if args.remote.is_some()
+                            || args.destination.is_some()
+                            || args.destination_stdin
+                            || args.primary_handoff.is_some()
+                            || args.online_verified =>
+                    {
+                        Err("--remote/--destination cannot be combined with --operation tag"
+                            .to_owned())
+                    }
                     Operation::Tag => {
-                        let tag = args.tag.ok_or_else(|| "--tag is required with --operation tag".to_owned())?;
+                        let tag = args
+                            .tag
+                            .ok_or_else(|| "--tag is required with --operation tag".to_owned())?;
                         let config = resolve_config_path(args.config.as_deref())?;
                         show_tag(&config, &args.cwd, &tag, format)
                     }
@@ -668,8 +1097,9 @@ fn main() -> ExitCode {
                 show_status(
                     &config,
                     &args.cwd,
-                    output_format(&args),
+                    status_output_format(&args),
                     true,
+                    args.strict,
                     None,
                     None,
                     false,
@@ -682,6 +1112,10 @@ fn main() -> ExitCode {
             Some(Commands::Baseline { command }) => baseline_command(command),
             Some(Commands::Install { command }) => installer_command(command),
             Some(Commands::Shell { command }) => shell_command(command),
+            Some(Commands::Completions { shell }) => {
+                print_completions(shell);
+                Ok(0)
+            }
             Some(Commands::Config { command }) => match command {
                 ConfigCommands::Migrate {
                     config,
@@ -712,7 +1146,11 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code),
         Err(message) => {
-            eprintln!("error: {message}");
+            if stderr_color_enabled() {
+                eprintln!("\x1b[31merror:\x1b[0m {message}");
+            } else {
+                eprintln!("error: {message}");
+            }
             ExitCode::from(EXIT_ERROR)
         }
     }
@@ -764,6 +1202,14 @@ fn managed_shim_dispatch() -> Option<ExitCode> {
             }
         }),
         _ => None,
+    }
+}
+
+fn status_output_format(args: &StatusArgs) -> OutputFormat {
+    if args.json {
+        OutputFormat::Json
+    } else {
+        args.format
     }
 }
 
@@ -823,13 +1269,171 @@ fn shell_command(command: ShellCommands) -> Result<u8, String> {
                 .map_err(|_| "cannot resolve current directory for shell marker".to_owned())?;
             let config_path = resolve_config_path(None)?;
             let config = Config::load(&config_path)
-                .map_err(|error| format!("cannot load Persona config: {error:?}"))?;
+                .map_err(|error| format!("cannot load Persona config: {error}"))?;
             let selected = persona::context::resolve_context(&cwd, &config.scopes())
                 .map_err(|_| "cannot resolve Persona scope for shell marker".to_owned())?;
             if selected.is_some() {
                 print!("[scope]");
             }
             Ok(0)
+        }
+        ShellCommands::Completions { shell } => {
+            print_completions(shell);
+            Ok(0)
+        }
+    }
+}
+
+fn print_completions(shell: CompletionShell) {
+    let cmd = Cli::command();
+    let top_subcommands: Vec<&str> = cmd
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .map(|sub| sub.get_name())
+        .collect();
+    let top_list = top_subcommands.join(" ");
+    match shell {
+        CompletionShell::Bash => {
+            println!(
+                r#"_persona_completions() {{
+    local cur prev words cword
+    COMPREPLY=()
+    cur="${{COMP_WORDS[COMP_CWORD]}}"
+    prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+    if [[ ${{COMP_CWORD}} -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "{top_list} --help --version --no-color --quiet" -- "$cur") )
+        return 0
+    fi
+    case "${{COMP_WORDS[1]}}" in
+        profile)
+            COMPREPLY=( $(compgen -W "list show verify add update commands remove --help" -- "$cur") )
+            ;;
+        scope)
+            COMPREPLY=( $(compgen -W "list show verify add update remove --help" -- "$cur") )
+            ;;
+        auth)
+            COMPREPLY=( $(compgen -W "enroll verify unbind --help" -- "$cur") )
+            ;;
+        hooks)
+            COMPREPLY=( $(compgen -W "install refresh remove --help" -- "$cur") )
+            ;;
+        install)
+            COMPREPLY=( $(compgen -W "preview apply refresh remove rollback --help" -- "$cur") )
+            ;;
+        config)
+            COMPREPLY=( $(compgen -W "migrate rollback --help" -- "$cur") )
+            ;;
+        baseline)
+            COMPREPLY=( $(compgen -W "update --help" -- "$cur") )
+            ;;
+        shell)
+            COMPREPLY=( $(compgen -W "zsh completions --help" -- "$cur") )
+            ;;
+        completions)
+            COMPREPLY=( $(compgen -W "bash zsh fish --help" -- "$cur") )
+            ;;
+        status|doctor|check)
+            COMPREPLY=( $(compgen -W "--config --cwd --format --json --verbose --strict --help" -- "$cur") )
+            ;;
+    esac
+}}
+complete -F _persona_completions persona"#
+            );
+        }
+        CompletionShell::Zsh => {
+            println!(
+                r#"#compdef persona
+_persona() {{
+    local -a commands
+    commands=(
+        'status:Show the resolved Persona scope, profile, and local status'
+        'check:Evaluate local status, outgoing push updates, or signed tag policy'
+        'doctor:Run a verbose offline diagnostic audit'
+        'run:Execute a command with temporary managed shims on PATH'
+        'setup:Create the initial private Persona configuration'
+        'config:Migrate or roll back Persona configuration'
+        'profile:Inspect, create, update, or configure profiles'
+        'scope:Inspect, add, update, verify, or remove directory scopes'
+        'auth:Enroll, verify, or unbind a GitHub CLI account binding'
+        'hooks:Install, refresh, or remove the pre-push hook'
+        'baseline:Manage pinned upstream commit baselines'
+        'install:Preview or manage user-owned PATH shims'
+        'shell:Generate shell prompt hooks or tab-completion scripts'
+        'completions:Print shell tab-completion script'
+    )
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'persona command' commands
+        return
+    fi
+    case "${{words[2]}}" in
+        profile)
+            local -a sub=('list' 'show' 'verify' 'add' 'update' 'commands' 'remove')
+            _describe -t subcommands 'profile command' sub
+            ;;
+        scope)
+            local -a sub=('list' 'show' 'verify' 'add' 'update' 'remove')
+            _describe -t subcommands 'scope command' sub
+            ;;
+        auth)
+            local -a sub=('enroll' 'verify' 'unbind')
+            _describe -t subcommands 'auth command' sub
+            ;;
+        hooks)
+            local -a sub=('install' 'refresh' 'remove')
+            _describe -t subcommands 'hooks command' sub
+            ;;
+        install)
+            local -a sub=('preview' 'apply' 'refresh' 'remove' 'rollback')
+            _describe -t subcommands 'install command' sub
+            ;;
+        config)
+            local -a sub=('migrate' 'rollback')
+            _describe -t subcommands 'config command' sub
+            ;;
+        baseline)
+            local -a sub=('update')
+            _describe -t subcommands 'baseline command' sub
+            ;;
+        shell)
+            local -a sub=('zsh' 'completions')
+            _describe -t subcommands 'shell command' sub
+            ;;
+        completions)
+            local -a sub=('bash' 'zsh' 'fish')
+            _describe -t subcommands 'shell' sub
+            ;;
+    esac
+}}
+compdef _persona persona"#
+            );
+        }
+        CompletionShell::Fish => {
+            for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+                let name = sub.get_name();
+                let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+                println!(
+                    "complete -c persona -n '__fish_use_subcommand' -a '{name}' -d '{}'",
+                    about.replace('\'', "\\'")
+                );
+            }
+            println!(
+                "complete -c persona -n '__fish_seen_subcommand_from profile' -a 'list show verify add update commands remove'"
+            );
+            println!(
+                "complete -c persona -n '__fish_seen_subcommand_from scope' -a 'list show verify add update remove'"
+            );
+            println!(
+                "complete -c persona -n '__fish_seen_subcommand_from auth' -a 'enroll verify unbind'"
+            );
+            println!(
+                "complete -c persona -n '__fish_seen_subcommand_from hooks' -a 'install refresh remove'"
+            );
+            println!(
+                "complete -c persona -n '__fish_seen_subcommand_from install' -a 'preview apply refresh remove rollback'"
+            );
+            println!(
+                "complete -c persona -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'"
+            );
         }
     }
 }
@@ -871,7 +1475,9 @@ fn installer_command(command: InstallCommands) -> Result<u8, String> {
                         &git,
                         &executable,
                     ) {
-                        println!("{line}");
+                        if !is_quiet() {
+                            println!("{line}");
+                        }
                     }
                 }
                 backup
@@ -905,11 +1511,13 @@ fn installer_command(command: InstallCommands) -> Result<u8, String> {
             }
         }
     };
-    if let Some(backup) = result {
-        println!("Backup: {}", backup.display());
-    }
-    if !preview_only {
-        println!("Installation operation complete.");
+    if !is_quiet() {
+        if let Some(backup) = result {
+            println!("Backup: {}", backup.display());
+        }
+        if !preview_only {
+            println!("Installation operation complete.");
+        }
     }
     Ok(0)
 }
@@ -933,7 +1541,7 @@ fn hooks_command(command: HookCommands) -> Result<u8, String> {
         } => {
             let config_path = resolve_config_path(config.as_deref())?;
             let config = Config::load(&config_path)
-                .map_err(|error| format!("cannot load Persona config: {error:?}"))?;
+                .map_err(|error| format!("cannot load Persona config: {error}"))?;
             let selected = persona::context::resolve_context(&root, &config.scopes())
                 .map_err(|_| "cannot resolve Persona policy for hook install".to_owned())?
                 .ok_or_else(|| "hook installation requires a managed scope".to_owned())?;
@@ -989,7 +1597,9 @@ fn hooks_command(command: HookCommands) -> Result<u8, String> {
             message
         }
     };
-    println!("{message}");
+    if !is_quiet() {
+        println!("{message}");
+    }
     Ok(0)
 }
 
@@ -1013,7 +1623,7 @@ fn run_launcher(args: RunArgs) -> Result<u8, String> {
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
     let config_path = absolute_path(&config_path, &current);
     let directory = absolute_path(&args.cwd, &current);
-    let config = Config::load(&config_path).map_err(|error| format!("{error:?}"))?;
+    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
     let executables = ExecutablePaths {
         git: git_executable(),
         gpg: gpg_executable(),
@@ -1103,8 +1713,7 @@ fn run_launcher(args: RunArgs) -> Result<u8, String> {
     if let Some(ssh_keygen) = ssh_keygen_executable() {
         child.env("PERSONA_SSH_KEYGEN", ssh_keygen);
     }
-    let status = child
-        .status()
+    let status = wait_child_ignoring_sigint(&mut child)
         .map_err(|error| format!("cannot launch requested program: {error}"))?;
     Ok(status_exit_code(status))
 }
@@ -1216,11 +1825,13 @@ fn integration_coverage_findings(directory: &Path) -> Vec<persona::report::Findi
     vec![installation_finding, hook_finding]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_status(
     config_path: &Path,
     directory: &Path,
     format: OutputFormat,
     verbose: bool,
+    strict: bool,
     push: Option<PushRequest>,
     handoff_binding: Option<persona::push_handoff::HandoffGithubBinding>,
     online_verified: bool,
@@ -1229,7 +1840,7 @@ fn show_status(
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
     let config_path = absolute_path(config_path, &current_directory);
     let directory = absolute_path(directory, &current_directory);
-    let config = Config::load(&config_path).map_err(|error| format!("{error:?}"))?;
+    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
     let executables = ExecutablePaths {
         git: git_executable(),
         gpg: gpg_executable(),
@@ -1407,7 +2018,10 @@ fn show_status(
         };
         findings.push(finding);
     }
-    let report = Report::new(findings);
+    let mut report = Report::new(findings);
+    if strict {
+        report.status = report.strict_status();
+    }
     let decision = push.as_ref().map(|_| {
         let mut required = vec![
             "scope".to_owned(),
@@ -1479,7 +2093,7 @@ fn show_tag(
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
     let config_path = absolute_path(config_path, &current);
     let directory = absolute_path(directory, &current);
-    let config = Config::load(&config_path).map_err(|error| format!("{error:?}"))?;
+    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
     let executables = ExecutablePaths {
         git: git_executable(),
         gpg: gpg_executable(),
@@ -1519,11 +2133,13 @@ fn print_text(
     decision: Option<&OperationDecision>,
     verbose: bool,
 ) {
+    let color = stdout_color_enabled();
     if !verbose {
         let scope = selected
             .map(|scope| scope.name.as_str())
             .unwrap_or("unmanaged");
-        println!("Persona: {scope} — {:?}", report.status);
+        let status_label = style_status(&format!("{:?}", report.status), report.status, color);
+        println!("Persona: {scope} — {status_label}");
         if let Some(scope) = selected {
             if let Some(policy) = config
                 .policies()
@@ -1536,14 +2152,17 @@ fn print_text(
         if let Some(decision) = decision {
             println!(
                 "authorization: {}",
-                if decision.is_allowed() {
-                    "ALLOW"
-                } else {
-                    "BLOCK"
-                }
+                style_verdict(decision.is_allowed(), color)
             );
+            for blocker in &decision.blockers {
+                println!("blocked {}: {}", blocker.property, blocker.reason);
+            }
+            if !is_quiet() {
+                println!("Use `--verbose` for all findings.");
+            }
+        } else if !is_quiet() {
+            println!("Use `persona doctor` or `--verbose` for offline findings.");
         }
-        println!("Use `persona doctor` or `--verbose` for offline findings.");
         return;
     }
     match selected {
@@ -1571,15 +2190,15 @@ fn print_text(
             println!("identity: no identity assumed");
         }
     }
-    println!("result: {}", format!("{:?}", report.status).to_uppercase());
+    let result_upper = format!("{:?}", report.status).to_uppercase();
+    println!(
+        "result: {}",
+        style_status(&result_upper, report.status, color)
+    );
     if let Some(decision) = decision {
         println!(
             "authorization: {} ({:?})",
-            if decision.is_allowed() {
-                "ALLOW"
-            } else {
-                "BLOCK"
-            },
+            style_verdict(decision.is_allowed(), color),
             decision.operation
         );
         for blocker in &decision.blockers {
@@ -1605,10 +2224,11 @@ fn print_text(
     );
     let mut details = String::new();
     for finding in &report.findings {
+        let status_str = style_status(&format!("{:?}", finding.status), finding.status, color);
         let _ = write!(
             details,
-            "finding {}: {:?} ({}), ",
-            finding.property, finding.status, finding.coverage_reason
+            "finding {}: {status_str} ({}), ",
+            finding.property, finding.coverage_reason
         );
         if let Some(expected) = &finding.expected {
             let _ = write!(details, "expected={expected}, ");
@@ -1623,22 +2243,32 @@ fn print_text(
 
 fn setup(args: SetupArgs) -> Result<u8, String> {
     let paths = PersonaPaths::discover()
-        .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+        .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
     paths
         .validate_private_config()
-        .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+        .map_err(|error| format!("unsafe private configuration: {error}"))?;
     if paths.config_file.exists() {
         return Err("Persona is already configured; refusing to overwrite it".to_owned());
     }
     let current = std::env::current_dir()
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
     let scope_root = physical_scope_root(&absolute_path(&args.scope, &current))?;
-    let author_name = setup_value(args.author_name, "Author name")?;
-    let author_email = setup_value(args.author_email, "Author email")?;
-    let committer_name = setup_value(args.committer_name, "Committer name")?;
-    let committer_email = setup_value(args.committer_email, "Committer email")?;
+    let author_name = setup_value(args.author_name, "Author name", args.no_input, None)?;
+    let author_email = setup_value(args.author_email, "Author email", args.no_input, None)?;
+    let committer_name = setup_value(
+        args.committer_name,
+        "Committer name",
+        args.no_input,
+        Some(&author_name),
+    )?;
+    let committer_email = setup_value(
+        args.committer_email,
+        "Committer email",
+        args.no_input,
+        Some(&author_email),
+    )?;
     let profile = Profile {
-        name: args.profile,
+        name: args.profile.clone(),
         github: None,
         ssh: None,
         github_merge: None,
@@ -1665,39 +2295,56 @@ fn setup(args: SetupArgs) -> Result<u8, String> {
         },
     };
     let config = Config::single_scope(profile, args.scope_name, scope_root)
-        .map_err(|error| format!("invalid initial profile/scope: {error:?}"))?;
+        .map_err(|error| format!("invalid initial profile/scope: {error}"))?;
     let contents = config
         .to_v3_toml()
-        .map_err(|error| format!("cannot encode initial configuration: {error:?}"))?;
+        .map_err(|error| format!("cannot encode initial configuration: {error}"))?;
     paths
         .ensure_private_directories()
-        .map_err(|error| format!("cannot prepare private Persona paths: {error:?}"))?;
+        .map_err(|error| format!("cannot prepare private Persona paths: {error}"))?;
     paths
         .create_config(contents.as_bytes())
-        .map_err(|error| format!("cannot securely create Persona configuration: {error:?}"))?;
-    println!(
-        "Created private Persona configuration at {}",
-        paths.config_file.display()
-    );
-    println!("No Git, SSH, GPG, GitHub, or credential settings were changed.");
+        .map_err(|error| format!("cannot securely create Persona configuration: {error}"))?;
+    if !is_quiet() {
+        println!(
+            "Created private Persona configuration at {}",
+            paths.config_file.display()
+        );
+        println!("No Git, SSH, GPG, GitHub, or credential settings were changed.");
+        println!(
+            "Next steps: run `persona doctor`, `persona profile show {}`, or `persona auth enroll --profile {} --user <GH_USER> --confirm-online`.",
+            args.profile, args.profile
+        );
+    }
     Ok(0)
 }
 
-fn setup_value(value: Option<String>, label: &str) -> Result<String, String> {
+fn setup_value(
+    value: Option<String>,
+    label: &str,
+    no_input: bool,
+    default: Option<&str>,
+) -> Result<String, String> {
     if let Some(value) = value {
         if value.trim().is_empty() {
             return Err(format!("{label} cannot be empty"));
         }
         return Ok(value);
     }
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
+    if no_input || !std::io::stdin().is_terminal() {
+        if let Some(default) = default {
+            return Ok(default.to_owned());
+        }
         return Err(format!(
             "{label} is required; supply its --{} flag or run setup interactively",
             label.to_ascii_lowercase().replace(' ', "-")
         ));
     }
-    print!("{label}: ");
+    if let Some(default) = default {
+        print!("{label} [{default}]: ");
+    } else {
+        print!("{label}: ");
+    }
     std::io::Write::flush(&mut std::io::stdout())
         .map_err(|error| format!("cannot write setup prompt: {error}"))?;
     let mut value = String::new();
@@ -1706,6 +2353,9 @@ fn setup_value(value: Option<String>, label: &str) -> Result<String, String> {
         .map_err(|error| format!("cannot read setup input: {error}"))?;
     let value = value.trim().to_owned();
     if value.is_empty() {
+        if let Some(default) = default {
+            return Ok(default.to_owned());
+        }
         return Err(format!("{label} cannot be empty"));
     }
     Ok(value)
@@ -1713,7 +2363,7 @@ fn setup_value(value: Option<String>, label: &str) -> Result<String, String> {
 
 fn physical_scope_root(path: &Path) -> Result<PathBuf, String> {
     let canonical = persona::paths::canonical_directory(path)
-        .map_err(|error| format!("invalid scope directory: {error:?}"))?;
+        .map_err(|error| format!("invalid scope directory: {error}"))?;
     let git = GitClient::new(git_executable(), Vec::new());
     match git.checkout_root(&canonical) {
         Ok(root) => Ok(root),
@@ -1723,56 +2373,60 @@ fn physical_scope_root(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn preview_config_migration(config_path: &Path) -> Result<u8, String> {
-    let config = Config::load(config_path).map_err(|error| format!("{error:?}"))?;
+    let config = Config::load(config_path).map_err(|error| error.to_string())?;
     let preview = config
         .to_v3_toml()
-        .map_err(|error| format!("cannot migrate configuration: {error:?}"))?;
+        .map_err(|error| format!("cannot migrate configuration: {error}"))?;
     print!("{preview}");
     Ok(0)
 }
 
 fn apply_config_migration() -> Result<u8, String> {
     let paths = PersonaPaths::discover()
-        .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+        .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
     let _update_lock = paths
         .lock_config_update()
-        .map_err(|error| format!("cannot lock private configuration for migration: {error:?}"))?;
+        .map_err(|error| format!("cannot lock private configuration for migration: {error}"))?;
     paths
         .validate_private_config()
-        .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+        .map_err(|error| format!("unsafe private configuration: {error}"))?;
     let config = Config::load(&paths.config_file)
-        .map_err(|error| format!("cannot load private configuration: {error:?}"))?;
+        .map_err(|error| format!("cannot load private configuration: {error}"))?;
     if config.version() == 3 {
         return Err("configuration is already version 3".to_owned());
     }
     let contents = config
         .to_v3_toml()
-        .map_err(|error| format!("cannot migrate configuration: {error:?}"))?;
+        .map_err(|error| format!("cannot migrate configuration: {error}"))?;
     let backup = paths
         .write_config(contents.as_bytes())
-        .map_err(|error| format!("cannot atomically migrate configuration: {error:?}"))?;
-    println!("Migrated private configuration to v3.");
-    if let Some(backup) = backup {
-        println!("Backup: {}", backup.display());
+        .map_err(|error| format!("cannot atomically migrate configuration: {error}"))?;
+    if !is_quiet() {
+        println!("Migrated private configuration to v3.");
+        if let Some(backup) = backup {
+            println!("Backup: {}", backup.display());
+        }
     }
     Ok(0)
 }
 
 fn rollback_config(backup: &Path) -> Result<u8, String> {
     let paths = PersonaPaths::discover()
-        .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+        .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
     let _update_lock = paths
         .lock_config_update()
-        .map_err(|error| format!("cannot lock private configuration for rollback: {error:?}"))?;
+        .map_err(|error| format!("cannot lock private configuration for rollback: {error}"))?;
     let previous = paths
         .rollback(backup)
-        .map_err(|error| format!("cannot roll back configuration: {error:?}"))?;
-    println!("Restored configuration from {}.", backup.display());
-    if let Some(previous) = previous {
-        println!(
-            "The replaced configuration was backed up to {}.",
-            previous.display()
-        );
+        .map_err(|error| format!("cannot roll back configuration: {error}"))?;
+    if !is_quiet() {
+        println!("Restored configuration from {}.", backup.display());
+        if let Some(previous) = previous {
+            println!(
+                "The replaced configuration was backed up to {}.",
+                previous.display()
+            );
+        }
     }
     Ok(0)
 }
@@ -2018,10 +2672,12 @@ fn baseline_command(command: BaselineCommands) -> Result<u8, String> {
                             .find(|(tracking_ref, _)| tracking_ref == &baseline.tracking_ref)
                         {
                             baseline.oid = oid.clone();
-                            println!(
-                                "Updated baseline: {} {} -> {}",
-                                baseline.destination, baseline.tracking_ref, baseline.oid
-                            );
+                            if !is_quiet() {
+                                println!(
+                                    "Updated baseline: {} {} -> {}",
+                                    baseline.destination, baseline.tracking_ref, baseline.oid
+                                );
+                            }
                             touched += 1;
                         }
                     }
@@ -2031,7 +2687,9 @@ fn baseline_command(command: BaselineCommands) -> Result<u8, String> {
                 for (destinations, refs) in repo_tracking {
                     let destination = destinations[0].clone();
                     for (tracking_ref, oid) in refs {
-                        println!("Pinned baseline: {destination} {tracking_ref} -> {oid}");
+                        if !is_quiet() {
+                            println!("Pinned baseline: {destination} {tracking_ref} -> {oid}");
+                        }
                         push.upstream_baselines
                             .push(persona::config::UpstreamBaseline {
                                 destination: destination.clone(),
@@ -2047,7 +2705,7 @@ fn baseline_command(command: BaselineCommands) -> Result<u8, String> {
             }
             config
                 .update_profile(updated)
-                .map_err(|error| format!("cannot update upstream baselines: {error:?}"))?;
+                .map_err(|error| format!("cannot update upstream baselines: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
     }
@@ -2055,20 +2713,72 @@ fn baseline_command(command: BaselineCommands) -> Result<u8, String> {
 
 fn profile_command(command: ProfileCommands) -> Result<u8, String> {
     match command {
-        ProfileCommands::List { config } => {
+        ProfileCommands::List { config, json } => {
             let config = load_config(config.as_deref())?;
-            for profile in config.profiles() {
-                println!("{}", profile.name);
+            if json {
+                let names: Vec<&str> = config
+                    .profiles()
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&names)
+                        .map_err(|error| format!("cannot encode profile list: {error}"))?
+                );
+            } else {
+                for profile in config.profiles() {
+                    println!("{}", profile.name);
+                }
             }
             Ok(0)
         }
-        ProfileCommands::Show { name, config } => {
+        ProfileCommands::Show { name, config, json } => {
             let config = load_config(config.as_deref())?;
             let profile = config
                 .profiles()
                 .iter()
                 .find(|profile| profile.name == name)
                 .ok_or_else(|| format!("profile `{name}` does not exist"))?;
+            if json {
+                let payload = serde_json::json!({
+                    "name": profile.name,
+                    "author": {
+                        "name": profile.git.author.name,
+                        "email": profile.git.author.email,
+                    },
+                    "committer": {
+                        "name": profile.git.committer.name,
+                        "email": profile.git.committer.email,
+                    },
+                    "signing_configured": profile.git.signing.is_some(),
+                    "push_configured": profile.git.push.is_some(),
+                    "ssh_configured": profile.ssh.is_some(),
+                    "github_configured": profile.github.is_some(),
+                    "git_commands": {
+                        "mode": match profile.git.commands.effective_mode() {
+                            CommandPolicyMode::Allowlist => "allowlist",
+                            CommandPolicyMode::Denylist => "denylist",
+                        },
+                        "allow": profile.git.commands.allow,
+                        "deny": profile.git.commands.deny,
+                    },
+                    "run_commands": {
+                        "mode": match profile.run.effective_mode() {
+                            CommandPolicyMode::Allowlist => "allowlist",
+                            CommandPolicyMode::Denylist => "denylist",
+                        },
+                        "allow": profile.run.allow,
+                        "deny": profile.run.deny,
+                    },
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|error| format!("cannot encode profile details: {error}"))?
+                );
+                return Ok(0);
+            }
             println!("profile: {}", profile.name);
             println!(
                 "author: {} <{}>",
@@ -2176,7 +2886,7 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
             let profile = profile_from_args(*args, None)?;
             config
                 .add_profile(profile)
-                .map_err(|error| format!("cannot add profile: {error:?}"))?;
+                .map_err(|error| format!("cannot add profile: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
         ProfileCommands::Update(args) => {
@@ -2191,7 +2901,7 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
             let profile = profile_from_args(*args, Some(&existing))?;
             config
                 .update_profile(profile)
-                .map_err(|error| format!("cannot update profile: {error:?}"))?;
+                .map_err(|error| format!("cannot update profile: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
         ProfileCommands::Commands(args) => {
@@ -2253,42 +2963,107 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
             )?;
             config
                 .update_profile(updated)
-                .map_err(|error| format!("cannot update profile command policy: {error:?}"))?;
+                .map_err(|error| format!("cannot update profile command policy: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
         ProfileCommands::Remove { name, preview } => {
             let (paths, update_lock, mut config) = load_private_config_for_update()?;
             config
                 .remove_profile(&name)
-                .map_err(|error| format!("cannot remove profile: {error:?}"))?;
+                .map_err(|error| format!("cannot remove profile: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
     }
 }
 
 fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Result<Profile, String> {
-    let signing = match (args.signing_fingerprint, args.public_key) {
-        (Some(fingerprint), Some(public_key)) => Some(persona::config::SigningPolicy {
-            fingerprint,
-            format: match args.signing_format.as_deref().unwrap_or("openpgp") {
-                "openpgp" => persona::config::SigningFormat::OpenPgp,
-                "ssh" => persona::config::SigningFormat::Ssh,
-                _ => return Err("--signing-format must be `openpgp` or `ssh`".to_owned()),
-            },
-            public_key,
-        }),
-        (None, None) if args.signing_format.is_none() => {
-            existing.and_then(|profile| profile.git.signing.clone())
+    let author_name = match (args.author_name, existing) {
+        (Some(name), _) => name,
+        (None, Some(profile)) => profile.git.author.name.clone(),
+        (None, None) => return Err("--author-name is required when adding a profile".to_owned()),
+    };
+    let author_email = match (args.author_email, existing) {
+        (Some(email), _) => email,
+        (None, Some(profile)) => profile.git.author.email.clone(),
+        (None, None) => return Err("--author-email is required when adding a profile".to_owned()),
+    };
+    let committer_name = match (args.committer_name, existing) {
+        (Some(name), _) => name,
+        (None, Some(profile)) => profile.git.committer.name.clone(),
+        (None, None) => author_name.clone(),
+    };
+    let committer_email = match (args.committer_email, existing) {
+        (Some(email), _) => email,
+        (None, Some(profile)) => profile.git.committer.email.clone(),
+        (None, None) => author_email.clone(),
+    };
+
+    let signing = if args.clear_signing {
+        if args.signing_fingerprint.is_some()
+            || args.public_key.is_some()
+            || args.signing_format.is_some()
+        {
+            return Err("--clear-signing cannot be combined with signing options".to_owned());
         }
-        (None, None) => {
-            return Err(
-                "--signing-format requires --signing-fingerprint and --public-key".to_owned(),
-            );
-        }
-        _ => {
-            return Err(
-                "--signing-fingerprint and --public-key must be supplied together".to_owned(),
-            );
+        None
+    } else {
+        match (
+            args.signing_fingerprint,
+            args.public_key,
+            existing.and_then(|profile| profile.git.signing.as_ref()),
+        ) {
+            (Some(fingerprint), Some(public_key), prev) => Some(persona::config::SigningPolicy {
+                fingerprint,
+                format: match args.signing_format.as_deref() {
+                    Some("openpgp") => persona::config::SigningFormat::OpenPgp,
+                    Some("ssh") => persona::config::SigningFormat::Ssh,
+                    Some(_) => return Err("--signing-format must be `openpgp` or `ssh`".to_owned()),
+                    None => prev.map_or(persona::config::SigningFormat::OpenPgp, |s| s.format),
+                },
+                public_key,
+            }),
+            (Some(fingerprint), None, Some(prev)) => Some(persona::config::SigningPolicy {
+                fingerprint,
+                format: match args.signing_format.as_deref() {
+                    Some("openpgp") => persona::config::SigningFormat::OpenPgp,
+                    Some("ssh") => persona::config::SigningFormat::Ssh,
+                    Some(_) => return Err("--signing-format must be `openpgp` or `ssh`".to_owned()),
+                    None => prev.format,
+                },
+                public_key: prev.public_key.clone(),
+            }),
+            (None, Some(public_key), Some(prev)) => Some(persona::config::SigningPolicy {
+                fingerprint: prev.fingerprint.clone(),
+                format: match args.signing_format.as_deref() {
+                    Some("openpgp") => persona::config::SigningFormat::OpenPgp,
+                    Some("ssh") => persona::config::SigningFormat::Ssh,
+                    Some(_) => return Err("--signing-format must be `openpgp` or `ssh`".to_owned()),
+                    None => prev.format,
+                },
+                public_key,
+            }),
+            (None, None, Some(prev)) if args.signing_format.is_some() => {
+                Some(persona::config::SigningPolicy {
+                    fingerprint: prev.fingerprint.clone(),
+                    format: match args.signing_format.as_deref() {
+                        Some("openpgp") => persona::config::SigningFormat::OpenPgp,
+                        Some("ssh") => persona::config::SigningFormat::Ssh,
+                        _ => return Err("--signing-format must be `openpgp` or `ssh`".to_owned()),
+                    },
+                    public_key: prev.public_key.clone(),
+                })
+            }
+            (None, None, prev) if args.signing_format.is_none() => prev.cloned(),
+            (None, None, None) => {
+                return Err(
+                    "--signing-format requires --signing-fingerprint and --public-key".to_owned(),
+                );
+            }
+            _ => {
+                return Err(
+                    "--signing-fingerprint and --public-key must be supplied together".to_owned(),
+                );
+            }
         }
     };
     let push = match (args.push_remote, args.push_destinations.is_empty()) {
@@ -2411,26 +3186,37 @@ fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Resul
     } else if !ssh_options_supplied {
         existing.and_then(|profile| profile.ssh.clone())
     } else {
+        let prev_ssh = existing.and_then(|profile| profile.ssh.as_ref());
         Some(persona::config::SshPolicy {
             host: args
                 .ssh_host
+                .or_else(|| prev_ssh.map(|s| s.host.clone()))
                 .ok_or_else(|| "--ssh-host required for SSH policy".to_owned())?,
             user: args
                 .ssh_user
+                .or_else(|| prev_ssh.map(|s| s.user.clone()))
                 .ok_or_else(|| "--ssh-user required for SSH policy".to_owned())?,
             port: args
                 .ssh_port
+                .or_else(|| prev_ssh.map(|s| s.port))
                 .ok_or_else(|| "--ssh-port required for SSH policy".to_owned())?,
             fingerprint: args
                 .ssh_fingerprint
+                .or_else(|| prev_ssh.map(|s| s.fingerprint.clone()))
                 .ok_or_else(|| "--ssh-fingerprint required for SSH policy".to_owned())?,
             public_key: args
                 .ssh_public_key
+                .or_else(|| prev_ssh.map(|s| s.public_key.clone()))
                 .ok_or_else(|| "--ssh-public-key required for SSH policy".to_owned())?,
-            identity_file: args.ssh_identity_file,
-            agent_socket: args.ssh_agent_socket,
+            identity_file: args
+                .ssh_identity_file
+                .or_else(|| prev_ssh.and_then(|s| s.identity_file.clone())),
+            agent_socket: args
+                .ssh_agent_socket
+                .or_else(|| prev_ssh.and_then(|s| s.agent_socket.clone())),
             known_hosts_file: args
                 .ssh_known_hosts_file
+                .or_else(|| prev_ssh.map(|s| s.known_hosts_file.clone()))
                 .ok_or_else(|| "--ssh-known-hosts-file required for SSH policy".to_owned())?,
         })
     };
@@ -2613,12 +3399,12 @@ fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Resul
         run,
         git: GitPolicy {
             author: Identity {
-                name: args.author_name,
-                email: args.author_email,
+                name: author_name,
+                email: author_email,
             },
             committer: Identity {
-                name: args.committer_name,
-                email: args.committer_email,
+                name: committer_name,
+                email: committer_email,
             },
             signing,
             push,
@@ -2646,19 +3432,63 @@ fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Resul
 
 fn scope_command(command: ScopeCommands) -> Result<u8, String> {
     match command {
-        ScopeCommands::List { config } => {
+        ScopeCommands::List { config, json } => {
             let config = load_config(config.as_deref())?;
-            for scope in config.policies() {
+            if json {
+                let items: Vec<serde_json::Value> = config
+                    .policies()
+                    .iter()
+                    .map(|scope| {
+                        serde_json::json!({
+                            "name": scope.name,
+                            "path": scope.path,
+                            "profile": scope.profile,
+                        })
+                    })
+                    .collect();
                 println!(
-                    "{}\t{}\t{}",
-                    scope.name,
-                    scope.path.display(),
-                    scope.profile
+                    "{}",
+                    serde_json::to_string_pretty(&items)
+                        .map_err(|error| format!("cannot encode scope list: {error}"))?
                 );
+            } else {
+                for scope in config.policies() {
+                    println!(
+                        "{}\t{}\t{}",
+                        scope.name,
+                        scope.path.display(),
+                        scope.profile
+                    );
+                }
             }
             Ok(0)
         }
-        ScopeCommands::Show { name, config } | ScopeCommands::Verify { name, config } => {
+        ScopeCommands::Show { name, config, json } => {
+            let config = load_config(config.as_deref())?;
+            let scope = config
+                .policies()
+                .iter()
+                .find(|scope| scope.name == name)
+                .ok_or_else(|| format!("scope `{name}` does not exist"))?;
+            if json {
+                let payload = serde_json::json!({
+                    "name": scope.name,
+                    "path": scope.path,
+                    "profile": scope.profile,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|error| format!("cannot encode scope details: {error}"))?
+                );
+            } else {
+                println!("scope: {}", scope.name);
+                println!("path: {}", scope.path.display());
+                println!("profile: {}", scope.profile);
+            }
+            Ok(0)
+        }
+        ScopeCommands::Verify { name, config } => {
             let config = load_config(config.as_deref())?;
             let scope = config
                 .policies()
@@ -2688,7 +3518,7 @@ fn scope_command(command: ScopeCommands) -> Result<u8, String> {
             let root = physical_scope_root(&absolute_path(&path, &current))?;
             config
                 .add_scope(name, root, &profile)
-                .map_err(|error| format!("cannot add scope: {error:?}"))?;
+                .map_err(|error| format!("cannot add scope: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
         ScopeCommands::Update {
@@ -2703,14 +3533,14 @@ fn scope_command(command: ScopeCommands) -> Result<u8, String> {
             let root = physical_scope_root(&absolute_path(&path, &current))?;
             config
                 .update_scope(&name, root, &profile)
-                .map_err(|error| format!("cannot update scope: {error:?}"))?;
+                .map_err(|error| format!("cannot update scope: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
         ScopeCommands::Remove { name, preview } => {
             let (paths, update_lock, mut config) = load_private_config_for_update()?;
             config
                 .remove_scope(&name)
-                .map_err(|error| format!("cannot remove scope: {error:?}"))?;
+                .map_err(|error| format!("cannot remove scope: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
     }
@@ -2725,12 +3555,12 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             confirm_online,
         } => {
             let paths = PersonaPaths::discover()
-                .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+                .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
             paths
                 .validate_private_config()
-                .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+                .map_err(|error| format!("unsafe private configuration: {error}"))?;
             let config = Config::load(&paths.config_file)
-                .map_err(|error| format!("cannot load private configuration: {error:?}"))?;
+                .map_err(|error| format!("cannot load private configuration: {error}"))?;
             if !config.profiles().iter().any(|item| item.name == profile) {
                 return Err(format!("profile `{profile}` does not exist"));
             }
@@ -2739,11 +3569,11 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             })?;
             let selector = persona::credential::GithubSelector::discover(gh, host.clone(), paths)
                 .map_err(|error| {
-                format!("cannot safely select native GitHub credentials: {error:?}")
+                format!("cannot safely select native GitHub credentials: {error}")
             })?;
             let binding = selector
                 .enroll(confirm_online, &user)
-                .map_err(|error| format!("GitHub enrollment failed: {error:?}"))?;
+                .map_err(|error| format!("GitHub enrollment failed: {error}"))?;
             let (paths, update_lock, mut config) = load_private_config_for_update()?;
             let mut updated = config
                 .profiles()
@@ -2754,18 +3584,20 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             updated.github = Some(binding.clone());
             config
                 .update_profile(updated)
-                .map_err(|error| format!("cannot bind GitHub account: {error:?}"))?;
+                .map_err(|error| format!("cannot bind GitHub account: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, false)?;
-            println!(
-                "Bound stable GitHub account ID {} on {} to profile `{}`.",
-                binding.account_id, binding.host, profile
-            );
-            println!(
-                "The native token was not stored by Persona; only a keyed non-reversible fingerprint was saved."
-            );
+            if !is_quiet() {
+                println!(
+                    "Bound stable GitHub account ID {} on {} to profile `{}`.",
+                    binding.account_id, binding.host, profile
+                );
+                println!(
+                    "The native token was not stored by Persona; only a keyed non-reversible fingerprint was saved."
+                );
+            }
             Ok(0)
         }
-        AuthCommands::Verify { profile } => {
+        AuthCommands::Verify { profile, json } => {
             let config = load_private_config()?;
             let profile_config = config
                 .profiles()
@@ -2780,28 +3612,66 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
                 "cannot find gh; set PERSONA_GH to an absolute gh executable".to_owned()
             })?;
             let paths = PersonaPaths::discover()
-                .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+                .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
             let selector =
                 persona::credential::GithubSelector::discover(gh, binding.host.clone(), paths)
                     .map_err(|error| {
-                        format!("cannot safely select native GitHub credentials: {error:?}")
+                        format!("cannot safely select native GitHub credentials: {error}")
                     })?;
             match selector.matches_selected_account(binding) {
                 Ok(true) => {
-                    println!(
-                        "Selected native credential matches bound account ID {} on {}.",
-                        binding.account_id, binding.host
-                    );
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "PASS",
+                                "profile": profile,
+                                "host": binding.host,
+                                "account_id": binding.account_id,
+                            }))
+                            .map_err(|error| format!("cannot encode auth verification: {error}"))?
+                        );
+                    } else {
+                        println!(
+                            "Selected native credential matches bound account ID {} on {}.",
+                            binding.account_id, binding.host
+                        );
+                    }
                     Ok(0)
                 }
                 Ok(false) => {
-                    println!(
-                        "BLOCK: selected native credential does not match profile `{profile}`."
-                    );
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "BLOCK",
+                                "profile": profile,
+                                "host": binding.host,
+                                "account_id": binding.account_id,
+                            }))
+                            .map_err(|error| format!("cannot encode auth verification: {error}"))?
+                        );
+                    } else {
+                        println!(
+                            "BLOCK: selected native credential does not match profile `{profile}`."
+                        );
+                    }
                     Ok(1)
                 }
                 Err(error) => {
-                    println!("UNKNOWN: cannot verify selected native credential ({error:?}).");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "UNKNOWN",
+                                "profile": profile,
+                                "error": error.to_string(),
+                            }))
+                            .map_err(|error| format!("cannot encode auth verification: {error}"))?
+                        );
+                    } else {
+                        println!("UNKNOWN: cannot verify selected native credential ({error}).");
+                    }
                     Ok(1)
                 }
             }
@@ -2820,7 +3690,7 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
             profile_config.github = None;
             config
                 .update_profile(profile_config)
-                .map_err(|error| format!("cannot remove GitHub binding: {error:?}"))?;
+                .map_err(|error| format!("cannot remove GitHub binding: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
     }
@@ -2828,25 +3698,25 @@ fn auth_command(command: AuthCommands) -> Result<u8, String> {
 
 fn load_private_config() -> Result<Config, String> {
     let paths = PersonaPaths::discover()
-        .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+        .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
     paths
         .validate_private_config()
-        .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+        .map_err(|error| format!("unsafe private configuration: {error}"))?;
     Config::load(&paths.config_file)
-        .map_err(|error| format!("cannot load private configuration: {error:?}"))
+        .map_err(|error| format!("cannot load private configuration: {error}"))
 }
 
 fn load_private_config_for_update() -> Result<(PersonaPaths, ConfigUpdateLock, Config), String> {
     let paths = PersonaPaths::discover()
-        .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+        .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
     let update_lock = paths
         .lock_config_update()
-        .map_err(|error| format!("cannot lock private configuration for update: {error:?}"))?;
+        .map_err(|error| format!("cannot lock private configuration for update: {error}"))?;
     paths
         .validate_private_config()
-        .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+        .map_err(|error| format!("unsafe private configuration: {error}"))?;
     let config = Config::load(&paths.config_file)
-        .map_err(|error| format!("cannot load private configuration: {error:?}"))?;
+        .map_err(|error| format!("cannot load private configuration: {error}"))?;
     Ok((paths, update_lock, config))
 }
 
@@ -2858,23 +3728,26 @@ fn persist_private_config(
 ) -> Result<u8, String> {
     paths
         .validate_private_config()
-        .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+        .map_err(|error| format!("unsafe private configuration: {error}"))?;
     let contents = config
         .to_v3_toml()
-        .map_err(|error| format!("cannot serialize configuration: {error:?}"))?;
-    Config::parse(&contents)
-        .map_err(|error| format!("refusing invalid configuration: {error:?}"))?;
+        .map_err(|error| format!("cannot serialize configuration: {error}"))?;
+    Config::parse(&contents).map_err(|error| format!("refusing invalid configuration: {error}"))?;
     if preview {
-        println!("Preview only; no configuration was written.");
+        if !is_quiet() {
+            println!("Preview only; no configuration was written.");
+        }
         print!("{contents}");
         return Ok(0);
     }
     let backup = paths
         .write_config(contents.as_bytes())
-        .map_err(|error| format!("cannot atomically write configuration: {error:?}"))?;
-    println!("Updated private Persona configuration.");
-    if let Some(backup) = backup {
-        println!("Backup: {}", backup.display());
+        .map_err(|error| format!("cannot atomically write configuration: {error}"))?;
+    if !is_quiet() {
+        println!("Updated private Persona configuration.");
+        if let Some(backup) = backup {
+            println!("Backup: {}", backup.display());
+        }
     }
     Ok(0)
 }

@@ -27,6 +27,37 @@ pub enum StorageError {
     Io { path: PathBuf, source: io::Error },
 }
 
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingHome => write!(f, "HOME environment variable is not set"),
+            Self::RelativeXdgPath(path) => write!(
+                f,
+                "environment path `{}` must be an absolute path",
+                path.display()
+            ),
+            Self::UnsafeDirectory(path) => write!(
+                f,
+                "directory `{}` has unsafe ownership or permissions (expected mode 0700 owned by current user)",
+                path.display()
+            ),
+            Self::UnsafeFile(path) => write!(
+                f,
+                "file `{}` has unsafe ownership, permissions, or link count (expected mode 0600 owned by current user)",
+                path.display()
+            ),
+            Self::OutsideBackupDirectory(path) => write!(
+                f,
+                "backup path `{}` is outside Persona's private backup directory",
+                path.display()
+            ),
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
 impl PersonaPaths {
     pub fn discover() -> Result<Self, StorageError> {
         let home = env::var_os("HOME").map(PathBuf::from);

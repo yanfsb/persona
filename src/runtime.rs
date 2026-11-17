@@ -130,11 +130,18 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
+    if let Some(path) = std::env::var_os("PERSONA_CONFIG_PATH") {
+        let path = PathBuf::from(path);
+        if path.as_os_str().is_empty() {
+            return Err("PERSONA_CONFIG_PATH cannot be empty".to_owned());
+        }
+        return Ok(path);
+    }
     let paths = PersonaPaths::discover()
-        .map_err(|error| format!("cannot resolve Persona paths: {error:?}"))?;
+        .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
     paths
         .validate_private_config()
-        .map_err(|error| format!("unsafe private configuration: {error:?}"))?;
+        .map_err(|error| format!("unsafe private configuration: {error}"))?;
     if !paths.config_file.is_file() {
         return Err(format!(
             "no Persona configuration at {}; run `persona setup` or pass --config",
@@ -146,7 +153,7 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
 pub fn load_config(explicit: Option<&Path>) -> Result<Config, String> {
     let path = resolve_config_path(explicit)?;
-    Config::load(&path).map_err(|error| format!("{error:?}"))
+    Config::load(&path).map_err(|error| error.to_string())
 }
 
 pub fn physical_scope_root(path: &Path) -> Result<PathBuf, String> {
@@ -194,6 +201,27 @@ pub fn status_exit_code(status: std::process::ExitStatus) -> u8 {
             EXIT_ERROR
         }
     }
+}
+
+pub fn wait_child_ignoring_sigint(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let previous_sigint = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    #[cfg(unix)]
+    let previous_sigquit = unsafe { libc::signal(libc::SIGQUIT, libc::SIG_IGN) };
+    let result = child.wait();
+    #[cfg(unix)]
+    unsafe {
+        if previous_sigint != libc::SIG_ERR {
+            libc::signal(libc::SIGINT, previous_sigint);
+        }
+        if previous_sigquit != libc::SIG_ERR {
+            libc::signal(libc::SIGQUIT, previous_sigquit);
+        }
+    }
+    result
 }
 
 pub fn git_executable() -> PathBuf {

@@ -398,11 +398,22 @@ impl GitInvocation {
                 continue;
             }
             if argument == "--no-pager"
+                || argument == "-P"
                 || argument == "--literal-pathspecs"
                 || argument == "--paginate"
                 || argument == "-p"
             {
                 global_arguments.push(argument);
+                continue;
+            }
+            if argument == "--version" || argument == "-v" {
+                command_seen = true;
+                native_arguments.push(OsString::from("version"));
+                continue;
+            }
+            if argument == "--help" || argument == "-h" {
+                command_seen = true;
+                native_arguments.push(OsString::from("help"));
                 continue;
             }
             if argument.to_string_lossy().starts_with('-') {
