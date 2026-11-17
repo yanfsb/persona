@@ -126,7 +126,8 @@ fn git_command_policy_supports_allow_deny_precedence_and_round_trips() {
 #[test]
 fn git_command_policy_rejects_unknown_and_duplicate_selectors() {
     for commands in [
-        "[profiles.git.commands]\nallow = [\"arbitrary-shell\"]",
+        "[profiles.git.commands]\nallow = [\"status;id\"]",
+        "[profiles.git.commands]\ndeny = [\"*status\"]",
         "[profiles.git.commands]\ndeny = [\"status\", \"status\"]",
     ] {
         let input = VALID_V3.replace(
@@ -140,18 +141,21 @@ fn git_command_policy_rejects_unknown_and_duplicate_selectors() {
 #[test]
 fn command_policy_empty_allowlist_denies_all_and_broad_deny_wins() {
     let empty_allow = persona::config::GitCommandPolicy {
+        mode: None,
         allow: Some(Vec::new()),
         deny: Vec::new(),
     };
     assert!(!empty_allow.permits("status"));
 
     let deny_fetch = persona::config::GitCommandPolicy {
+        mode: None,
         allow: Some(vec!["fetch.all".to_owned()]),
         deny: vec!["fetch".to_owned()],
     };
     assert!(!deny_fetch.permits("fetch.all"));
 
     let allow_fetch = persona::config::GitCommandPolicy {
+        mode: None,
         allow: Some(vec!["fetch".to_owned()]),
         deny: Vec::new(),
     };
@@ -391,6 +395,7 @@ fn profile_and_scope_edits_are_validated_and_v1_edits_become_v3() {
         github: None,
         ssh: None,
         github_merge: None,
+        run: Default::default(),
     };
     config.add_profile(profile.clone()).expect("add profile");
     config
@@ -543,4 +548,142 @@ fn rejects_empty_author_or_committer_fields() {
             }
         );
     }
+}
+
+#[test]
+fn v3_wildcard_destinations_deny_rules_and_command_policies_round_trip() {
+    let input = r#"
+version = 3
+
+[[profiles]]
+name = "yanfsb"
+
+[profiles.run]
+mode = "denylist"
+deny = ["curl", "cargo --frozen"]
+
+[profiles.git]
+author = { name = "yanfsb", email = "yanfsb@users.noreply.github.com" }
+committer = { name = "yanfsb", email = "yanfsb@users.noreply.github.com" }
+deny_destinations = ["https://github.com/yanfsb/secret.git", "git@github.com:yanfsb/secret.git"]
+strict_repo_hooks = false
+strict_git_filters = false
+strict_merge_drivers = false
+inherit_git_config = true
+cross_profile_identity_check = true
+
+[profiles.git.commands]
+mode = "denylist"
+deny = ["push --force", "tag.*"]
+
+[profiles.git.push]
+remote = "*"
+destinations = ["https://github.com/yanfsb/*", "git@github.com:yanfsb/*"]
+preserve_authors = false
+allow_initial_push = true
+allow_fast_forward = true
+allow_annotated_tags = false
+allow_lightweight_tags = false
+allow_branch_deletion = true
+allow_tag_deletion = false
+allow_force_with_lease = true
+allow_force_push = false
+require_tag_lease_on_create = false
+upstream_provenance = "remote_tracking"
+
+[profiles.github]
+host = "github.com"
+account_id = "102800044"
+account_selector = "yanfsb"
+token_fingerprint = "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+repositories = ["yanfsb/*"]
+deny_repositories = ["yanfsb/secret"]
+
+[profiles.github.commands]
+mode = "allowlist"
+allow = ["pr", "issue.view"]
+deny = ["pr.merge"]
+
+[[scopes]]
+name = "yanfsb-projects"
+path = "/yanfsb"
+profile = "yanfsb"
+"#;
+
+    let parsed = Config::parse(input).expect("valid wildcard v3 config");
+    let profile = &parsed.profiles()[0];
+    let github = profile.github.as_ref().expect("github binding");
+    assert!(github.permits_repository("yanfsb/persona"));
+    assert!(!github.permits_repository("yanfsb/secret"));
+    assert!(!github.permits_repository("opsec/repo"));
+
+    assert!(
+        profile
+            .git
+            .permits_push_destination("upstream", "git@github.com:yanfsb/persona.git")
+    );
+    assert!(
+        !profile
+            .git
+            .permits_push_destination("origin", "https://github.com/yanfsb/secret.git")
+    );
+    assert!(
+        !profile
+            .git
+            .permits_push_destination("origin", "https://github.com/opsec/persona.git")
+    );
+
+    assert!(profile.git.commands.evaluate(&["log"], &[]).is_ok());
+    assert!(
+        profile
+            .git
+            .commands
+            .evaluate(&["push"], &["--force"])
+            .is_err()
+    );
+    assert!(profile.git.commands.evaluate(&["tag.create"], &[]).is_err());
+
+    assert!(github.commands.evaluate(&["pr.diff"], &[]).is_ok());
+    assert!(github.commands.evaluate(&["pr.merge"], &[]).is_err());
+    assert!(github.commands.evaluate(&["repo.delete"], &[]).is_err());
+
+    assert!(profile.run.evaluate(&["cargo"], &["--locked"]).is_ok());
+    assert!(profile.run.evaluate(&["cargo"], &["--frozen"]).is_err());
+    assert!(profile.run.evaluate(&["curl"], &[]).is_err());
+
+    let serialized = parsed.to_v3_toml().expect("serialize v3");
+    let reparsed = Config::parse(&serialized).expect("reparse v3");
+    let reparsed_profile = &reparsed.profiles()[0];
+    assert_eq!(reparsed_profile.git.commands, profile.git.commands);
+    assert_eq!(
+        reparsed_profile.git.deny_destinations,
+        profile.git.deny_destinations
+    );
+    assert_eq!(reparsed_profile.run, profile.run);
+    assert_eq!(
+        reparsed_profile.github.as_ref().unwrap().commands,
+        github.commands
+    );
+    assert_eq!(
+        reparsed_profile.github.as_ref().unwrap().deny_repositories,
+        github.deny_repositories
+    );
+    assert_eq!(
+        reparsed_profile
+            .git
+            .push
+            .as_ref()
+            .unwrap()
+            .upstream_provenance,
+        profile.git.push.as_ref().unwrap().upstream_provenance
+    );
+
+    let bad_run = input.replace(
+        "deny = [\"curl\", \"cargo --frozen\"]",
+        "deny = [\"curl;sh\"]",
+    );
+    assert!(matches!(
+        Config::parse(&bad_run),
+        Err(ConfigError::InvalidRunCommandPolicy { .. })
+    ));
 }

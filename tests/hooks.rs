@@ -530,3 +530,134 @@ fn installed_pre_push_composes_restores_and_honors_documented_bypasses() {
         "direct native Git bypasses the removed Persona adapter and hook"
     );
 }
+
+#[test]
+fn hooks_refresh_and_installer_refresh_update_registered_worktree_hooks() {
+    let temporary = tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let config_home = temporary.path().join("config");
+    let state_home = temporary.path().join("state");
+    let bin = temporary.path().join("bin");
+    let repo = temporary.path().join("repo");
+    let remote = temporary.path().join("remote.git");
+    for directory in [&home, &bin, &repo] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let git = git();
+    must_succeed(run_git(
+        &git,
+        temporary.path(),
+        &home,
+        &["init", "--bare", remote.to_str().unwrap()],
+    ));
+    must_succeed(run_git(&git, &repo, &home, &["init", "-q", "-b", "main"]));
+    must_succeed(run_git(
+        &git,
+        &repo,
+        &home,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    ));
+    commit(
+        &git,
+        &repo,
+        &home,
+        "Persona Author <author@example.invalid>",
+        "initial",
+    );
+
+    let config_dir = config_home.join("persona");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"version = 3
+
+[[profiles]]
+name = "work"
+[profiles.git]
+author = {{ name = "Persona Author", email = "author@example.invalid" }}
+committer = {{ name = "Persona Committer", email = "committer@example.invalid" }}
+[profiles.git.push]
+remote = "origin"
+destinations = [{dest:?}]
+
+[[scopes]]
+name = "repo"
+path = {scope:?}
+profile = "work"
+"#,
+            dest = remote.to_string_lossy(),
+            scope = repo.canonicalize().unwrap().to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let persona = PathBuf::from(env!("CARGO_BIN_EXE_persona"));
+    let second_persona = temporary.path().join("persona-next");
+    fs::copy(&persona, &second_persona).unwrap();
+    fs::set_permissions(&second_persona, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_cli = |bin_path: &Path, args: &[&str]| -> Output {
+        Command::new(bin_path)
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("PERSONA_GIT", &git)
+            .env("PATH", fixture_path())
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    must_succeed(run_cli(
+        &persona,
+        &["install", "apply", "--bin-dir", bin.to_str().unwrap()],
+    ));
+    must_succeed(run_cli(
+        &persona,
+        &["hooks", "install", "--cwd", repo.to_str().unwrap()],
+    ));
+
+    let hook_link = repo.join(".git/hooks/pre-push");
+    assert_eq!(
+        fs::read_link(&hook_link).unwrap(),
+        persona.canonicalize().unwrap()
+    );
+
+    let preview = must_succeed(run_cli(
+        &second_persona,
+        &[
+            "hooks",
+            "refresh",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--preview",
+        ],
+    ));
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("would refresh"));
+    assert_eq!(
+        fs::read_link(&hook_link).unwrap(),
+        persona.canonicalize().unwrap()
+    );
+
+    must_succeed(run_cli(
+        &second_persona,
+        &["hooks", "refresh", "--cwd", repo.to_str().unwrap()],
+    ));
+    assert_eq!(
+        fs::read_link(&hook_link).unwrap(),
+        second_persona.canonicalize().unwrap()
+    );
+
+    // Re-running `install refresh --apply` from the original binary automatically refreshes registered worktree hooks.
+    must_succeed(run_cli(&persona, &["install", "refresh", "--apply"]));
+    assert_eq!(
+        fs::read_link(&hook_link).unwrap(),
+        persona.canonicalize().unwrap()
+    );
+}

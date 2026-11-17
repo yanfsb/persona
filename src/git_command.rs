@@ -26,7 +26,7 @@ pub enum GitSubcommand {
     Push,
     Remote,
     Submodule,
-    Unsupported(String),
+    Other(String),
 }
 
 impl GitSubcommand {
@@ -46,7 +46,7 @@ impl GitSubcommand {
             "push" => Self::Push,
             "remote" => Self::Remote,
             "submodule" => Self::Submodule,
-            other => Self::Unsupported(other.to_owned()),
+            other => Self::Other(other.to_owned()),
         }
     }
 
@@ -66,7 +66,7 @@ impl GitSubcommand {
             Self::Push => "push",
             Self::Remote => "remote",
             Self::Submodule => "submodule",
-            Self::Unsupported(value) => value,
+            Self::Other(value) => value,
         }
     }
 }
@@ -82,15 +82,28 @@ pub enum ParseError {
 pub struct PushRefspec {
     pub source: String,
     pub destination: String,
+    pub raw_source: String,
+    pub raw_destination: String,
+    pub forced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushInvocation {
-    pub remote: String,
+    pub remote: Option<String>,
     pub refspecs: Vec<PushRefspec>,
     pub leases: Vec<ExactPushLease>,
+    pub bare_force_with_lease: bool,
+    pub lease_refs: Vec<String>,
     pub atomic: bool,
     pub set_upstream: bool,
+    pub force: bool,
+    pub dry_run: bool,
+    pub tags: bool,
+    pub follow_tags: bool,
+    pub delete: bool,
+    pub verbose: bool,
+    pub quiet: bool,
+    pub no_verify: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,15 +113,24 @@ pub struct ExactPushLease {
 }
 
 impl PushInvocation {
-    /// Parse a bounded explicit push grammar without authorizing or executing it.
-    /// Unsupported options/refspec forms fail here so callers cannot reinterpret them.
+    /// Parse a bounded explicit or shorthand push request without authorizing or executing it.
     pub fn parse(arguments: &[OsString]) -> Result<Self, &'static str> {
         const MAX_REFSPECS: usize = 16;
         let mut remote: Option<String> = None;
         let mut refspecs = Vec::new();
         let mut leases = Vec::new();
+        let mut bare_force_with_lease = false;
+        let mut lease_refs = Vec::new();
         let mut atomic = false;
         let mut set_upstream = false;
+        let mut force = false;
+        let mut dry_run = false;
+        let mut tags = false;
+        let mut follow_tags = false;
+        let mut delete = false;
+        let mut verbose = false;
+        let mut quiet = false;
+        let mut no_verify = false;
         let mut index = 0;
         while index < arguments.len() {
             let word = arguments[index]
@@ -117,30 +139,41 @@ impl PushInvocation {
             match word {
                 "--atomic" => atomic = true,
                 "-u" | "--set-upstream" => set_upstream = true,
+                "-f" | "--force" => force = true,
+                "-n" | "--dry-run" => dry_run = true,
+                "--tags" => tags = true,
+                "--follow-tags" => follow_tags = true,
+                "-d" | "--delete" => delete = true,
+                "-v" | "--verbose" => verbose = true,
+                "-q" | "--quiet" => quiet = true,
+                "--no-verify" => no_verify = true,
+                "--force-with-lease" => bare_force_with_lease = true,
                 _ if word.starts_with("--force-with-lease=") => {
                     let value = word.trim_start_matches("--force-with-lease=");
-                    let (remote_ref, expected_oid) = value
-                        .split_once(':')
-                        .ok_or("force-with-lease must bind ref and expected object ID")?;
-                    let remote_ref = normalize_ref(remote_ref, false)?;
-                    if !(matches!(expected_oid.len(), 40 | 64)
-                        && expected_oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                    {
-                        return Err("force-with-lease object ID is invalid");
+                    if let Some((remote_ref, expected_oid)) = value.split_once(':') {
+                        let remote_ref = normalize_ref(remote_ref, false)?;
+                        if expected_oid.is_empty() {
+                            lease_refs.push(remote_ref);
+                        } else {
+                            if !(matches!(expected_oid.len(), 40 | 64)
+                                && expected_oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                            {
+                                return Err("force-with-lease object ID is invalid");
+                            }
+                            leases.push(ExactPushLease {
+                                remote_ref,
+                                expected_oid: expected_oid.to_ascii_lowercase(),
+                            });
+                        }
+                    } else if !value.is_empty() {
+                        lease_refs.push(normalize_ref(value, false)?);
+                    } else {
+                        return Err("force-with-lease value is empty");
                     }
-                    leases.push(ExactPushLease {
-                        remote_ref,
-                        expected_oid: expected_oid.to_ascii_lowercase(),
-                    });
                 }
                 _ if word.starts_with('-') => return Err("unsupported push option"),
                 _ if remote.is_none() => {
-                    if word.is_empty()
-                        || word.len() > 128
-                        || !word.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-                        })
-                    {
+                    if !valid_remote_name(word) {
                         return Err("invalid push remote");
                     }
                     remote = Some(word.to_owned());
@@ -149,63 +182,123 @@ impl PushInvocation {
                     if refspecs.len() == MAX_REFSPECS {
                         return Err("push refspec count exceeds the limit");
                     }
-                    let (source, destination) =
-                        if let Some((source, destination)) = word.split_once(':') {
-                            (source, destination)
-                        } else {
-                            // Git accepts `git push <remote> <branch>` as the
-                            // same-name refspec. Preserve that bounded spelling by
-                            // canonicalizing it before authorization.
-                            (word, word)
-                        };
-                    if source.starts_with('+') || destination.is_empty() {
-                        return Err("unsupported push refspec");
-                    }
-                    let source = if source.is_empty() {
-                        "(delete)".to_owned()
-                    } else if source == "HEAD" {
-                        "HEAD".to_owned()
+                    if delete {
+                        if word.contains(':') || word.starts_with('+') {
+                            return Err("unsupported push deletion refspec");
+                        }
+                        let destination = normalize_ref(word, false)?;
+                        refspecs.push(PushRefspec {
+                            source: "(delete)".to_owned(),
+                            destination,
+                            raw_source: "(delete)".to_owned(),
+                            raw_destination: word.to_owned(),
+                            forced: false,
+                        });
                     } else {
-                        normalize_ref(source, true)?
-                    };
-                    let destination = normalize_ref(destination, false)?;
-                    refspecs.push(PushRefspec {
-                        source,
-                        destination,
-                    });
+                        let (forced, raw_spec) = if let Some(rest) = word.strip_prefix('+') {
+                            force = true;
+                            (true, rest)
+                        } else {
+                            (false, word)
+                        };
+                        let (raw_source, raw_destination) =
+                            if let Some((source, destination)) = raw_spec.split_once(':') {
+                                (source, destination)
+                            } else {
+                                (raw_spec, raw_spec)
+                            };
+                        if raw_destination.is_empty() {
+                            return Err("unsupported push refspec");
+                        }
+                        let source = if raw_source.is_empty() {
+                            "(delete)".to_owned()
+                        } else if raw_source == "HEAD" {
+                            "HEAD".to_owned()
+                        } else {
+                            normalize_ref(raw_source, true)?
+                        };
+                        let destination = if raw_destination == "HEAD" {
+                            "HEAD".to_owned()
+                        } else {
+                            normalize_ref(raw_destination, false)?
+                        };
+                        refspecs.push(PushRefspec {
+                            source,
+                            destination,
+                            raw_source: raw_source.to_owned(),
+                            raw_destination: raw_destination.to_owned(),
+                            forced,
+                        });
+                    }
                 }
             }
             index += 1;
         }
-        if refspecs.is_empty() {
-            return Err("push requires at least one explicit refspec");
+        if remote.is_none() && !refspecs.is_empty() {
+            return Err("push requires an explicit remote");
         }
-        let mut destinations = std::collections::HashSet::new();
-        for refspec in &refspecs {
-            if !destinations.insert(refspec.destination.as_str()) {
-                return Err("push refspec destinations must be unique");
+        if !refspecs.is_empty() {
+            let mut destinations = std::collections::HashSet::new();
+            for refspec in &refspecs {
+                if refspec.destination != "HEAD"
+                    && !destinations.insert(refspec.destination.as_str())
+                {
+                    return Err("push refspec destinations must be unique");
+                }
             }
-        }
-        let mut leased_refs = std::collections::HashSet::new();
-        for lease in &leases {
-            if !leased_refs.insert(lease.remote_ref.as_str()) {
-                return Err("force-with-lease may name each ref only once");
+            let mut leased_refs = std::collections::HashSet::new();
+            for lease in &leases {
+                if !leased_refs.insert(lease.remote_ref.as_str()) {
+                    return Err("force-with-lease may name each ref only once");
+                }
+                if !destinations.contains(lease.remote_ref.as_str())
+                    && !lease
+                        .remote_ref
+                        .strip_prefix("refs/heads/")
+                        .is_some_and(|name| {
+                            refspecs.iter().any(|spec| spec.raw_destination == name)
+                        })
+                {
+                    return Err("force-with-lease must match a requested destination ref");
+                }
             }
-            if !destinations.contains(lease.remote_ref.as_str()) {
-                return Err("force-with-lease must match a requested destination ref");
+        } else {
+            let mut leased_refs = std::collections::HashSet::new();
+            for lease in &leases {
+                if !leased_refs.insert(lease.remote_ref.as_str()) {
+                    return Err("force-with-lease may name each ref only once");
+                }
             }
         }
         Ok(Self {
-            remote: remote.ok_or("push requires an explicit remote")?,
+            remote,
             refspecs,
             leases,
+            bare_force_with_lease,
+            lease_refs,
             atomic,
             set_upstream,
+            force,
+            dry_run,
+            tags,
+            follow_tags,
+            delete,
+            verbose,
+            quiet,
+            no_verify,
         })
     }
 }
 
-fn normalize_ref(reference: &str, source: bool) -> Result<String, &'static str> {
+fn valid_remote_name(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 128
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+pub fn normalize_ref(reference: &str, source: bool) -> Result<String, &'static str> {
     let reference = if reference.starts_with("refs/heads/") || reference.starts_with("refs/tags/") {
         reference.to_owned()
     } else if reference.starts_with("refs/") {
@@ -249,6 +342,22 @@ fn normalize_ref(reference: &str, source: bool) -> Result<String, &'static str> 
     Ok(reference)
 }
 
+fn is_safe_global_config_override(entry: &str) -> bool {
+    let Some((key, _value)) = entry.split_once('=') else {
+        return false;
+    };
+    let key = key.trim().to_ascii_lowercase();
+    const SAFE_PREFIXES: &[&str] = &["color.", "advice.", "diff.", "log.", "status."];
+    const BLOCKED_EXACT_OR_SUB: &[&str] = &["diff.external", "diff.guitool", "diff.tool"];
+    if BLOCKED_EXACT_OR_SUB.contains(&key.as_str())
+        || key.ends_with(".textconv")
+        || key.ends_with(".command")
+    {
+        return false;
+    }
+    SAFE_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+}
+
 impl GitInvocation {
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, ParseError> {
         let mut arguments = arguments.into_iter();
@@ -274,7 +383,25 @@ impl GitInvocation {
                 directory_changes.push(PathBuf::from(path));
                 continue;
             }
-            if argument == "--no-pager" || argument == "--literal-pathspecs" {
+            if argument == "-c" {
+                let entry = arguments
+                    .next()
+                    .ok_or(ParseError::UnsupportedGlobalOption)?;
+                let Some(entry_str) = entry.to_str() else {
+                    return Err(ParseError::UnsupportedGlobalOption);
+                };
+                if !is_safe_global_config_override(entry_str) {
+                    return Err(ParseError::UnsupportedGlobalOption);
+                }
+                global_arguments.push(OsString::from("-c"));
+                global_arguments.push(entry);
+                continue;
+            }
+            if argument == "--no-pager"
+                || argument == "--literal-pathspecs"
+                || argument == "--paginate"
+                || argument == "-p"
+            {
                 global_arguments.push(argument);
                 continue;
             }
@@ -340,6 +467,8 @@ mod tests {
             "repo",
             "--no-pager",
             "-Csubdir",
+            "-c",
+            "color.ui=always",
             "status",
             "-C",
             "not-a-global-option",
@@ -349,7 +478,10 @@ mod tests {
             parsed.directory_changes,
             [PathBuf::from("repo"), PathBuf::from("subdir")]
         );
-        assert_eq!(parsed.global_arguments, args(&["--no-pager"]));
+        assert_eq!(
+            parsed.global_arguments,
+            args(&["--no-pager", "-c", "color.ui=always"])
+        );
         assert_eq!(
             parsed.arguments,
             args(&["status", "-C", "not-a-global-option"])
@@ -363,10 +495,21 @@ mod tests {
             GitInvocation::parse(args(&["-C"])),
             Err(ParseError::MissingDirectory)
         );
-        assert_eq!(
-            GitInvocation::parse(args(&["-c", "alias.x=...", "status"])),
-            Err(ParseError::UnsupportedGlobalOption)
-        );
+        for unsafe_args in [
+            vec!["-c", "alias.x=...", "status"],
+            vec!["-c", "user.email=wrong@example.invalid", "commit"],
+            vec!["-c", "credential.helper=store", "fetch"],
+            vec!["-c", "core.sshCommand=evil", "fetch"],
+            vec!["-c", "diff.external=evil", "diff"],
+            vec!["--git-dir=/tmp/other", "status"],
+            vec!["--exec-path=/tmp/evil", "status"],
+        ] {
+            assert_eq!(
+                GitInvocation::parse(args(&unsafe_args)),
+                Err(ParseError::UnsupportedGlobalOption),
+                "{unsafe_args:?}"
+            );
+        }
         assert_eq!(
             GitInvocation::parse(Vec::<OsString>::new()),
             Err(ParseError::MissingSubcommand)
@@ -374,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_bounded_explicit_push_requests_without_authorizing_them() {
+    fn parses_bounded_and_everyday_push_requests() {
         let parsed = PushInvocation::parse(&args(&[
             "--atomic",
             "-u",
@@ -385,7 +528,7 @@ mod tests {
             ":obsolete",
         ]))
         .unwrap();
-        assert_eq!(parsed.remote, "origin");
+        assert_eq!(parsed.remote.as_deref(), Some("origin"));
         assert_eq!(parsed.refspecs.len(), 3);
         assert!(parsed.atomic);
         assert!(parsed.set_upstream);
@@ -395,14 +538,22 @@ mod tests {
         assert_eq!(parsed.refspecs[1].source, "refs/heads/feature");
         assert_eq!(parsed.refspecs[2].source, "(delete)");
 
+        let tags = PushInvocation::parse(&args(&["origin", "--tags", "--dry-run"])).unwrap();
+        assert!(tags.tags && tags.dry_run);
+
+        let forced = PushInvocation::parse(&args(&[
+            "origin",
+            "--force",
+            "refs/heads/main:refs/heads/main",
+        ]))
+        .unwrap();
+        assert!(forced.force);
+
         for invalid in [
-            vec!["origin"],
             vec!["origin", "refs/notes/a:refs/notes/b"],
             vec!["origin", "main..backup:main"],
             vec!["origin", "feature/.hidden:feature/.hidden"],
             vec!["origin", "main.lock:main.lock"],
-            vec!["origin", "+refs/heads/main:refs/heads/main"],
-            vec!["origin", "--force", "refs/heads/main:refs/heads/main"],
             vec!["origin", "main:main", "feature:main"],
             vec![
                 "origin",
@@ -426,7 +577,7 @@ mod tests {
     #[test]
     fn accepts_git_push_same_name_refspec_spelling() {
         let parsed = PushInvocation::parse(&args(&["origin", "main"])).unwrap();
-        assert_eq!(parsed.remote, "origin");
+        assert_eq!(parsed.remote.as_deref(), Some("origin"));
         assert_eq!(parsed.refspecs[0].source, "refs/heads/main");
         assert_eq!(parsed.refspecs[0].destination, "refs/heads/main");
     }

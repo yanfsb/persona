@@ -22,6 +22,10 @@ pub struct PushHandoff {
     pub destination: String,
     pub tuples: Vec<HandoffTuple>,
     pub github_binding: Option<HandoffGithubBinding>,
+    #[serde(default)]
+    pub dynamic_tuples: bool,
+    #[serde(default)]
+    pub force_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +206,8 @@ mod tests {
                 expected_lease_oid: None,
             }],
             github_binding: None,
+            dynamic_tuples: false,
+            force_requested: false,
         }
     }
 

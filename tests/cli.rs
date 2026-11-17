@@ -823,11 +823,39 @@ fn managed_worktree_add_is_detached_and_confined_to_the_target_scope() {
     )
     .unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
-    let hook_blocked = persona_command(&repo)
+    let everyday_switch = persona_command(&repo)
         .env("PERSONA_GIT", &git)
         .env("PATH", "/usr/bin:/bin")
         .args(["run", "--config"])
         .arg(&config)
+        .args(["--cwd"])
+        .arg(&repo)
+        .args(["--", "git", "switch", "-c", "day-to-day-hook"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        everyday_switch.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&everyday_switch.stderr)
+    );
+    assert!(
+        hook_marker.exists(),
+        "day-to-day repo hooks should run by default when strict_repo_hooks is false"
+    );
+    fs::remove_file(&hook_marker).unwrap();
+
+    let strict_config_path = temporary.path().join("strict-hooks-policy.toml");
+    let mut strict_config = persona::config::Config::load(&config).unwrap();
+    let mut strict_profile = strict_config.profiles()[0].clone();
+    strict_profile.git.strict_repo_hooks = true;
+    strict_config.update_profile(strict_profile).unwrap();
+    fs::write(&strict_config_path, strict_config.to_v3_toml().unwrap()).unwrap();
+    let hook_blocked = persona_command(&repo)
+        .env("PERSONA_GIT", &git)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["run", "--config"])
+        .arg(&strict_config_path)
         .args(["--cwd"])
         .arg(&target)
         .args(["--", "git", "switch", "main"])
@@ -836,7 +864,7 @@ fn managed_worktree_add_is_detached_and_confined_to_the_target_scope() {
     assert_eq!(hook_blocked.status.code(), Some(126));
     assert!(
         !hook_marker.exists(),
-        "Persona must block before running hooks"
+        "Persona must block before running hooks when strict_repo_hooks = true"
     );
 
     let outside = temporary.path().join("outside-worktree");
@@ -1028,11 +1056,25 @@ fn run_routes_local_git_through_managed_adapter_and_blocks_network_commands() {
         .arg(&config)
         .args(["--cwd"])
         .arg(&repo)
-        .args(["--", "git", "status", "--exec-path"])
+        .args(["--", "git", "--exec-path=/tmp", "status"])
         .output()
         .unwrap();
     assert_eq!(unsafe_status.status.code(), Some(126));
-    assert!(String::from_utf8_lossy(&unsafe_status.stderr).contains("safe grammar"));
+    assert!(
+        String::from_utf8_lossy(&unsafe_status.stderr).contains("unsupported Git global option")
+    );
+
+    let everyday_status = persona_command(temporary.path())
+        .env("PERSONA_GIT", &git)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["run", "--config"])
+        .arg(&config)
+        .args(["--cwd"])
+        .arg(&repo)
+        .args(["--", "git", "status", "-sb"])
+        .output()
+        .unwrap();
+    assert_eq!(everyday_status.status.code(), Some(0));
 
     let echo = temporary.path().join("echo-child");
     fs::write(
@@ -1391,7 +1433,7 @@ printf '%s|%s' "$PWD" "$1"
         .output()
         .unwrap();
     assert!(configure_filter.status.success());
-    let filtered_add = persona_command(temporary.path())
+    let permissive_add = persona_command(temporary.path())
         .env("PERSONA_GIT", &git)
         .env("PATH", "/usr/bin:/bin")
         .args(["run", "--config"])
@@ -1401,10 +1443,34 @@ printf '%s|%s' "$PWD" "$1"
         .args(["--", "git", "add", "--", "tracked.txt"])
         .output()
         .unwrap();
+    assert_eq!(permissive_add.status.code(), Some(0));
+
+    let strict_filter_config_path = temporary.path().join("strict-filters.toml");
+    let mut strict_filter_config = persona::config::Config::load(&config).unwrap();
+    let mut strict_filter_profile = strict_filter_config.profiles()[0].clone();
+    strict_filter_profile.git.strict_git_filters = true;
+    strict_filter_config
+        .update_profile(strict_filter_profile)
+        .unwrap();
+    fs::write(
+        &strict_filter_config_path,
+        strict_filter_config.to_v3_toml().unwrap(),
+    )
+    .unwrap();
+    let filtered_add = persona_command(temporary.path())
+        .env("PERSONA_GIT", &git)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["run", "--config"])
+        .arg(&strict_filter_config_path)
+        .args(["--cwd"])
+        .arg(&repo)
+        .args(["--", "git", "add", "--", "tracked.txt"])
+        .output()
+        .unwrap();
     assert_eq!(filtered_add.status.code(), Some(126));
     assert!(
         !filter_marker.exists(),
-        "managed staging must refuse before invoking repository filters"
+        "managed staging must refuse before invoking repository filters when strict_git_filters = true"
     );
 
     let branch_list = persona_command(temporary.path())
@@ -1467,9 +1533,10 @@ printf '%s|%s' "$PWD" "$1"
         .output()
         .unwrap();
     assert_eq!(blocked_network.status.code(), Some(126));
+    let blocked_stderr = String::from_utf8_lossy(&blocked_network.stderr);
     assert!(
-        String::from_utf8_lossy(&blocked_network.stderr)
-            .contains("fetch requires a profile-bound remote fetch policy")
+        blocked_stderr.contains("no profile-bound destination policy"),
+        "unexpected stderr: {blocked_stderr}"
     );
 
     let outside = temporary.path().join("outside");
@@ -1716,6 +1783,8 @@ profile = "work"
             remote_oid: "0".repeat(40),
             expected_lease_oid: None,
         }],
+        dynamic_tuples: false,
+        force_requested: false,
         github_binding: Some(HandoffGithubBinding {
             host: "github.com".into(),
             account_id: "4242".into(),
@@ -2371,6 +2440,30 @@ exec {real_git_literal} "$@"
             .output()
             .unwrap()
     };
+    let unleased_force = persona_command(&repo)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("XDG_STATE_HOME", &state)
+        .env("GH_CONFIG_DIR", &gh_config)
+        .env("PERSONA_GH", &gh)
+        .env("PERSONA_GIT", &fake_git)
+        .args([
+            "run",
+            "--",
+            "git",
+            "push",
+            "--force",
+            "origin",
+            "refs/heads/main:refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(!unleased_force.status.success());
+    assert!(
+        !marker.exists(),
+        "unleased force push must be refused before transport when allow_force_push = false"
+    );
+
     let non_atomic = persona_command(&repo)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
@@ -2389,15 +2482,13 @@ exec {real_git_literal} "$@"
         ])
         .output()
         .unwrap();
-    assert!(!non_atomic.status.success());
     assert!(
+        non_atomic.status.success(),
+        "non-atomic multi-ref push should pass everyday workflow checks while keeping pre-push enforcement: stdout={}, stderr={}",
+        String::from_utf8_lossy(&non_atomic.stdout),
         String::from_utf8_lossy(&non_atomic.stderr)
-            .contains("outside the currently supported safe grammar")
     );
-    assert!(
-        !marker.exists(),
-        "non-atomic multi-ref push must be refused before transport"
-    );
+    fs::remove_file(&marker).unwrap();
 
     let push = managed_push();
     assert!(
@@ -3143,4 +3234,339 @@ fn help_and_version_exit_successfully() {
 
         assert!(stdout.contains("persona"));
     }
+}
+
+#[test]
+fn everyday_git_workflow_and_command_denylist_allowlist() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let config_home = temporary.path().join("config");
+    let state_home = temporary.path().join("state");
+    let repo = temporary.path().join("repo");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let git = PathBuf::from(std::env::var_os("PERSONA_TEST_GIT").expect("PERSONA_TEST_GIT"));
+
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let config_dir = config_home.join("persona");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = config_dir.join("config.toml");
+    let config = format!(
+        r#"version = 3
+
+[[profiles]]
+name = "yanfsb"
+[profiles.git]
+author = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
+committer = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
+
+[[scopes]]
+name = "work"
+path = {scope:?}
+profile = "yanfsb"
+"#,
+        scope = repo.canonicalize().unwrap().to_string_lossy()
+    );
+    fs::write(&config_path, config).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let run_in_repo = |args: &[&str]| {
+        persona_command(&repo)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    fs::write(repo.join("notes.txt"), "hello\n").unwrap();
+    assert!(
+        run_in_repo(&["run", "--", "git", "add", "notes.txt"])
+            .status
+            .success()
+    );
+    assert!(
+        run_in_repo(&["run", "--", "git", "commit", "-m", "init"])
+            .status
+            .success()
+    );
+
+    // Day-to-day commands (log -p, diff, show, branch -a, stash) work out of the box in Denylist mode.
+    for cmd in [
+        &["run", "--", "git", "log", "-n", "1", "-p"][..],
+        &["run", "--", "git", "diff"][..],
+        &["run", "--", "git", "show", "--stat", "HEAD"][..],
+        &["run", "--", "git", "branch", "-a"][..],
+        &["run", "--", "git", "stash", "list"][..],
+    ] {
+        let out = run_in_repo(cmd);
+        assert!(
+            out.status.success(),
+            "{cmd:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Configure denylist for git + run via `persona profile commands`.
+    let set_cmd = run_in_repo(&[
+        "profile",
+        "commands",
+        "yanfsb",
+        "--git-mode",
+        "denylist",
+        "--git-deny",
+        "stash",
+        "--git-deny",
+        "log --stat",
+        "--run-deny",
+        "env",
+    ]);
+    assert!(
+        set_cmd.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set_cmd.stderr)
+    );
+
+    let denied_stash = run_in_repo(&["run", "--", "git", "stash", "list"]);
+    assert_eq!(denied_stash.status.code(), Some(126));
+    let denied_flag = run_in_repo(&["run", "--", "git", "log", "--stat"]);
+    assert_eq!(denied_flag.status.code(), Some(126));
+    let allowed_log = run_in_repo(&["run", "--", "git", "log", "-n", "1"]);
+    assert_eq!(allowed_log.status.code(), Some(0));
+
+    let denied_run = run_in_repo(&["run", "--", "env"]);
+    assert!(!denied_run.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied_run.stderr).contains("blocked by profile deny rule"),
+        "{}",
+        String::from_utf8_lossy(&denied_run.stderr)
+    );
+
+    // Switch to allowlist mode and verify unknown commands are denied while allowlisted ones succeed.
+    assert!(
+        run_in_repo(&["profile", "commands", "yanfsb", "--clear-run",])
+            .status
+            .success()
+    );
+    assert!(
+        run_in_repo(&[
+            "profile",
+            "commands",
+            "yanfsb",
+            "--git-mode",
+            "allowlist",
+            "--git-allow",
+            "status",
+            "--git-deny",
+            "stash",
+        ])
+        .status
+        .success()
+    );
+    assert_eq!(
+        run_in_repo(&["run", "--", "git", "status"]).status.code(),
+        Some(0)
+    );
+    assert_eq!(
+        run_in_repo(&["run", "--", "git", "log"]).status.code(),
+        Some(126)
+    );
+
+    let show = run_in_repo(&["profile", "show", "yanfsb"]);
+    assert!(show.status.success());
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("git commands: mode=allowlist"));
+}
+
+#[test]
+fn baseline_update_pins_current_remote_tracking_refs_without_manual_sed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let config_home = temporary.path().join("config");
+    let state_home = temporary.path().join("state");
+    let repo = temporary.path().join("repo");
+    let remote = temporary.path().join("remote.git");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let git = PathBuf::from(std::env::var_os("PERSONA_TEST_GIT").expect("PERSONA_TEST_GIT"));
+
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["init", "--bare", remote.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "user.name=yanfsb",
+                "-c",
+                "user.email=yanfsb@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "upstream",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["remote", "add", "origin", remote.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["push", "origin", "HEAD:main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["fetch", "origin"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let expected_oid = String::from_utf8_lossy(
+        &Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&repo)
+            .args(["rev-parse", "refs/remotes/origin/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+
+    let config_dir = config_home.join("persona");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"version = 3
+
+[[profiles]]
+name = "yanfsb"
+[profiles.git]
+author = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
+committer = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
+[profiles.git.push]
+remote = "origin"
+destinations = [{dest:?}, "https://github.com/yanfsb/other.git"]
+upstream_provenance = "pinned"
+upstream_baselines = [
+  {{ destination = {dest:?}, tracking_ref = "refs/remotes/origin/main", oid = "1111111111111111111111111111111111111111" }},
+  {{ destination = "https://github.com/yanfsb/other.git", tracking_ref = "refs/remotes/origin/main", oid = "2222222222222222222222222222222222222222" }}
+]
+
+[[scopes]]
+name = "work"
+path = {scope:?}
+profile = "yanfsb"
+"#,
+            dest = remote.to_string_lossy(),
+            scope = repo.canonicalize().unwrap().to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let preview = persona_command(&repo)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["baseline", "update", "--cwd", ".", "--preview"])
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(String::from_utf8_lossy(&preview.stdout).contains(&expected_oid));
+
+    let applied = persona_command(&repo)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["baseline", "update", "--cwd", "."])
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    let reloaded = persona::config::Config::load(&config_path).unwrap();
+    let baselines = &reloaded.profiles()[0]
+        .git
+        .push
+        .as_ref()
+        .unwrap()
+        .upstream_baselines;
+    assert_eq!(baselines[0].oid, expected_oid);
+    assert_eq!(baselines[1].oid, "2222222222222222222222222222222222222222");
 }

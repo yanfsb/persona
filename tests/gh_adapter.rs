@@ -418,6 +418,54 @@ fn managed_gh_binds_account_and_repository_before_native_delegation() {
     );
 
     let before = fs::read_to_string(&marker).unwrap().lines().count();
+    let everyday_issue = call(
+        &scope,
+        &home,
+        &xdg,
+        &state,
+        &gh,
+        &[
+            "run",
+            "--",
+            "gh",
+            "issue",
+            "close",
+            "12",
+            "--repo",
+            "acme/persona",
+        ],
+    );
+    assert_eq!(everyday_issue.status.code(), Some(64));
+    let after_issue = fs::read_to_string(&marker).unwrap().lines().count();
+    assert!(after_issue > before);
+
+    let wrong_repository = call(
+        &scope,
+        &home,
+        &xdg,
+        &state,
+        &gh,
+        &["run", "--", "gh", "repo", "view", "other/repo"],
+    );
+    assert_eq!(wrong_repository.status.code(), Some(126));
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().lines().count(),
+        after_issue
+    );
+
+    let update_cmd = call(
+        &scope,
+        &home,
+        &xdg,
+        &state,
+        &gh,
+        &["profile", "commands", "work", "--gh-deny", "issue.close"],
+    );
+    assert!(
+        update_cmd.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update_cmd.stderr)
+    );
     let denied = call(
         &scope,
         &home,
@@ -436,18 +484,10 @@ fn managed_gh_binds_account_and_repository_before_native_delegation() {
         ],
     );
     assert_eq!(denied.status.code(), Some(126));
-    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), before);
-
-    let wrong_repository = call(
-        &scope,
-        &home,
-        &xdg,
-        &state,
-        &gh,
-        &["run", "--", "gh", "repo", "view", "other/repo"],
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().lines().count(),
+        after_issue
     );
-    assert_eq!(wrong_repository.status.code(), Some(126));
-    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), before);
 
     let unsigned_release = call(
         &scope,
@@ -468,7 +508,10 @@ fn managed_gh_binds_account_and_repository_before_native_delegation() {
         ],
     );
     assert_eq!(unsigned_release.status.code(), Some(126));
-    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), before);
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().lines().count(),
+        after_issue
+    );
 
     let environment_override = Command::new(persona())
         .env_clear()
@@ -484,7 +527,10 @@ fn managed_gh_binds_account_and_repository_before_native_delegation() {
         .output()
         .unwrap();
     assert_eq!(environment_override.status.code(), Some(126));
-    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), before);
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().lines().count(),
+        after_issue
+    );
 }
 
 #[test]
@@ -925,6 +971,43 @@ fn pr_checkout_uses_managed_fetch_without_exposing_token_to_git_or_hooks() {
     )
     .unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let permissive = call_with_git(
+        &repo,
+        &home,
+        &xdg,
+        &state,
+        &gh,
+        &fake_git,
+        &[
+            "run",
+            "--",
+            "gh",
+            "pr",
+            "checkout",
+            "16",
+            "--repo",
+            "acme/persona",
+            "--branch",
+            "pr-16",
+        ],
+    );
+    assert_eq!(
+        permissive.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&permissive.stderr)
+    );
+    assert!(
+        !hook_marker.exists(),
+        "GH_TOKEN must never be exposed to repository post-checkout hooks"
+    );
+
+    let mut strict_config = persona::config::Config::load(&config).unwrap();
+    let mut profile = strict_config.profiles()[0].clone();
+    profile.git.strict_repo_hooks = true;
+    strict_config.update_profile(profile).unwrap();
+    fs::write(&config, strict_config.to_v3_toml().unwrap()).unwrap();
+
     let blocked = call_with_git(
         &repo,
         &home,
@@ -948,7 +1031,7 @@ fn pr_checkout_uses_managed_fetch_without_exposing_token_to_git_or_hooks() {
     assert_eq!(blocked.status.code(), Some(126));
     assert!(
         !hook_marker.exists(),
-        "repository-controlled post-checkout hook must not execute"
+        "repository-controlled post-checkout hook must not execute when strict_repo_hooks = true"
     );
 }
 
@@ -1618,4 +1701,142 @@ exit 64
     let race_error = String::from_utf8_lossy(&concurrent_tag_move.stderr);
     assert!(race_error.contains("changed concurrently"));
     assert!(race_error.contains("confirmed uploaded assets: race.bin (id 457)"));
+}
+
+#[test]
+fn gh_infers_repository_from_git_checkout_and_enforces_wildcard_and_deny_rules() {
+    let temporary = tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let xdg = temporary.path().join("xdg");
+    let state = temporary.path().join("state");
+    let scope = temporary.path().join("work");
+    let allowed_repo = scope.join("public-app");
+    let denied_repo = scope.join("secret-app");
+    let gh_config = xdg.join("gh");
+    for dir in [&allowed_repo, &denied_repo, &gh_config] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::set_permissions(&gh_config, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        gh_config.join("hosts.yml"),
+        "github.com:\n  user: synthetic-user\n",
+    )
+    .unwrap();
+
+    let git = PathBuf::from(std::env::var_os("PERSONA_TEST_GIT").expect("PERSONA_TEST_GIT"));
+    for (dir, url) in [
+        (&allowed_repo, "https://github.com/acme/public-app.git"),
+        (&denied_repo, "https://github.com/acme/secret.git"),
+    ] {
+        assert!(
+            Command::new(&git)
+                .current_dir(dir)
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new(&git)
+                .current_dir(dir)
+                .args(["remote", "add", "origin", url])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    let gh = temporary.path().join("gh-fixture");
+    let calls = temporary.path().join("gh-calls");
+    fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+if [ "$1 $2" = "auth token" ]; then printf 'synthetic-token\n'; exit 0; fi
+if [ "$1 $2" = "api user" ]; then printf '4242\n'; exit 0; fi
+printf '%s\n' "$*" >> '{}'
+exit 0
+"#,
+            calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config_path = xdg.join("persona/config.toml");
+    write_private_config(&config_path, &scope);
+    assert!(
+        call(
+            &scope,
+            &home,
+            &xdg,
+            &state,
+            &gh,
+            &[
+                "auth",
+                "enroll",
+                "--profile",
+                "work",
+                "--user",
+                "synthetic-user",
+                "--confirm-online",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let mut config = persona::config::Config::load(&config_path).unwrap();
+    let mut profile = config.profiles()[0].clone();
+    let binding = profile.github.as_mut().unwrap();
+    binding.repositories = vec!["acme/*".to_owned()];
+    binding.deny_repositories = vec!["acme/secret".to_owned()];
+    config.update_profile(profile).unwrap();
+    fs::write(&config_path, config.to_v3_toml().unwrap()).unwrap();
+
+    // Without `--repo`, `gh` infers `acme/public-app` from the checkout's `origin` remote.
+    let inferred_ok = call(
+        &allowed_repo,
+        &home,
+        &xdg,
+        &state,
+        &gh,
+        &["run", "--", "gh", "pr", "diff"],
+    );
+    assert_eq!(
+        inferred_ok.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&inferred_ok.stderr)
+    );
+    let everyday_run = call(
+        &allowed_repo,
+        &home,
+        &xdg,
+        &state,
+        &gh,
+        &["run", "--", "gh", "run", "list"],
+    );
+    assert_eq!(
+        everyday_run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&everyday_run.stderr)
+    );
+
+    // Denied repository overrides wildcard `acme/*`.
+    let denied = call(
+        &denied_repo,
+        &home,
+        &xdg,
+        &state,
+        &gh,
+        &["run", "--", "gh", "issue", "list"],
+    );
+    assert_eq!(denied.status.code(), Some(126));
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("allowlist"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
 }

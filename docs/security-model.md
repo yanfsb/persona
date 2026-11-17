@@ -2,7 +2,7 @@
 
 ## Intended protection
 
-Persona reduces accidental identity and destination mistakes in explicitly managed Git/GitHub CLI paths. It associates local identity policy with physical directory/worktree scopes, checks bounded command forms, and fails closed when required evidence is missing, ambiguous, unsupported, or unbounded. Optional profile command allow/deny lists only narrow the implemented Git surface; they do not turn unsupported commands into protected native pass-through. A PASS applies only to the named evidence checked for that operation.
+Persona prevents cross-identity and wrong-destination mistakes across directory-scoped profiles by enforcing author/committer identity isolation, cross-profile commit leak checks (`cross_profile_identity_check`), cryptographic signing, destination allow/deny boundaries, SSH key isolation, and GitHub credential binding. Per-profile command policies (`denylist` by default, or `allowlist` for strict workflows) govern which `git`, `gh`, and `persona run` commands are permitted; command rules never weaken identity, signing, destination, or credential checks. Opt-in repository hardening flags (`strict_repo_hooks`, `strict_git_filters`, `strict_merge_drivers`) block local hooks, filters, and merge drivers on untrusted repositories when enabled. A PASS applies only to the named evidence checked for that operation.
 
 ## Boundaries
 

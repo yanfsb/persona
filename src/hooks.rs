@@ -192,6 +192,159 @@ pub fn install(
     Ok("installed the Persona pre-push guard and preserved the previous hook".to_owned())
 }
 
+pub fn refresh(
+    paths: &HookPaths,
+    config_path: Option<&Path>,
+    persona_executable: &Path,
+    preview: bool,
+) -> Result<String, String> {
+    if !paths.manifest.exists() {
+        return Err("no Persona pre-push hook is installed in this repository".to_owned());
+    }
+    let mut manifest = read_manifest(&paths.manifest)?;
+    verify_installed_hook(paths, &manifest)?;
+    let target_config = match config_path {
+        Some(path) => fs::canonicalize(path)
+            .map_err(|_| "Persona config file must exist and resolve physically".to_owned())?,
+        None => manifest.config_path.clone(),
+    };
+    let persona_executable = fs::canonicalize(persona_executable)
+        .map_err(|_| "Persona executable must exist and resolve physically".to_owned())?;
+    if !target_config.is_file() || !persona_executable.is_file() {
+        return Err("config or Persona executable is not a regular file".to_owned());
+    }
+    validate_directories(paths, preview)?;
+    if preview {
+        return Ok(format!(
+            "would refresh Persona pre-push hook to {} with policy {}",
+            persona_executable.display(),
+            target_config.display()
+        ));
+    }
+    let previous_executable = manifest.persona_executable.clone();
+    replace_owned_symlink(&paths.hook, &previous_executable, &persona_executable)?;
+    manifest.config_path = target_config;
+    manifest.persona_executable = persona_executable;
+    if let Err(error) = write_manifest_atomic(&paths.manifest, &manifest) {
+        let rollback = replace_owned_symlink(
+            &paths.hook,
+            &manifest.persona_executable,
+            &previous_executable,
+        );
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback_error) => format!("{error}; hook rollback failed: {rollback_error}"),
+        });
+    }
+    Ok("refreshed the owned Persona pre-push hook".to_owned())
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HookRegistry {
+    version: u32,
+    worktrees: Vec<PathBuf>,
+}
+
+pub fn register_hook_worktree(state_dir: &Path, worktree: &Path) -> Result<(), String> {
+    let Ok(worktree) = fs::canonicalize(worktree) else {
+        return Ok(());
+    };
+    let registry_path = state_dir.join("hooks-registry.json");
+    let mut registry = read_hook_registry(&registry_path).unwrap_or(HookRegistry {
+        version: 1,
+        worktrees: Vec::new(),
+    });
+    if !registry.worktrees.contains(&worktree) {
+        registry.worktrees.push(worktree);
+        registry.version = 1;
+        write_hook_registry_atomic(&registry_path, &registry)?;
+    }
+    Ok(())
+}
+
+pub fn unregister_hook_worktree(state_dir: &Path, worktree: &Path) -> Result<(), String> {
+    let canonical = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let registry_path = state_dir.join("hooks-registry.json");
+    let Ok(mut registry) = read_hook_registry(&registry_path) else {
+        return Ok(());
+    };
+    let before = registry.worktrees.len();
+    registry
+        .worktrees
+        .retain(|path| path != &canonical && path != worktree);
+    if registry.worktrees.len() != before {
+        write_hook_registry_atomic(&registry_path, &registry)?;
+    }
+    Ok(())
+}
+
+pub fn refresh_registered_hooks(
+    state_dir: &Path,
+    git: &crate::git::GitClient,
+    persona_executable: &Path,
+) -> Vec<String> {
+    let registry_path = state_dir.join("hooks-registry.json");
+    let Ok(mut registry) = read_hook_registry(&registry_path) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    let mut retained = Vec::with_capacity(registry.worktrees.len());
+    for worktree in &registry.worktrees {
+        if !worktree.is_dir() {
+            continue;
+        }
+        let Ok(paths) = resolve_paths(git, worktree) else {
+            retained.push(worktree.clone());
+            continue;
+        };
+        if !paths.manifest.exists() {
+            continue;
+        }
+        retained.push(worktree.clone());
+        match refresh(&paths, None, persona_executable, false) {
+            Ok(_) => messages.push(format!("refreshed hook in {}", worktree.display())),
+            Err(error) => messages.push(format!(
+                "skipped hook refresh in {}: {error}",
+                worktree.display()
+            )),
+        }
+    }
+    if retained != registry.worktrees {
+        registry.worktrees = retained;
+        let _ = write_hook_registry_atomic(&registry_path, &registry);
+    }
+    messages
+}
+
+fn read_hook_registry(path: &Path) -> Result<HookRegistry, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "registry missing".to_owned())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 256 * 1024 {
+        return Err("invalid hook registry".to_owned());
+    }
+    let bytes = fs::read(path).map_err(|_| "cannot read hook registry".to_owned())?;
+    serde_json::from_slice(&bytes).map_err(|_| "malformed hook registry".to_owned())
+}
+
+fn write_hook_registry_atomic(path: &Path, registry: &HookRegistry) -> Result<(), String> {
+    let Some(directory) = path.parent() else {
+        return Err("hook registry has no parent".to_owned());
+    };
+    fs::create_dir_all(directory).map_err(|_| "cannot create Persona state dir".to_owned())?;
+    set_private_directory(directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|_| "cannot create temporary hook registry".to_owned())?;
+    let bytes =
+        serde_json::to_vec(registry).map_err(|_| "cannot serialize hook registry".to_owned())?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|_| "cannot write hook registry".to_owned())?;
+    temporary
+        .persist(path)
+        .map_err(|_| "cannot persist hook registry".to_owned())?;
+    Ok(())
+}
+
 pub fn uninstall(paths: &HookPaths, preview: bool) -> Result<String, String> {
     let manifest = match read_manifest(&paths.manifest) {
         Ok(manifest) => manifest,

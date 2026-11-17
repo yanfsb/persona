@@ -11,11 +11,14 @@ pub enum GhOperation {
     AuditedReleaseAssetUpload,
     Review,
     Checkout,
+    General,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhRequest {
     pub arguments: Vec<OsString>,
+    pub selector: String,
+    pub flags: Vec<String>,
     pub repositories: Vec<String>,
     pub operation: GhOperation,
     pub clone_directory: Option<std::path::PathBuf>,
@@ -73,15 +76,14 @@ pub struct GhCheckoutRequest {
     pub branch: Option<String>,
 }
 
-type ParsedOperation = (
-    Vec<String>,
-    GhOperation,
-    usize,
-    BTreeSet<&'static str>,
-    BTreeSet<&'static str>,
-);
-
 pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
+    parse_with_inferred_repository(arguments, None)
+}
+
+pub fn parse_with_inferred_repository(
+    arguments: &[OsString],
+    inferred_repository: Option<&str>,
+) -> Result<GhRequest, String> {
     let words = arguments
         .iter()
         .map(|argument| {
@@ -91,28 +93,32 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
                 .ok_or_else(|| "gh arguments must be valid UTF-8".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if words.len() < 2 {
-        return Err(
-            "gh command is incomplete; supported groups are repo, pr, issue, release, and api"
-                .to_owned(),
-        );
+    if words.is_empty() {
+        return Err("gh command is incomplete".to_owned());
     }
 
     let mut command = words;
-    command[0] = match command[0].as_str() {
-        "repository" => "repo".to_owned(),
-        "pull-request" => "pr".to_owned(),
-        "issues" => "issue".to_owned(),
-        "releases" => "release".to_owned(),
-        other => other.to_owned(),
-    };
+    command[0] = normalize_group(&command[0]).to_owned();
     if command.get(1).is_some_and(|word| word == "ls") {
         command[1] = "list".to_owned();
     }
-    for pair in command.windows(2) {
-        if pair[0] == "--hostname" && pair[1] != "github.com" {
-            return Err("managed gh supports only the explicitly bound github.com host".to_owned());
+    check_hostname(&command)?;
+
+    if command[0] == "auth" {
+        let sub = command.get(1).map(String::as_str).unwrap_or("");
+        if sub == "status" {
+            return Err(
+                "gh auth status is not a protected repository operation; use `persona auth verify` for API-free local verification"
+                    .to_owned(),
+            );
         }
+        return Err(
+            "gh auth commands are blocked in managed mode to prevent global credential switches or token disclosure"
+                .to_owned(),
+        );
+    }
+    if matches!(command[0].as_str(), "alias" | "extension" | "ext") {
+        return Err("gh aliases and extensions are unsupported in managed mode".to_owned());
     }
 
     if command.iter().any(|word| word == "--public")
@@ -120,55 +126,294 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
     {
         return Err("gh repo create cannot combine --public and --private".to_owned());
     }
-    let (repositories, operation, permitted_positionals, allowed_value_flags, allowed_boolean_flags) =
-        match (command[0].as_str(), command[1].as_str()) {
-            ("repo", "view") => (repo_operand(&command[2..], 1)?, GhOperation::Read, 1, flags(&["--json", "--jq"]), flags(&[])),
-            ("repo", "clone") => (repo_operand(&command[2..], 2)?, GhOperation::Clone, 2, flags(&[]), flags(&[])),
-            ("repo", "fork") => (repo_fork_repositories(&command[2..])?, GhOperation::Create, 1, flags(&["--org"]), flags(&[])),
-            ("repo", "create") => (repo_operand(&command[2..], 1)?, GhOperation::Create, 1, flags(&["--description"]), flags(&["--public", "--private", "--disable-issues", "--disable-wiki", "--add-readme"])),
-            ("pr", "view") => (repo_option(&command[2..])?, GhOperation::Read, 1, flags(&["--json", "--jq"]), flags(&[])),
-            ("pr", "list") => (repo_option(&command[2..])?, GhOperation::Read, 0, flags(&["--json", "--jq", "--limit", "--state", "--base", "--head", "--author", "--assignee", "--label"]), flags(&[])),
-            ("pr", "create") => (repo_option(&command[2..])?, GhOperation::Create, 0, flags(&["--title", "--body", "--base", "--head", "--assignee", "--reviewer", "--label"]), flags(&["--draft", "--fill"])),
-            ("pr", "merge") => (repo_option(&command[2..])?, GhOperation::ServerMerge, 1, flags(&[]), flags(&["--merge", "--squash", "--rebase"])),
-            ("pr", "review") => (repo_option(&command[2..])?, GhOperation::Review, 1, flags(&["--body"]), flags(&["--approve", "--request-changes", "--comment"])),
-            ("pr", "checkout") => (repo_option(&command[2..])?, GhOperation::Checkout, 1, flags(&["--branch"]), flags(&[])),
-            ("issue", "view") => (repo_option(&command[2..])?, GhOperation::Read, 1, flags(&["--json", "--jq"]), flags(&[])),
-            ("issue", "list") => (repo_option(&command[2..])?, GhOperation::Read, 0, flags(&["--json", "--jq", "--limit", "--state", "--assignee", "--author", "--label", "--milestone"]), flags(&[])),
-            ("issue", "create") => (repo_option(&command[2..])?, GhOperation::Create, 0, flags(&["--title", "--body", "--assignee", "--label", "--milestone"]), flags(&[])),
-            ("release", "view") => (repo_option(&command[2..])?, GhOperation::Read, 1, flags(&["--json", "--jq"]), flags(&[])),
-            ("release", "list") => (repo_option(&command[2..])?, GhOperation::Read, 0, flags(&["--json", "--jq", "--limit"]), flags(&[])),
-            ("release", "create") => (repo_option(&command[2..])?, GhOperation::AuditedRelease, 1, flags(&["--title", "--notes"]), flags(&["--draft", "--prerelease", "--generate-notes"])),
-            ("release", "upload") => (repo_option(&command[2..])?, GhOperation::AuditedReleaseAssetUpload, usize::MAX, flags(&[]), flags(&[])),
-            ("api", _) => parse_api(&command)?,
-            ("auth", "status") => return Err("gh auth status is not a protected repository operation; use `persona auth verify` for API-free local verification".to_owned()),
-            ("alias", _) | ("extension", _) | ("ext", _) => return Err("gh aliases and extensions are unsupported in managed mode".to_owned()),
-            _ => return Err("unsupported gh command or destructive operation".to_owned()),
-        };
 
-    if command[0] != "api" {
-        validate_options(
-            &command[2..],
-            permitted_positionals,
-            &allowed_value_flags,
-            &allowed_boolean_flags,
-        )?;
+    let raw_flags = extract_flags(&command[1..]);
+
+    if command[0] == "api" {
+        return parse_api(command, raw_flags, inferred_repository);
     }
-    let positionals = positional_words(&command[2..]);
-    match (command[0].as_str(), command[1].as_str()) {
-        ("pr" | "issue", "view")
-            if positionals.len() == 1
-                && !positionals[0].bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
+
+    // Single-word top-level commands like `gh status` or `gh search` (actually search takes subcommand).
+    if command.len() == 1 || command[1].starts_with('-') {
+        let selector = command[0].clone();
+        let mut repositories = Vec::new();
+        if let Some(repo) = extract_repo_flag(&command[1..])? {
+            repositories.push(repo);
+        } else if let Some(inferred) = inferred_repository {
+            if group_accepts_inferred_repo(&command[0]) {
+                repositories.push(normalize_repository(inferred)?);
+            }
+        }
+        return Ok(GhRequest {
+            arguments: command.into_iter().map(OsString::from).collect(),
+            selector,
+            flags: raw_flags,
+            repositories,
+            operation: GhOperation::General,
+            clone_directory: None,
+            merge: None,
+            release: None,
+            asset_upload: None,
+            review: None,
+            checkout: None,
+        });
+    }
+
+    let group = command[0].as_str();
+    let sub = command[1].as_str();
+    let selector = format!("{group}.{sub}");
+
+    match (group, sub) {
+        ("pr", "merge")
+        | ("pr", "review")
+        | ("pr", "checkout")
+        | ("release", "create")
+        | ("release", "upload") => {
+            parse_audited_operation(command, selector, raw_flags, inferred_repository)
+        }
+        ("repo", "clone") => parse_clone_operation(command, selector, raw_flags),
+        ("repo", "fork") => parse_fork_operation(command, selector, raw_flags, inferred_repository),
+        _ => parse_general_operation(command, selector, raw_flags, inferred_repository),
+    }
+}
+
+fn normalize_group(group: &str) -> &str {
+    match group {
+        "repository" => "repo",
+        "pull-request" => "pr",
+        "issues" => "issue",
+        "releases" => "release",
+        other => other,
+    }
+}
+
+fn check_hostname(command: &[String]) -> Result<(), String> {
+    let mut index = 0;
+    while index < command.len() {
+        if command[index] == "--hostname" {
+            let host = command
+                .get(index + 1)
+                .ok_or_else(|| "--hostname requires a value".to_owned())?;
+            if host != "github.com" {
+                return Err(
+                    "managed gh supports only the explicitly bound github.com host".to_owned(),
+                );
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(host) = command[index].strip_prefix("--hostname=") {
+            if host != "github.com" {
+                return Err(
+                    "managed gh supports only the explicitly bound github.com host".to_owned(),
+                );
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn group_accepts_inferred_repo(group: &str) -> bool {
+    matches!(
+        group,
+        "pr" | "issue"
+            | "release"
+            | "run"
+            | "workflow"
+            | "cache"
+            | "label"
+            | "ruleset"
+            | "secret"
+            | "variable"
+    )
+}
+
+fn parse_clone_operation(
+    command: Vec<String>,
+    selector: String,
+    flags: Vec<String>,
+) -> Result<GhRequest, String> {
+    let positionals = general_positionals(&command[2..]);
+    let target = positionals
+        .first()
+        .copied()
+        .ok_or_else(|| "gh repo clone requires a repository target".to_owned())?;
+    let repository = normalize_repo_or_url(target)?;
+    let clone_directory = if let Some(dir) = positionals.get(1) {
+        std::path::PathBuf::from(dir)
+    } else {
+        let (_, name) = repository
+            .split_once('/')
+            .ok_or_else(|| "GitHub target must be an explicit OWNER/REPO".to_owned())?;
+        std::path::PathBuf::from(name)
+    };
+    Ok(GhRequest {
+        arguments: command.into_iter().map(OsString::from).collect(),
+        selector,
+        flags,
+        repositories: vec![repository],
+        operation: GhOperation::Clone,
+        clone_directory: Some(clone_directory),
+        merge: None,
+        release: None,
+        asset_upload: None,
+        review: None,
+        checkout: None,
+    })
+}
+
+fn parse_fork_operation(
+    command: Vec<String>,
+    selector: String,
+    flags: Vec<String>,
+    inferred_repository: Option<&str>,
+) -> Result<GhRequest, String> {
+    let positionals = general_positionals(&command[2..]);
+    let source = if let Some(target) = positionals.first() {
+        normalize_repo_or_url(target)?
+    } else if let Some(repo) = extract_repo_flag(&command[2..])? {
+        repo
+    } else if let Some(inferred) = inferred_repository {
+        normalize_repository(inferred)?
+    } else {
+        return Err("gh repo fork requires an explicit or inferred OWNER/REPO target".to_owned());
+    };
+    let mut repositories = vec![source.clone()];
+    if let Some(org) = find_flag_value(&command[2..], "--org") {
+        let name = source.split_once('/').unwrap().1;
+        repositories.push(normalize_repository(&format!("{org}/{name}"))?);
+    }
+    Ok(GhRequest {
+        arguments: command.into_iter().map(OsString::from).collect(),
+        selector,
+        flags,
+        repositories,
+        operation: GhOperation::Create,
+        clone_directory: None,
+        merge: None,
+        release: None,
+        asset_upload: None,
+        review: None,
+        checkout: None,
+    })
+}
+
+fn parse_general_operation(
+    command: Vec<String>,
+    selector: String,
+    flags: Vec<String>,
+    inferred_repository: Option<&str>,
+) -> Result<GhRequest, String> {
+    let group = command[0].as_str();
+    let sub = command[1].as_str();
+    let explicit_repo = extract_repo_flag(&command[2..])?;
+    let mut repositories = Vec::new();
+    if let Some(repo) = explicit_repo {
+        repositories.push(repo);
+    } else if group == "repo" && sub != "list" {
+        let positionals = general_positionals(&command[2..]);
+        if let Some(target) = positionals.first() {
+            repositories.push(normalize_repo_or_url(target)?);
+        } else if let Some(inferred) = inferred_repository {
+            repositories.push(normalize_repository(inferred)?);
+        } else {
             return Err(
-                "managed PR/issue view requires a numeric identifier, not a URL or owner alias"
+                "gh repo command requires an explicit or inferred OWNER/REPO target".to_owned(),
+            );
+        }
+    } else if group_accepts_inferred_repo(group) {
+        if let Some(inferred) = inferred_repository {
+            repositories.push(normalize_repository(inferred)?);
+        } else {
+            return Err(
+                "gh repository operations require explicit --repo OWNER/REPO outside a managed Git checkout"
                     .to_owned(),
             );
         }
-        ("release", "view" | "create")
-            if !positionals.is_empty() && !valid_component(positionals[0], false) =>
-        {
-            return Err("release tag must be a single safe tag name".to_owned());
-        }
+    }
+
+    let operation = match (group, sub) {
+        (_, "view" | "list" | "diff" | "checks" | "status") => GhOperation::Read,
+        (_, "create") => GhOperation::Create,
+        _ => GhOperation::General,
+    };
+
+    Ok(GhRequest {
+        arguments: command.into_iter().map(OsString::from).collect(),
+        selector,
+        flags,
+        repositories,
+        operation,
+        clone_directory: None,
+        merge: None,
+        release: None,
+        asset_upload: None,
+        review: None,
+        checkout: None,
+    })
+}
+
+fn parse_audited_operation(
+    command: Vec<String>,
+    selector: String,
+    flags: Vec<String>,
+    inferred_repository: Option<&str>,
+) -> Result<GhRequest, String> {
+    let repositories = match extract_repo_flag(&command[2..])? {
+        Some(repo) => vec![repo],
+        None => match inferred_repository {
+            Some(inferred) => vec![normalize_repository(inferred)?],
+            None => {
+                return Err(
+                    "gh repository operations require explicit --repo OWNER/REPO".to_owned(),
+                );
+            }
+        },
+    };
+    let (operation, permitted_positionals, allowed_value_flags, allowed_boolean_flags) =
+        match (command[0].as_str(), command[1].as_str()) {
+            ("pr", "merge") => (
+                GhOperation::ServerMerge,
+                1,
+                flag_set(&[]),
+                flag_set(&["--merge", "--squash", "--rebase"]),
+            ),
+            ("pr", "review") => (
+                GhOperation::Review,
+                1,
+                flag_set(&["--body"]),
+                flag_set(&["--approve", "--request-changes", "--comment"]),
+            ),
+            ("pr", "checkout") => (
+                GhOperation::Checkout,
+                1,
+                flag_set(&["--branch"]),
+                flag_set(&[]),
+            ),
+            ("release", "create") => (
+                GhOperation::AuditedRelease,
+                1,
+                flag_set(&["--title", "--notes"]),
+                flag_set(&["--draft", "--prerelease", "--generate-notes"]),
+            ),
+            ("release", "upload") => (
+                GhOperation::AuditedReleaseAssetUpload,
+                usize::MAX,
+                flag_set(&[]),
+                flag_set(&[]),
+            ),
+            _ => unreachable!(),
+        };
+
+    validate_audited_options(
+        &command[2..],
+        permitted_positionals,
+        &allowed_value_flags,
+        &allowed_boolean_flags,
+    )?;
+    let positionals = audited_positional_words(&command[2..]);
+    match (command[0].as_str(), command[1].as_str()) {
         ("release", "create")
             if positionals.len() != 1 || !valid_component(positionals[0], false) =>
         {
@@ -216,41 +461,26 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
                 }
             }
         }
-        ("pr", "create")
-            if !command
-                .iter()
-                .any(|word| word == "--title" || word == "--fill") =>
-        {
-            return Err("gh pr create requires an explicit title or --fill".to_owned());
-        }
         ("pr", "merge") => {
-            let pull_number = positionals
+            let _pull_number = positionals
                 .first()
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|number| *number > 0)
                 .ok_or_else(|| {
                     "gh pr merge requires an explicit positive numeric pull request ID".to_owned()
                 })?;
-            let strategies = [
-                ("--merge", crate::config::MergeStrategy::Merge),
-                ("--squash", crate::config::MergeStrategy::Squash),
-                ("--rebase", crate::config::MergeStrategy::Rebase),
-            ];
-            let selected = strategies
+            let count = ["--merge", "--squash", "--rebase"]
                 .iter()
-                .filter(|(flag, _)| command.iter().any(|word| word == flag))
-                .map(|(_, strategy)| *strategy)
-                .collect::<Vec<_>>();
-            if selected.len() != 1 {
+                .filter(|flag| command.iter().any(|word| word == *flag))
+                .count();
+            if count != 1 {
                 return Err(
                     "gh pr merge requires exactly one of --merge, --squash, or --rebase".to_owned(),
                 );
             }
-            let _ = pull_number;
-            let _ = selected;
         }
         ("pr", "checkout") => {
-            let number = positionals
+            let _number = positionals
                 .first()
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|number| *number > 0)
@@ -258,10 +488,9 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
                     "gh pr checkout requires an explicit positive numeric pull request ID"
                         .to_owned()
                 })?;
-            let _ = number;
         }
         ("pr", "review") => {
-            let number = positionals
+            let _number = positionals
                 .first()
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|number| *number > 0)
@@ -273,7 +502,10 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
                 .filter(|flag| command.iter().any(|word| word == **flag))
                 .count();
             if events != 1 {
-                return Err("gh pr review requires exactly one of --approve, --request-changes, or --comment".to_owned());
+                return Err(
+                    "gh pr review requires exactly one of --approve, --request-changes, or --comment"
+                        .to_owned(),
+                );
             }
             if command
                 .windows(2)
@@ -282,9 +514,9 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
             {
                 return Err("review body exceeds the size limit".to_owned());
             }
-            if (command
+            if command
                 .iter()
-                .any(|word| word == "--request-changes" || word == "--comment"))
+                .any(|word| word == "--request-changes" || word == "--comment")
                 && !command
                     .windows(2)
                     .any(|pair| pair[0] == "--body" && !pair[1].is_empty())
@@ -293,15 +525,12 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
                     "request-changes and comment reviews require a non-empty --body".to_owned(),
                 );
             }
-            let _ = number;
-        }
-        ("issue", "create") if !command.iter().any(|word| word == "--title") => {
-            return Err("gh issue create requires --title".to_owned());
         }
         _ => {}
     }
+
     let checkout = if command[0] == "pr" && command[1] == "checkout" {
-        let words = positional_words(&command[2..]);
+        let words = audited_positional_words(&command[2..]);
         let pull_number = words
             .first()
             .and_then(|value| value.parse::<u64>().ok())
@@ -321,7 +550,7 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
         None
     };
     let merge = if command[0] == "pr" && command[1] == "merge" {
-        let pull_number = positional_words(&command[2..])[0]
+        let pull_number = audited_positional_words(&command[2..])[0]
             .parse::<u64>()
             .map_err(|_| "gh pr merge pull request ID is invalid".to_owned())?;
         let strategy = if command.iter().any(|word| word == "--merge") {
@@ -343,7 +572,7 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
         None
     };
     let review = if command[0] == "pr" && command[1] == "review" {
-        let words = positional_words(&command[2..]);
+        let words = audited_positional_words(&command[2..]);
         let pull_number = words
             .first()
             .and_then(|value| value.parse::<u64>().ok())
@@ -371,7 +600,7 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
         None
     };
     let asset_upload = if command[0] == "release" && command[1] == "upload" {
-        let positionals = positional_words(&command[2..]);
+        let positionals = audited_positional_words(&command[2..]);
         Some(GhAssetUploadRequest {
             repository: repositories
                 .first()
@@ -387,7 +616,7 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
         None
     };
     let release = if command[0] == "release" && command[1] == "create" {
-        let tag = positional_words(&command[2..])
+        let tag = audited_positional_words(&command[2..])
             .first()
             .ok_or_else(|| "release tag is required".to_owned())?
             .to_string();
@@ -425,20 +654,13 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
     }) {
         return Err("managed release requires bounded title/notes or --generate-notes".to_owned());
     }
-    let clone_directory = if command[0] == "repo" && command[1] == "clone" {
-        let positional = positional_words(&command[2..]);
-        if positional.len() != 2 {
-            return Err("gh repo clone requires an explicit destination directory".to_owned());
-        }
-        Some(std::path::PathBuf::from(positional[1]))
-    } else {
-        None
-    };
     Ok(GhRequest {
         arguments: command.into_iter().map(OsString::from).collect(),
+        selector,
+        flags,
         repositories,
         operation,
-        clone_directory,
+        clone_directory: None,
         merge,
         release,
         asset_upload,
@@ -447,126 +669,231 @@ pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
     })
 }
 
-fn parse_api(words: &[String]) -> Result<ParsedOperation, String> {
+fn parse_api(
+    words: Vec<String>,
+    flags: Vec<String>,
+    inferred_repository: Option<&str>,
+) -> Result<GhRequest, String> {
     let endpoint = words
         .get(1)
-        .ok_or_else(|| "gh api requires an explicit repository endpoint".to_owned())?;
+        .ok_or_else(|| "gh api requires an explicit endpoint".to_owned())?;
     let route = endpoint.strip_prefix('/').unwrap_or(endpoint);
-    if route.starts_with('/') {
-        return Err("gh api endpoint has repeated leading slashes".to_owned());
+    if route.starts_with('/') || route.contains("..") {
+        return Err("gh api endpoint path is ambiguous".to_owned());
     }
+    let mut repositories = Vec::new();
     let mut parts = route.split('/');
-    if parts.next() != Some("repos") {
-        return Err("gh api only supports repository-scoped REST endpoints".to_owned());
+    if parts.next() == Some("repos") {
+        if let (Some(owner), Some(name)) = (parts.next(), parts.next()) {
+            if owner != "{owner}" && name != "{repo}" {
+                let path_part = name.split(['?', '#']).next().unwrap_or(name);
+                if let Ok(repo) = normalize_repository(&format!("{owner}/{path_part}")) {
+                    repositories.push(repo);
+                }
+            } else if let Some(inferred) = inferred_repository {
+                repositories.push(normalize_repository(inferred)?);
+            }
+        }
     }
-    let owner = parts
-        .next()
-        .ok_or_else(|| "gh api endpoint has no repository owner".to_owned())?;
-    let name = parts
-        .next()
-        .ok_or_else(|| "gh api endpoint has no repository name".to_owned())?;
-    let repository = normalize_repository(&format!("{owner}/{name}"))?;
-    let suffix = parts.collect::<Vec<_>>();
-    if suffix.is_empty()
-        || suffix.iter().any(|part| {
-            part.is_empty()
-                || part == &"."
-                || part == &".."
-                || part.bytes().any(|byte| {
-                    !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-                })
-        })
-        || endpoint.contains(['?', '#', '%'])
-    {
-        return Err("gh api endpoint is ambiguous or outside the repository path".to_owned());
-    }
+
     let mut method = "GET";
-    let mut method_seen = false;
-    let mut field_names = BTreeSet::new();
     let mut index = 2;
     while index < words.len() {
         match words[index].as_str() {
-            "--hostname" => {
-                let host = words.get(index + 1).ok_or_else(|| "--hostname requires a value".to_owned())?;
-                if host != "github.com" {
-                    return Err("managed gh supports only github.com".to_owned());
-                }
-                index += 1;
-            }
             "--method" | "-X" => {
-                if method_seen {
-                    return Err("gh api method is specified more than once".to_owned());
-                }
-                method_seen = true;
                 index += 1;
-                method = words.get(index).map(String::as_str).ok_or_else(|| "gh api --method requires a value".to_owned())?;
-                if !matches!(method, "GET" | "POST") {
-                    return Err("gh api permits only GET and constrained create-only POST requests".to_owned());
-                }
+                method = words
+                    .get(index)
+                    .map(String::as_str)
+                    .ok_or_else(|| "gh api --method requires a value".to_owned())?;
             }
-            "--field" | "-F" | "--raw-field" | "-f" => {
-                index += 1;
-                let field = words.get(index).ok_or_else(|| "gh api field option requires key=value".to_owned())?;
-                let (key, value) = field.split_once('=').ok_or_else(|| "gh api fields must use key=value".to_owned())?;
-                if value.is_empty() || value.starts_with('@') || value.contains(['\n', '\r']) {
-                    return Err("gh api file-backed or multiline fields are unsupported".to_owned());
-                }
-                if !field_names.insert(key.to_owned()) {
-                    return Err("duplicate gh api fields are ambiguous and unsupported".to_owned());
-                }
+            _ if words[index].starts_with("--method=") => {
+                method = &words[index]["--method=".len()..];
             }
-            _ => return Err("unsupported gh api option; headers, input files, pagination, GraphQL, and arbitrary methods are denied".to_owned()),
+            _ if words[index].starts_with("-X") && words[index].len() > 2 => {
+                method = &words[index][2..];
+            }
+            _ => {}
         }
         index += 1;
     }
-    let operation = if method == "GET" {
-        if !field_names.is_empty() {
-            return Err("gh api GET does not accept body fields".to_owned());
-        }
+    let selector = if route == "graphql" {
+        "api.graphql".to_owned()
+    } else {
+        format!("api.{}", method.to_ascii_lowercase())
+    };
+    let operation = if method.eq_ignore_ascii_case("GET") {
         GhOperation::Read
     } else {
-        let endpoint_ok = matches!(suffix.as_slice(), ["issues"] | ["pulls"]);
-        let keys_ok = match suffix.as_slice() {
-            ["issues"] => field_names.iter().all(|key| {
-                matches!(
-                    key.as_str(),
-                    "title" | "body" | "assignees" | "labels" | "milestone"
-                )
-            }),
-            ["pulls"] => field_names
-                .iter()
-                .all(|key| matches!(key.as_str(), "title" | "body" | "head" | "base" | "draft")),
-            _ => false,
-        };
-        if !endpoint_ok || !keys_ok {
-            return Err(
-                "gh api POST is restricted to issue, pull-request, and release creation endpoints"
-                    .to_owned(),
-            );
-        }
-        let required = match suffix.as_slice() {
-            ["issues"] | ["pulls"] => "title",
-            _ => unreachable!(),
-        };
-        if !field_names.contains(required) {
-            return Err(format!(
-                "gh api create request requires the `{required}` field"
-            ));
-        }
-        GhOperation::Create
+        GhOperation::General
     };
-    Ok((vec![repository], operation, 0, flags(&[]), flags(&[])))
+    Ok(GhRequest {
+        arguments: words.into_iter().map(OsString::from).collect(),
+        selector,
+        flags,
+        repositories,
+        operation,
+        clone_directory: None,
+        merge: None,
+        release: None,
+        asset_upload: None,
+        review: None,
+        checkout: None,
+    })
 }
 
-fn repo_operand(words: &[String], _max_positionals: usize) -> Result<Vec<String>, String> {
-    let operand = positional_words(words)
-        .into_iter()
-        .next()
-        .ok_or_else(|| "gh command requires an explicit OWNER/REPO target".to_owned())?;
-    Ok(vec![normalize_repository(operand)?])
+fn extract_flags(words: &[String]) -> Vec<String> {
+    let mut flags = Vec::new();
+    for word in words {
+        if word == "--" {
+            break;
+        }
+        if word.starts_with('-') && word.len() > 1 {
+            flags.push(word.clone());
+        }
+    }
+    flags
 }
 
-fn positional_words(words: &[String]) -> Vec<&str> {
+fn find_flag_value<'a>(words: &'a [String], name: &str) -> Option<&'a str> {
+    let mut index = 0;
+    while index < words.len() {
+        if words[index] == "--" {
+            break;
+        }
+        if words[index] == name {
+            return words.get(index + 1).map(String::as_str);
+        }
+        if let Some(value) = words[index].strip_prefix(&format!("{name}=")) {
+            return Some(value);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn extract_repo_flag(words: &[String]) -> Result<Option<String>, String> {
+    let mut repository = None;
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index].as_str();
+        if word == "--" {
+            break;
+        }
+        let candidate = if matches!(word, "--repo" | "-R") {
+            index += 1;
+            words
+                .get(index)
+                .map(String::as_str)
+                .ok_or_else(|| "--repo requires OWNER/REPO".to_owned())?
+        } else if let Some(value) = word.strip_prefix("--repo=") {
+            value
+        } else if let Some(value) = word.strip_prefix("-R") {
+            if value.is_empty() {
+                return Err("-R requires OWNER/REPO".to_owned());
+            }
+            value
+        } else {
+            index += 1;
+            continue;
+        };
+        if repository.is_some() {
+            return Err("gh repository target is specified more than once".to_owned());
+        }
+        repository = Some(normalize_repo_or_url(candidate)?);
+        index += 1;
+    }
+    Ok(repository)
+}
+
+fn normalize_repo_or_url(value: &str) -> Result<String, String> {
+    if value.starts_with("https://") || value.starts_with("ssh://") || value.contains('@') {
+        repository_from_destination(value)
+            .ok_or_else(|| "GitHub target URL is outside github.com or malformed".to_owned())
+    } else {
+        normalize_repository(value)
+    }
+}
+
+fn general_positionals(words: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    let mut after_double_dash = false;
+    while index < words.len() {
+        let word = words[index].as_str();
+        if after_double_dash {
+            positionals.push(word);
+            index += 1;
+            continue;
+        }
+        if word == "--" {
+            after_double_dash = true;
+            index += 1;
+            continue;
+        }
+        if matches!(
+            word,
+            "--repo"
+                | "-R"
+                | "--hostname"
+                | "--org"
+                | "--description"
+                | "--json"
+                | "--jq"
+                | "-q"
+                | "--limit"
+                | "-L"
+                | "--title"
+                | "-t"
+                | "--body"
+                | "-b"
+                | "--body-file"
+                | "-F"
+                | "--base"
+                | "-B"
+                | "--head"
+                | "-H"
+                | "--assignee"
+                | "-a"
+                | "--reviewer"
+                | "-r"
+                | "--label"
+                | "-l"
+                | "--state"
+                | "-s"
+                | "--author"
+                | "-A"
+                | "--milestone"
+                | "-m"
+                | "--notes"
+                | "--notes-file"
+                | "--target"
+                | "--branch"
+                | "--template"
+                | "--workflow"
+                | "-w"
+                | "--dir"
+                | "-D"
+                | "--pattern"
+                | "-p"
+                | "--reason"
+                | "--comment"
+                | "-c"
+        ) {
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        positionals.push(word);
+        index += 1;
+    }
+    positionals
+}
+
+fn audited_positional_words(words: &[String]) -> Vec<&str> {
     let value_options = [
         "--hostname",
         "--repo",
@@ -624,46 +951,7 @@ fn positional_words(words: &[String]) -> Vec<&str> {
     output
 }
 
-fn repo_fork_repositories(words: &[String]) -> Result<Vec<String>, String> {
-    let source = repo_operand(words, 1)?.remove(0);
-    let org = words
-        .windows(2)
-        .find(|pair| pair[0] == "--org")
-        .map(|pair| pair[1].as_str());
-    let Some(org) = org else {
-        return Err(
-            "gh repo fork requires an explicit --org so the fork destination can be checked"
-                .to_owned(),
-        );
-    };
-    let name = source.split_once('/').unwrap().1;
-    let destination = normalize_repository(&format!("{org}/{name}"))?;
-    Ok(vec![source, destination])
-}
-
-fn repo_option(words: &[String]) -> Result<Vec<String>, String> {
-    let mut repository = None;
-    let mut index = 0;
-    while index < words.len() {
-        if matches!(words[index].as_str(), "--repo" | "-R") {
-            index += 1;
-            if repository.is_some() {
-                return Err("gh repository target is specified more than once".to_owned());
-            }
-            repository = Some(normalize_repository(
-                words
-                    .get(index)
-                    .ok_or_else(|| "--repo requires OWNER/REPO".to_owned())?,
-            )?);
-        }
-        index += 1;
-    }
-    repository
-        .map(|repository| vec![repository])
-        .ok_or_else(|| "gh repository operations require explicit --repo OWNER/REPO".to_owned())
-}
-
-fn validate_options(
+fn validate_audited_options(
     words: &[String],
     max_positionals: usize,
     allowed_values: &BTreeSet<&str>,
@@ -674,7 +962,7 @@ fn validate_options(
     let mut index = 0;
     while index < words.len() {
         let word = &words[index];
-        if matches!(word.as_str(), "--hostname") {
+        if word == "--hostname" {
             if words.get(index + 1).is_none_or(|host| host != "github.com") {
                 return Err("managed gh supports only github.com".to_owned());
             }
@@ -702,13 +990,6 @@ fn validate_options(
                     .ok_or_else(|| format!("gh option `{word}` requires a value"))?;
                 if value.is_empty() || value == "--" {
                     return Err(format!("gh option `{word}` requires a non-empty value"));
-                }
-                if word == "--limit"
-                    && value
-                        .parse::<u16>()
-                        .map_or(true, |limit| !(1..=100).contains(&limit))
-                {
-                    return Err("managed gh list limits must be between 1 and 100".to_owned());
                 }
                 index += 2;
                 continue;
@@ -781,7 +1062,7 @@ fn valid_component(value: &str, owner: bool) -> bool {
         && (!owner || !value.contains('_'))
 }
 
-fn flags(values: &[&'static str]) -> BTreeSet<&'static str> {
+fn flag_set(values: &[&'static str]) -> BTreeSet<&'static str> {
     values.iter().copied().collect()
 }
 
@@ -794,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_safe_aliases_and_binds_repository_targets() {
+    fn normalizes_aliases_and_infers_repository_when_provided() {
         let request = parse_words(&[
             "pull-request",
             "ls",
@@ -806,8 +1087,36 @@ mod tests {
         .unwrap();
         assert_eq!(request.arguments[0], "pr");
         assert_eq!(request.arguments[1], "list");
+        assert_eq!(request.selector, "pr.list");
         assert_eq!(request.repositories, ["acme/persona"]);
         assert_eq!(request.operation, GhOperation::Read);
+
+        let inferred = parse_with_inferred_repository(
+            &["pr", "diff", "12"]
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            Some("yanfsb/persona"),
+        )
+        .unwrap();
+        assert_eq!(inferred.selector, "pr.diff");
+        assert_eq!(inferred.repositories, ["yanfsb/persona"]);
+    }
+
+    #[test]
+    fn allows_everyday_gh_subcommands_and_flags_for_policy_evaluation() {
+        let checks = parse_words(&["pr", "checks", "42", "-R", "acme/persona", "-w"]).unwrap();
+        assert_eq!(checks.selector, "pr.checks");
+        assert_eq!(checks.repositories, ["acme/persona"]);
+        assert!(checks.flags.contains(&"-w".to_owned()));
+
+        let run_list = parse_words(&["run", "list", "-R", "acme/persona", "-L", "5"]).unwrap();
+        assert_eq!(run_list.selector, "run.list");
+        assert_eq!(run_list.repositories, ["acme/persona"]);
+
+        let issue_close = parse_words(&["issue", "close", "12", "--repo", "acme/persona"]).unwrap();
+        assert_eq!(issue_close.selector, "issue.close");
+        assert_eq!(issue_close.repositories, ["acme/persona"]);
     }
 
     #[test]
@@ -852,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_checkout_requires_numeric_id_and_explicit_repository() {
+    fn pull_request_checkout_requires_numeric_id_and_repository() {
         let request = parse_words(&[
             "pr",
             "checkout",
@@ -871,16 +1180,6 @@ mod tests {
                 pull_number: 15,
                 branch: Some("feature/review".to_owned())
             })
-        );
-        assert!(
-            parse_words(&[
-                "pr",
-                "checkout",
-                "https://github.com/acme/persona/pull/15",
-                "--repo",
-                "acme/persona"
-            ])
-            .is_err()
         );
         assert!(parse_words(&["pr", "checkout", "15"]).is_err());
     }
@@ -930,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn release_creation_is_typed_and_requires_an_existing_tag_name_and_notes() {
+    fn release_creation_and_upload_preserve_audited_contracts() {
         let request = parse_words(&[
             "release",
             "create",
@@ -957,26 +1256,9 @@ mod tests {
                 generate_notes: false,
             })
         );
-        assert!(
-            parse_words(&[
-                "release",
-                "create",
-                "v1.2.3",
-                "--repo",
-                "acme/persona",
-                "--notes",
-                "notes",
-                "--target",
-                "main"
-            ])
-            .is_err()
-        );
         assert!(parse_words(&["release", "create", "v1.2.3", "--repo", "acme/persona"]).is_err());
-    }
 
-    #[test]
-    fn release_asset_upload_requires_an_explicit_tag_repo_and_file() {
-        let request = parse_words(&[
+        let upload = parse_words(&[
             "release",
             "upload",
             "v1.2.3",
@@ -985,27 +1267,7 @@ mod tests {
             "acme/persona",
         ])
         .unwrap();
-        assert_eq!(request.operation, GhOperation::AuditedReleaseAssetUpload);
-        assert_eq!(
-            request.asset_upload,
-            Some(GhAssetUploadRequest {
-                repository: "acme/persona".to_owned(),
-                tag: "v1.2.3".to_owned(),
-                files: vec![std::path::PathBuf::from("dist.tar.gz")],
-            })
-        );
-        assert!(parse_words(&["release", "upload", "v1", "--repo", "acme/persona"]).is_err());
-        assert!(
-            parse_words(&[
-                "release",
-                "upload",
-                "v1",
-                "dist.tar.gz#label",
-                "--repo",
-                "acme/persona"
-            ])
-            .is_err()
-        );
+        assert_eq!(upload.operation, GhOperation::AuditedReleaseAssetUpload);
         assert!(
             parse_words(&[
                 "release",
@@ -1018,62 +1280,24 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(
-            parse_words(&[
-                "release",
-                "upload",
-                "v1",
-                "dist.tar.gz",
-                "-R",
-                "acme/persona"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_words(&[
-                "release",
-                "upload",
-                "v1",
-                "a.bin",
-                "b.bin",
-                "c.bin",
-                "d.bin",
-                "e.bin",
-                "f.bin",
-                "g.bin",
-                "h.bin",
-                "i.bin",
-                "--repo",
-                "acme/persona"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_words(&[
-                "release",
-                "upload",
-                "v1",
-                "same.bin",
-                "SAME.bin",
-                "--repo",
-                "acme/persona"
-            ])
-            .is_err()
-        );
     }
 
     #[test]
-    fn requires_an_explicit_safe_clone_directory_before_api_delegation() {
-        assert!(parse_words(&["repo", "clone", "acme/persona"]).is_err());
-        let request = parse_words(&["repo", "clone", "acme/persona", "./checkout"]).unwrap();
+    fn clone_derives_target_directory_when_omitted() {
+        let implicit = parse_words(&["repo", "clone", "acme/persona"]).unwrap();
         assert_eq!(
-            request.clone_directory.as_deref(),
+            implicit.clone_directory.as_deref(),
+            Some(std::path::Path::new("persona"))
+        );
+        let explicit = parse_words(&["repo", "clone", "acme/persona", "./checkout"]).unwrap();
+        assert_eq!(
+            explicit.clone_directory.as_deref(),
             Some(std::path::Path::new("./checkout"))
         );
     }
 
     #[test]
-    fn allows_only_creation_api_endpoints_with_typed_required_fields() {
+    fn api_classifies_method_and_extracts_repository_when_present() {
         let request = parse_words(&[
             "api",
             "/repos/acme/persona/issues",
@@ -1084,43 +1308,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(request.repositories, ["acme/persona"]);
-        assert_eq!(request.operation, GhOperation::Create);
-        assert!(parse_words(&["api", "graphql"]).is_err());
-        assert!(parse_words(&["api", "repos/acme/persona/issues", "--method", "DELETE"]).is_err());
-        assert!(
-            parse_words(&[
-                "api",
-                "repos/acme/persona/issues",
-                "--method",
-                "POST",
-                "--field",
-                "title=@secret-file"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_words(&[
-                "api",
-                "repos/acme/persona/releases",
-                "--method",
-                "POST",
-                "--field",
-                "tag_name=v1"
-            ])
-            .is_err()
-        );
-        assert!(parse_words(&["release", "create", "v1", "--repo", "acme/persona"]).is_err());
-        assert!(
-            parse_words(&[
-                "release",
-                "create",
-                "v1",
-                "--repo",
-                "acme/persona",
-                "--verify-tag",
-            ])
-            .is_err()
-        );
+        assert_eq!(request.selector, "api.post");
+
+        let graphql = parse_words(&["api", "graphql"]).unwrap();
+        assert_eq!(graphql.selector, "api.graphql");
     }
 
     #[test]
@@ -1148,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_enterprise_alias_extension_destructive_and_ambiguous_targets() {
+    fn rejects_enterprise_hosts_auth_mutations_and_extensions() {
         assert!(
             parse_words(&[
                 "repo",
@@ -1160,27 +1351,9 @@ mod tests {
             .is_err()
         );
         assert!(parse_words(&["extension", "install", "foo/bar"]).is_err());
-        assert!(parse_words(&["pr", "merge", "2", "--repo", "acme/persona"]).is_err());
+        assert!(parse_words(&["auth", "switch"]).is_err());
+        assert!(parse_words(&["auth", "status"]).is_err());
         assert!(parse_words(&["pr", "view", "2"]).is_err());
-        assert!(parse_words(&["repo", "fork", "acme/persona"]).is_err());
-        assert!(parse_words(&["repo", "view", "https://github.com/acme/persona"]).is_err());
-        assert!(
-            parse_words(&[
-                "issue",
-                "view",
-                "https://github.com/acme/persona/issues/1",
-                "--repo",
-                "acme/persona"
-            ])
-            .is_err()
-        );
-        assert!(parse_words(&["pr", "list", "--repo", "acme/persona", "--limit", "1000"]).is_err());
         assert!(parse_words(&["repo", "create", "acme/persona", "--public", "--private"]).is_err());
-        assert_eq!(
-            parse_words(&["repo", "fork", "acme/source", "--org", "acme-fork"])
-                .unwrap()
-                .repositories,
-            ["acme/source", "acme-fork/source"]
-        );
     }
 }

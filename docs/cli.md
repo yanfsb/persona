@@ -8,11 +8,12 @@ The CLI is implemented in Rust with Clap. `persona --help` and subcommand help a
 |---|---|
 | `persona`, `status`, `check`, `doctor` | Offline diagnostics by default; text or versioned JSON as supported. Push/tag checks consume explicit inputs and apply bounded policy. `check --online-verified` is an explicit GitHub query for outgoing commit verification. |
 | `setup` | Create Persona's private configuration; does not activate a profile or install integrations. |
-| `profile`, `scope` | Inspect/manage private policy. Mutations validate and support preview; see `persona profile --help` and `persona scope --help`. |
+| `profile`, `scope` | Inspect/manage private policy, including `profile commands` for `git`/`gh`/`run` allowlists and denylists; mutations validate and support preview. See `persona profile --help` and `persona scope --help`. |
+| `baseline update` | Update `upstream_baselines` in the active profile to match current remote-tracking refs in Git (`--preview` supported). |
 | `config migrate`, `config rollback` | Explicit policy migration and restoration from a Persona backup. |
-| `run` | Start a program directly, without an implicit shell, with temporary managed PATH adapters. Not a sandbox or network restriction. |
-| `install preview|apply|refresh|remove|rollback` | Preview and manage Persona-owned adapter symlinks in an existing user bin directory; explicit actions only. |
-| `hooks install|remove` | Manage the Persona pre-push hook in one explicitly selected worktree. |
+| `run` | Start a program directly (without an implicit shell), enforcing `[profiles.run]` command rules and adding temporary managed PATH adapters. Not a sandbox or network restriction. |
+| `install preview|apply|refresh|remove|rollback` | Preview and manage Persona-owned adapter symlinks in an existing user bin directory (plus registered worktree hooks on `refresh --apply`); explicit actions only. |
+| `hooks install|refresh|remove` | Manage or refresh the Persona pre-push hook in one explicitly selected worktree. |
 | `auth enroll|verify|unbind` | Explicit account-binding lifecycle. `enroll` contacts GitHub and requires user/online confirmation; `verify` compares local selection without an API call. |
 | `credential-helper get|store|erase` | Bounded Git credential-helper protocol for managed calls. Do not configure globally. |
 | `shell zsh init|marker` | Optional Zsh prompt convenience, not an authorization mechanism. |

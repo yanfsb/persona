@@ -364,10 +364,10 @@ allow = ["status", "branch.list"]
         .output()
         .unwrap();
     assert!(!fetch_denied.status.success());
+    let fetch_stderr = String::from_utf8_lossy(&fetch_denied.stderr);
     assert!(
-        String::from_utf8_lossy(&fetch_denied.stderr).contains("fetch.all` is denied"),
-        "{}",
-        String::from_utf8_lossy(&fetch_denied.stderr)
+        fetch_stderr.contains("fetch.all") && fetch_stderr.contains("not permitted"),
+        "{fetch_stderr}"
     );
     let flag_order_alias = Command::new(bin.join("git"))
         .args(["fetch", "--prune", "--all"])
@@ -384,10 +384,10 @@ allow = ["status", "branch.list"]
         .output()
         .unwrap();
     assert!(!flag_order_alias.status.success());
+    let alias_stderr = String::from_utf8_lossy(&flag_order_alias.stderr);
     assert!(
-        String::from_utf8_lossy(&flag_order_alias.stderr).contains("fetch.all` is denied"),
-        "equivalent flag order must receive the same command policy: {}",
-        String::from_utf8_lossy(&flag_order_alias.stderr)
+        alias_stderr.contains("fetch.all") && alias_stderr.contains("not permitted"),
+        "equivalent flag order must receive the same command policy: {alias_stderr}"
     );
 }
 

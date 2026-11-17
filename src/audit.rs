@@ -1,4 +1,4 @@
-use crate::config::{Config, ScopePolicy, SigningFormat, SigningPolicy};
+use crate::config::{Config, ScopePolicy, SigningFormat, SigningPolicy, UpstreamProvenanceMode};
 use crate::context::resolve_context;
 use crate::git::{CommitIdentity, EffectiveSigning, GitClient, PushTuple, safe_environment};
 use crate::git_command::ExactPushLease;
@@ -15,6 +15,7 @@ pub struct PushRequest {
     pub destination: String,
     pub tuples: Vec<PushTuple>,
     pub leases: Vec<ExactPushLease>,
+    pub allow_unleased_force: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +147,16 @@ pub fn build_report(
     );
     add_publication_finding(&mut findings);
     if let Some(push) = push {
-        add_push_findings(&mut findings, &git, directory, policy, push, executables);
+        let foreign_emails = collect_foreign_profile_emails(config, policy);
+        add_push_findings(
+            &mut findings,
+            &git,
+            directory,
+            policy,
+            push,
+            executables,
+            &foreign_emails,
+        );
         findings.push(Finding::status(
             "git.push.signature.remote_verified",
             Status::Unknown,
@@ -156,6 +166,35 @@ pub fn build_report(
         ));
     }
     Ok((Report::new(findings), selected))
+}
+
+fn collect_foreign_profile_emails(
+    config: &Config,
+    policy: Option<&ScopePolicy>,
+) -> HashSet<String> {
+    let Some(scope_policy) = policy else {
+        return HashSet::new();
+    };
+    if !scope_policy.git.cross_profile_identity_check {
+        return HashSet::new();
+    }
+    let active: HashSet<String> = [
+        scope_policy.git.author.email.to_ascii_lowercase(),
+        scope_policy.git.committer.email.to_ascii_lowercase(),
+    ]
+    .into_iter()
+    .collect();
+    config
+        .profiles()
+        .iter()
+        .flat_map(|profile| {
+            [
+                profile.git.author.email.to_ascii_lowercase(),
+                profile.git.committer.email.to_ascii_lowercase(),
+            ]
+        })
+        .filter(|email| !active.contains(email))
+        .collect()
 }
 
 pub fn build_tag_report(
@@ -1214,6 +1253,7 @@ fn add_push_findings(
     policy: Option<&crate::config::ScopePolicy>,
     request: &PushRequest,
     executables: &ExecutablePaths,
+    foreign_emails: &HashSet<String>,
 ) {
     let audit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let Some(scope_policy) = policy else {
@@ -1231,7 +1271,7 @@ fn add_push_findings(
         return;
     };
 
-    let destination_status = if request.remote != push_policy.remote {
+    let destination_status = if push_policy.remote != "*" && request.remote != push_policy.remote {
         Finding::status(
             "git.push.destination",
             Status::Fail,
@@ -1250,10 +1290,14 @@ fn add_push_findings(
             ),
             Ok(effective)
                 if effective.iter().all(|destination| {
-                    push_policy
-                        .destinations
-                        .iter()
-                        .any(|allowed| allowed == destination)
+                    scope_policy
+                        .git
+                        .permits_push_destination(&request.remote, destination)
+                        && crate::destination::destination_is_permitted(
+                            destination,
+                            &push_policy.destinations,
+                            &scope_policy.git.deny_destinations,
+                        )
                 }) && effective
                     .iter()
                     .any(|destination| destination == &request.destination) =>
@@ -1362,14 +1406,15 @@ fn add_push_findings(
             UpdateClass::AnnotatedTag | UpdateClass::LightweightTag
         ) && !update.remote_oid.bytes().all(|byte| byte == b'0')
         {
-            if !push_policy.allow_force_with_lease {
+            if request.allow_unleased_force && push_policy.allow_force_push {
+                // Force tag update explicitly permitted by policy and command.
+            } else if !push_policy.allow_force_with_lease {
                 add_denied_push_updates(
                     findings,
                     "updating an existing tag requires explicit force-with-lease policy",
                 );
                 return;
-            }
-            if planned.expected_lease_oid() != Some(update.remote_oid.as_str()) {
+            } else if planned.expected_lease_oid() != Some(update.remote_oid.as_str()) {
                 add_unknown_push_updates(
                     findings,
                     "tag update requires an exact lease matching the advertised remote OID",
@@ -1394,6 +1439,8 @@ fn add_push_findings(
                 return;
             }
             UpdateClass::InitialBranch | UpdateClass::FastForwardBranch => {}
+            UpdateClass::RewriteBranch
+                if request.allow_unleased_force && push_policy.allow_force_push => {}
             UpdateClass::RewriteBranch if !push_policy.allow_force_with_lease => {
                 add_denied_push_updates(
                     findings,
@@ -1607,10 +1654,64 @@ fn add_push_findings(
         );
         return;
     }
+    let provenance_mode = push_policy.effective_upstream_provenance();
+    let applicable_baselines = push_policy
+        .upstream_baselines
+        .iter()
+        .filter(|baseline| {
+            baseline.destination == request.destination
+                || crate::destination::destination_matches_pattern(
+                    &request.destination,
+                    &baseline.destination,
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let remote_tracking_tips = match provenance_mode {
+        UpstreamProvenanceMode::RemoteTracking => git
+            .remote_tracking_tips(root, &request.remote)
+            .unwrap_or_default(),
+        UpstreamProvenanceMode::Pinned => {
+            if let Err(reason) =
+                validate_pinned_baselines(git, root, &applicable_baselines, audit_deadline)
+            {
+                add_unknown_push_updates(findings, reason);
+                return;
+            }
+            applicable_baselines
+                .iter()
+                .map(|baseline| baseline.oid.clone())
+                .collect()
+        }
+        UpstreamProvenanceMode::Off => Vec::new(),
+    };
     let _reachable_objects = if reachable_tips.is_empty() {
         Vec::new()
     } else {
-        match git.reachable_publication_objects_many(root, &reachable_tips, audit_deadline) {
+        let excluded_for_objects: Vec<String> = match provenance_mode {
+            UpstreamProvenanceMode::RemoteTracking => remote_tracking_tips.clone(),
+            UpstreamProvenanceMode::Pinned => applicable_baselines
+                .iter()
+                .map(|baseline| baseline.oid.clone())
+                .collect(),
+            UpstreamProvenanceMode::Off => Vec::new(),
+        };
+        let reach_result =
+            git.reachable_publication_objects_many(root, &reachable_tips, audit_deadline);
+        let reach_result = match reach_result {
+            Err(crate::git::GitError::UnsupportedRepository)
+                if !excluded_for_objects.is_empty() =>
+            {
+                git.reachable_publication_objects_excluding(
+                    root,
+                    &reachable_tips,
+                    &excluded_for_objects,
+                    audit_deadline,
+                )
+            }
+            other => other,
+        };
+        match reach_result {
             Ok(graph) if graph.complete => graph.object_ids,
             Ok(_) => {
                 add_unknown_push_updates(
@@ -1628,44 +1729,104 @@ fn add_push_findings(
             }
         }
     };
-    let commits = if commit_updates.is_empty() {
-        Vec::new()
+    let (commits, trusted_upstream) = if commit_updates.is_empty() {
+        (Vec::new(), HashSet::new())
     } else {
-        match git.outgoing_commit_identities_many(root, &commit_updates, audit_deadline) {
-            Ok(commits) => commits,
-            Err(error) => {
-                add_unknown_push_updates(
-                    findings,
-                    format!("outgoing commit bounds or metadata are incomplete offline: {error:?}"),
-                );
-                return;
+        match provenance_mode {
+            UpstreamProvenanceMode::Pinned => {
+                match git.outgoing_commit_identities_many(root, &commit_updates, audit_deadline) {
+                    Ok(commits) => {
+                        let trusted = match pinned_upstream_commits(
+                            git,
+                            root,
+                            &commits,
+                            &applicable_baselines,
+                            audit_deadline,
+                        ) {
+                            Ok(trusted) => trusted,
+                            Err(reason) => {
+                                add_unknown_push_updates(findings, reason);
+                                return;
+                            }
+                        };
+                        (commits, trusted)
+                    }
+                    Err(crate::git::GitError::UnsupportedRepository)
+                        if !remote_tracking_tips.is_empty() =>
+                    {
+                        match git.outgoing_commit_identities_excluding(
+                            root,
+                            &commit_updates,
+                            &remote_tracking_tips,
+                            audit_deadline,
+                        ) {
+                            Ok(commits) => (commits, HashSet::new()),
+                            Err(error) => {
+                                add_unknown_push_updates(
+                                    findings,
+                                    format!(
+                                        "outgoing commit bounds or metadata are incomplete offline: {error:?}"
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        add_unknown_push_updates(
+                            findings,
+                            format!(
+                                "outgoing commit bounds or metadata are incomplete offline: {error:?}"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+            UpstreamProvenanceMode::RemoteTracking => {
+                match git.outgoing_commit_identities_excluding(
+                    root,
+                    &commit_updates,
+                    &remote_tracking_tips,
+                    audit_deadline,
+                ) {
+                    Ok(commits) => (commits, HashSet::new()),
+                    Err(error) => {
+                        add_unknown_push_updates(
+                            findings,
+                            format!(
+                                "outgoing commit bounds or metadata are incomplete offline: {error:?}"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+            UpstreamProvenanceMode::Off => {
+                match git.outgoing_commit_identities_many(root, &commit_updates, audit_deadline) {
+                    Ok(commits) => (commits, HashSet::new()),
+                    Err(error) => {
+                        add_unknown_push_updates(
+                            findings,
+                            format!(
+                                "outgoing commit bounds or metadata are incomplete offline: {error:?}"
+                            ),
+                        );
+                        return;
+                    }
+                }
             }
         }
     };
-    let applicable_baselines = push_policy
-        .upstream_baselines
-        .iter()
-        .filter(|baseline| baseline.destination == request.destination)
-        .cloned()
-        .collect::<Vec<_>>();
-    let trusted_upstream =
-        match pinned_upstream_commits(git, root, &commits, &applicable_baselines, audit_deadline) {
-            Ok(commits) => commits,
-            Err(reason) => {
-                add_unknown_push_updates(findings, reason);
-                return;
-            }
-        };
-    findings.push(if applicable_baselines.is_empty() {
-        Finding::status(
+    findings.push(match provenance_mode {
+        UpstreamProvenanceMode::Pinned if applicable_baselines.is_empty() => Finding::status(
             "git.push.provenance",
             Status::Unknown,
             None,
             None,
             "no explicitly pinned upstream provenance baseline is configured",
-        )
-    } else {
-        Finding::pass(
+        ),
+        UpstreamProvenanceMode::Pinned => Finding::pass(
             "git.push.provenance",
             "only commits ancestral to pinned baselines may use upstream identity provenance",
             format!(
@@ -1673,7 +1834,20 @@ fn add_push_findings(
                 trusted_upstream.len()
             ),
             "baseline identity exemptions are limited to the exact pinned destination, tracking ref, and object ID; unmatched commits remain subject to local identity policy",
-        )
+        ),
+        UpstreamProvenanceMode::RemoteTracking => Finding::pass(
+            "git.push.provenance",
+            "commits already on remote-tracking refs are treated as upstream history; local new commits satisfy active profile policy",
+            format!("{} unpushed outgoing commit(s) inspected", commits.len()),
+            "remote-tracking refs exempt existing upstream history while local commits and cross-profile leak checks are enforced",
+        ),
+        UpstreamProvenanceMode::Off => Finding::status(
+            "git.push.provenance",
+            Status::Unknown,
+            None,
+            None,
+            "no explicitly pinned upstream provenance baseline is configured",
+        ),
     });
     add_push_identity_findings(
         findings,
@@ -1682,6 +1856,7 @@ fn add_push_findings(
         &scope_policy.git.committer,
         push_policy.preserve_authors,
         &trusted_upstream,
+        foreign_emails,
         request.tuples.len(),
     );
     // Commits already reachable from an exact, preflight-validated pinned
@@ -1705,13 +1880,12 @@ fn add_push_findings(
     );
 }
 
-fn pinned_upstream_commits(
+fn validate_pinned_baselines(
     git: &GitClient,
     root: &Path,
-    commits: &[CommitIdentity],
     baselines: &[crate::config::UpstreamBaseline],
     deadline: std::time::Instant,
-) -> Result<HashSet<String>, String> {
+) -> Result<(), String> {
     for baseline in baselines {
         if std::time::Instant::now() >= deadline {
             return Err(
@@ -1725,6 +1899,17 @@ fn pinned_upstream_commits(
             return Err("pinned upstream tracking ref moved; explicitly update the baseline before publishing".to_owned());
         }
     }
+    Ok(())
+}
+
+fn pinned_upstream_commits(
+    git: &GitClient,
+    root: &Path,
+    commits: &[CommitIdentity],
+    baselines: &[crate::config::UpstreamBaseline],
+    deadline: std::time::Instant,
+) -> Result<HashSet<String>, String> {
+    validate_pinned_baselines(git, root, baselines, deadline)?;
     let mut trusted = HashSet::new();
     for commit in commits {
         if std::time::Instant::now() >= deadline {
@@ -1752,6 +1937,7 @@ fn pinned_upstream_commits(
     Ok(trusted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_push_identity_findings(
     findings: &mut Vec<Finding>,
     commits: &[CommitIdentity],
@@ -1759,8 +1945,17 @@ fn add_push_identity_findings(
     expected_committer: &crate::config::Identity,
     preserve_authors: bool,
     trusted_upstream: &HashSet<String>,
+    foreign_emails: &HashSet<String>,
     update_count: usize,
 ) {
+    let leaked_author = commits.iter().find(|commit| {
+        !trusted_upstream.contains(&commit.oid)
+            && foreign_emails.contains(&commit.author.email.to_ascii_lowercase())
+    });
+    let leaked_committer = commits.iter().find(|commit| {
+        !trusted_upstream.contains(&commit.oid)
+            && foreign_emails.contains(&commit.committer.email.to_ascii_lowercase())
+    });
     let bad_author = (!preserve_authors)
         .then(|| {
             commits.iter().find(|commit| {
@@ -1771,7 +1966,17 @@ fn add_push_identity_findings(
     let bad_committer = commits.iter().find(|commit| {
         &commit.committer != expected_committer && !trusted_upstream.contains(&commit.oid)
     });
-    findings.push(if bad_author.is_none() {
+    findings.push(if let Some(_leak) = leaked_author {
+        Finding::status(
+            "git.push.author",
+            Status::Fail,
+            Some("no outgoing commit author belongs to another Persona profile".to_owned()),
+            Some(
+                "at least one outgoing commit author belongs to another Persona profile".to_owned(),
+            ),
+            "an outgoing commit author leaks another Persona profile's identity",
+        )
+    } else if bad_author.is_none() {
         Finding::status(
             "git.push.author",
             Status::Pass,
@@ -1796,7 +2001,18 @@ fn add_push_identity_findings(
             "an outgoing commit author did not match the explicit scope policy",
         )
     });
-    findings.push(if bad_committer.is_none() {
+    findings.push(if let Some(_leak) = leaked_committer {
+        Finding::status(
+            "git.push.committer",
+            Status::Fail,
+            Some("no outgoing commit committer belongs to another Persona profile".to_owned()),
+            Some(
+                "at least one outgoing commit committer belongs to another Persona profile"
+                    .to_owned(),
+            ),
+            "an outgoing commit committer leaks another Persona profile's identity",
+        )
+    } else if bad_committer.is_none() {
         Finding::status(
             "git.push.committer",
             Status::Pass,

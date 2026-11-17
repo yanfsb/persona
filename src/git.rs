@@ -323,6 +323,70 @@ impl GitClient {
         Ok(eligible)
     }
 
+    /// Return `(refname, oid)` for all remote-tracking branches of `remote` (or all remotes if `*`).
+    pub fn remote_tracking_refs(
+        &self,
+        directory: &Path,
+        remote: &str,
+    ) -> Result<Vec<(String, String)>, GitError> {
+        self.validate_environment()?;
+        let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
+        let prefix = if remote == "*" {
+            "refs/remotes/".to_owned()
+        } else {
+            if remote.is_empty()
+                || remote.len() > 128
+                || !remote
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(GitError::InvalidPushConfig);
+            }
+            format!("refs/remotes/{remote}/")
+        };
+        let output = self.run(
+            &directory,
+            [
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                prefix.as_str(),
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(GitError::CommandFailed(output.status.code()));
+        }
+        let text = String::from_utf8(output.stdout).map_err(|_| GitError::InvalidOutput)?;
+        let mut refs = Vec::new();
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((refname, oid)) = line.split_once(' ') else {
+                return Err(GitError::InvalidOutput);
+            };
+            if is_oid(oid) && !is_zero_oid(oid) {
+                refs.push((refname.to_owned(), oid.to_owned()));
+            }
+        }
+        Ok(refs)
+    }
+
+    pub fn remote_tracking_tips(
+        &self,
+        directory: &Path,
+        remote: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let refs = self.remote_tracking_refs(directory, remote)?;
+        let mut tips = Vec::with_capacity(refs.len());
+        let mut seen = std::collections::HashSet::new();
+        for (_, oid) in refs {
+            if seen.insert(oid.clone()) {
+                tips.push(oid);
+            }
+        }
+        Ok(tips)
+    }
+
     /// Return configured remote names after validating their bounded syntax.
     pub fn configured_remotes(&self, directory: &Path) -> Result<Vec<String>, GitError> {
         self.validate_environment()?;
@@ -560,6 +624,15 @@ impl GitClient {
     }
 
     pub fn has_unsafe_https_transport_config(&self, directory: &Path) -> Result<bool, GitError> {
+        self.has_unsafe_https_transport_config_with_options(directory, true, true)
+    }
+
+    pub fn has_unsafe_https_transport_config_with_options(
+        &self,
+        directory: &Path,
+        strict_filters: bool,
+        strict_merge: bool,
+    ) -> Result<bool, GitError> {
         self.validate_environment()?;
         let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
         let mut output = self.run(
@@ -571,7 +644,11 @@ impl GitClient {
             return Err(GitError::CommandFailed(output.status.code()));
         }
         let unsafe_config =
-            crate::git_https::contains_unsafe_transport_config_key_names(&output.stdout);
+            crate::git_https::contains_unsafe_transport_config_key_names_with_options(
+                &output.stdout,
+                strict_filters,
+                strict_merge,
+            );
         output.stdout.fill(0);
         Ok(unsafe_config)
     }
@@ -769,6 +846,16 @@ impl GitClient {
         oids: &[String],
         deadline: std::time::Instant,
     ) -> Result<ReachableObjects, GitError> {
+        self.reachable_publication_objects_excluding(directory, oids, &[], deadline)
+    }
+
+    pub fn reachable_publication_objects_excluding(
+        &self,
+        directory: &Path,
+        oids: &[String],
+        excluded_tips: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<ReachableObjects, GitError> {
         ensure_git_deadline(deadline)?;
         self.validate_environment()?;
         let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
@@ -784,6 +871,16 @@ impl GitClient {
             OsString::from("--missing=print"),
         ];
         arguments.extend(oids.iter().map(OsString::from));
+        let valid_excluded = excluded_tips
+            .iter()
+            .filter(|oid| is_oid(oid) && !is_zero_oid(oid))
+            .collect::<Vec<_>>();
+        if !valid_excluded.is_empty() {
+            arguments.push(OsString::from("--not"));
+            for oid in valid_excluded {
+                arguments.push(OsString::from(oid));
+            }
+        }
         let output = self.run_owned(&directory, &arguments)?;
         ensure_git_deadline(deadline)?;
         if !output.status.success() {
@@ -809,19 +906,21 @@ impl GitClient {
             }
         }
         let object_ids = object_ids.into_iter().collect::<Vec<_>>();
-        if complete {
+        if complete && !object_ids.is_empty() {
             self.reachable_publication_object_bytes(&directory, &object_ids, deadline)?;
         }
-        let mut fsck_arguments = vec![
-            OsString::from("fsck"),
-            OsString::from("--no-reflogs"),
-            OsString::from("--no-progress"),
-        ];
-        fsck_arguments.extend(oids.iter().map(OsString::from));
-        let fsck = self.run_owned(&directory, &fsck_arguments)?;
-        ensure_git_deadline(deadline)?;
-        if !fsck.status.success() {
-            return Err(GitError::MissingObject);
+        if excluded_tips.is_empty() {
+            let mut fsck_arguments = vec![
+                OsString::from("fsck"),
+                OsString::from("--no-reflogs"),
+                OsString::from("--no-progress"),
+            ];
+            fsck_arguments.extend(oids.iter().map(OsString::from));
+            let fsck = self.run_owned(&directory, &fsck_arguments)?;
+            ensure_git_deadline(deadline)?;
+            if !fsck.status.success() {
+                return Err(GitError::MissingObject);
+            }
         }
         Ok(ReachableObjects {
             object_ids,
@@ -974,6 +1073,16 @@ impl GitClient {
         updates: &[PushTuple],
         deadline: std::time::Instant,
     ) -> Result<Vec<CommitIdentity>, GitError> {
+        self.outgoing_commit_identities_excluding(directory, updates, &[], deadline)
+    }
+
+    pub fn outgoing_commit_identities_excluding(
+        &self,
+        directory: &Path,
+        updates: &[PushTuple],
+        excluded_tips: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<CommitIdentity>, GitError> {
         ensure_git_deadline(deadline)?;
         self.validate_environment()?;
         let directory = crate::paths::canonical_directory(directory).map_err(GitError::Path)?;
@@ -995,13 +1104,20 @@ impl GitClient {
             .iter()
             .filter(|update| !is_zero_oid(&update.remote_oid))
             .collect::<Vec<_>>();
-        if !excluded.is_empty() {
+        let extra_excluded = excluded_tips
+            .iter()
+            .filter(|oid| is_oid(oid) && !is_zero_oid(oid))
+            .collect::<Vec<_>>();
+        if !excluded.is_empty() || !extra_excluded.is_empty() {
             args.push(OsString::from("--not"));
             for update in excluded {
                 if !is_oid(&update.remote_oid) {
                     return Err(GitError::MissingObject);
                 }
                 args.push(OsString::from(&update.remote_oid));
+            }
+            for oid in extra_excluded {
+                args.push(OsString::from(oid));
             }
         }
         let output = self.run_owned(&directory, &args)?;

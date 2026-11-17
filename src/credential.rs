@@ -205,6 +205,8 @@ impl GithubSelector {
             account_selector: Some(account_selector.to_owned()),
             token_fingerprint: fingerprint,
             repositories: Vec::new(),
+            deny_repositories: Vec::new(),
+            commands: Default::default(),
         })
     }
 

@@ -25,6 +25,16 @@ pub const fn required_git_http_overrides() -> [(&'static str, &'static str); 9] 
 /// are inspected. These settings can inject credentials, helpers, proxy routes,
 /// custom trust roots, cookies, or redirects into an HTTPS transport.
 pub fn contains_unsafe_transport_config_key_names(names: &[u8]) -> bool {
+    contains_unsafe_transport_config_key_names_with_options(names, true, true)
+}
+
+/// Inspect local/worktree config key names for transport-hijacking settings,
+/// optionally gating filter/textconv and merge-driver keys behind policy toggles.
+pub fn contains_unsafe_transport_config_key_names_with_options(
+    names: &[u8],
+    strict_filters: bool,
+    strict_merge: bool,
+) -> bool {
     let Ok(names) = std::str::from_utf8(names) else {
         return true;
     };
@@ -45,12 +55,13 @@ pub fn contains_unsafe_transport_config_key_names(names: &[u8]) -> bool {
                     .any(|suffix| name.ends_with(suffix)))
             || name == "core.sshcommand"
             || name == "core.fsmonitor"
-            || (name.starts_with("filter.")
-                && [".clean", ".smudge", ".process"]
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix)))
-            || (name.starts_with("diff.") && name.ends_with(".textconv"))
-            || (name.starts_with("merge.") && name.ends_with(".driver"))
+            || (strict_filters
+                && ((name.starts_with("filter.")
+                    && [".clean", ".smudge", ".process"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix)))
+                    || (name.starts_with("diff.") && name.ends_with(".textconv"))))
+            || (strict_merge && name.starts_with("merge.") && name.ends_with(".driver"))
             || (name.starts_with("http.")
                 && [
                     ".extraheader",
@@ -182,6 +193,17 @@ pub fn select_https_credential(
     allowed_destinations: &[String],
     selector: &GithubSelector,
 ) -> Result<Option<Secret>, HttpsCredentialError> {
+    select_https_credential_with_denies(action, input, binding, allowed_destinations, &[], selector)
+}
+
+pub fn select_https_credential_with_denies(
+    action: &str,
+    input: &[u8],
+    binding: &GitHubBinding,
+    allowed_destinations: &[String],
+    denied_destinations: &[String],
+    selector: &GithubSelector,
+) -> Result<Option<Secret>, HttpsCredentialError> {
     match action {
         "store" | "erase" => return Ok(None),
         "get" => {}
@@ -194,9 +216,26 @@ pub fn select_https_credential(
     if request.host != binding.host {
         return Err(HttpsCredentialError::DestinationNotAllowed);
     }
+    let actual_url = format!("https://{}/{}", request.host, request.path);
+    if denied_destinations
+        .iter()
+        .any(|pattern| crate::destination::destination_matches_pattern(&actual_url, pattern))
+    {
+        return Err(HttpsCredentialError::DestinationNotAllowed);
+    }
+    if let Some(repo) = crate::gh_adapter::repository_from_destination(&actual_url) {
+        if binding
+            .deny_repositories
+            .iter()
+            .any(|pattern| crate::destination::repository_matches_pattern(&repo, pattern))
+        {
+            return Err(HttpsCredentialError::DestinationNotAllowed);
+        }
+    }
     let allowed = allowed_destinations.iter().any(|destination| {
         parse_https_destination(destination)
             .is_ok_and(|(host, path)| host == request.host && path == request.path)
+            || crate::destination::destination_matches_pattern(&actual_url, destination)
     });
     if !allowed {
         return Err(HttpsCredentialError::DestinationNotAllowed);
@@ -218,8 +257,34 @@ pub fn handle_credential_helper<W: Write>(
     selector: &GithubSelector,
     output: &mut W,
 ) -> Result<(), HttpsCredentialError> {
-    let Some(token) =
-        select_https_credential(action, input, binding, allowed_destinations, selector)?
+    handle_credential_helper_with_denies(
+        action,
+        input,
+        binding,
+        allowed_destinations,
+        &[],
+        selector,
+        output,
+    )
+}
+
+pub fn handle_credential_helper_with_denies<W: Write>(
+    action: &str,
+    input: &[u8],
+    binding: &GitHubBinding,
+    allowed_destinations: &[String],
+    denied_destinations: &[String],
+    selector: &GithubSelector,
+    output: &mut W,
+) -> Result<(), HttpsCredentialError> {
+    let Some(token) = select_https_credential_with_denies(
+        action,
+        input,
+        binding,
+        allowed_destinations,
+        denied_destinations,
+        selector,
+    )?
     else {
         return Ok(());
     };

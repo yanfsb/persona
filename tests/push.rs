@@ -612,6 +612,7 @@ fn offline_rewrite_audit_requires_exact_command_bound_lease() {
             remote_ref: "refs/heads/main".into(),
             expected_oid,
         }],
+        allow_unleased_force: false,
     };
     let (matching, _) = persona::audit::build_report(
         &config,
@@ -927,4 +928,85 @@ fn destination_policy_is_checked_after_push_rewrite_without_network() {
         rewritten,
     );
     assert_eq!(finding(&report, "git.push.destination")["status"], "PASS");
+}
+
+#[test]
+fn cross_profile_identity_check_blocks_other_profile_commits_even_with_preserve_authors() {
+    let fixture = Fixture::new();
+    let opsec_initial = fixture.commit("Good Author", "opsec@example.invalid");
+    success(run_git(&fixture.repo, &["push", "origin", "HEAD:main"]));
+    success(run_git(&fixture.repo, &["fetch", "origin"]));
+
+    // Commit authored with another configured profile's email ("yanfsb@example.invalid").
+    let leaked_commit = fixture.commit("yanfsb", "yanfsb@example.invalid");
+    let yanfsb_dir = fixture._temporary.path().join("yanfsb-repo");
+    fs::create_dir_all(&yanfsb_dir).unwrap();
+    let yanfsb_root = yanfsb_dir.to_string_lossy();
+    let root = fixture.repo.to_string_lossy();
+    let remote = fixture.remote.to_string_lossy();
+    fs::write(
+        &fixture.policy,
+        format!(
+            r#"version = 3
+
+[[profiles]]
+name = "yanfsb"
+[profiles.git]
+author = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
+committer = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
+
+[[profiles]]
+name = "opsec"
+[profiles.git]
+author = {{ name = "Good Author", email = "opsec@example.invalid" }}
+committer = {{ name = "Good Author", email = "opsec@example.invalid" }}
+cross_profile_identity_check = true
+[profiles.git.push]
+remote = "origin"
+destinations = ["{remote}"]
+preserve_authors = true
+allow_initial_push = true
+allow_fast_forward = true
+upstream_provenance = "remote_tracking"
+
+[[scopes]]
+name = "opsec-repo"
+path = "{root}"
+profile = "opsec"
+
+[[scopes]]
+name = "yanfsb-repo"
+path = "{yanfsb_root}"
+profile = "yanfsb"
+"#
+        ),
+    )
+    .expect("multi-profile policy");
+
+    let report = fixture.run_audit(
+        &format!("refs/heads/main {leaked_commit} refs/heads/main {opsec_initial}\n"),
+        &fixture.remote.to_string_lossy(),
+    );
+    assert_eq!(report["verdict"], "BLOCK");
+    assert_eq!(finding(&report, "git.push.author")["status"], "FAIL");
+    assert!(
+        finding(&report, "git.push.author")["coverage_reason"]
+            .as_str()
+            .unwrap()
+            .contains("leaks another Persona profile")
+    );
+
+    // An upstream commit already present on refs/remotes/origin/main (even from another author)
+    // is respected by `remote_tracking` provenance without stale pinned OIDs.
+    success(run_git(&fixture.repo, &["reset", "--hard", &opsec_initial]));
+    let clean_opsec = fixture.commit("opsec", "opsec@example.invalid");
+    let clean_report = fixture.run_audit(
+        &format!("refs/heads/main {clean_opsec} refs/heads/main {opsec_initial}\n"),
+        &fixture.remote.to_string_lossy(),
+    );
+    assert_eq!(clean_report["verdict"], "ALLOW", "{clean_report:#}");
+    assert_eq!(
+        finding(&clean_report, "git.push.provenance")["status"],
+        "PASS"
+    );
 }

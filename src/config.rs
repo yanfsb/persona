@@ -1,6 +1,21 @@
+pub use crate::command_policy::{CommandPolicy, CommandPolicyMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+pub type GitCommandPolicy = CommandPolicy;
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -21,6 +36,8 @@ pub struct Profile {
     pub ssh: Option<SshPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_merge: Option<GitHubMergePolicy>,
+    #[serde(default, skip_serializing_if = "CommandPolicy::is_default")]
+    pub run: CommandPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -33,9 +50,25 @@ pub struct GitHubBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_selector: Option<String>,
     pub token_fingerprint: String,
-    /// Explicit GitHub.com repositories this profile may address, in OWNER/REPO form.
+    /// GitHub.com repositories or owner wildcards (`OWNER/REPO`, `OWNER/*`, `*`) this profile may address.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repositories: Vec<String>,
+    /// Explicitly denied GitHub.com repositories or owner wildcards; always takes precedence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_repositories: Vec<String>,
+    /// Optional allowlist/denylist for managed `gh` subcommands.
+    #[serde(default, skip_serializing_if = "CommandPolicy::is_default")]
+    pub commands: CommandPolicy,
+}
+
+impl GitHubBinding {
+    pub fn permits_repository(&self, repository: &str) -> bool {
+        crate::destination::repository_is_permitted(
+            repository,
+            &self.repositories,
+            &self.deny_repositories,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -68,87 +101,35 @@ pub struct GitPolicy {
     pub push: Option<PushPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remotes: Vec<RemotePolicy>,
-    #[serde(default, skip_serializing_if = "GitCommandPolicy::is_default")]
-    pub commands: GitCommandPolicy,
-}
-
-/// Optional allowlist and denylist for supported managed Git operations.
-/// These lists restrict the adapter's existing command surface; they never
-/// enable native pass-through or skip operation-specific security checks.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct GitCommandPolicy {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allow: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny: Vec<String>,
+    pub deny_destinations: Vec<String>,
+    #[serde(default, skip_serializing_if = "CommandPolicy::is_default")]
+    pub commands: CommandPolicy,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict_repo_hooks: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict_git_filters: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict_merge_drivers: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub inherit_git_config: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub cross_profile_identity_check: bool,
 }
 
-impl GitCommandPolicy {
-    fn is_default(&self) -> bool {
-        self.allow.is_none() && self.deny.is_empty()
-    }
-
-    pub fn permits(&self, selector: &str) -> bool {
-        if !GIT_COMMAND_SELECTORS.contains(&selector) {
-            return false;
-        }
-        let broad = selector.split_once('.').map(|(command, _)| command);
-        if self
-            .deny
-            .iter()
-            .any(|entry| entry == selector || broad.is_some_and(|command| entry == command))
-        {
-            return false;
-        }
-        self.allow.as_ref().is_none_or(|allowed| {
-            allowed
-                .iter()
-                .any(|entry| entry == selector || broad.is_some_and(|command| entry == command))
-        })
-    }
-
-    fn is_valid(&self) -> bool {
-        let valid = |values: &[String]| {
-            let mut seen = HashSet::new();
-            values
-                .iter()
-                .all(|value| GIT_COMMAND_SELECTORS.contains(&value.as_str()) && seen.insert(value))
-        };
-        self.allow.as_deref().is_none_or(valid) && valid(&self.deny)
-    }
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProvenanceMode {
+    /// Trust commits reachable from `refs/remotes/<remote>/*` tracking refs, while
+    /// enforcing active profile identity/signing on local commits and blocking
+    /// cross-profile identity leaks.
+    #[default]
+    RemoteTracking,
+    /// Trust only commits ancestral to explicitly pinned `upstream_baselines` OIDs.
+    Pinned,
+    /// Do not exempt upstream commits; enforce local policy on all outgoing commits.
+    Off,
 }
-
-const GIT_COMMAND_SELECTORS: &[&str] = &[
-    "status",
-    "diff",
-    "show",
-    "add",
-    "restore",
-    "rm",
-    "remote.add",
-    "init",
-    "commit",
-    "log",
-    "branch.list",
-    "branch.create",
-    "switch",
-    "checkout",
-    "merge",
-    "cherry-pick",
-    "rebase",
-    "worktree.list",
-    "worktree.add",
-    "tag.list",
-    "tag.signed",
-    "tag.lightweight",
-    "fetch",
-    "fetch.all",
-    "pull",
-    "push",
-    "clone",
-    "rev-parse",
-];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -185,9 +166,9 @@ pub enum MergeStrategy {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct PushPolicy {
-    /// Exact remote name accepted by the push audit.
+    /// Exact remote name (or `*` for any matching remote) accepted by the push audit.
     pub remote: String,
-    /// Exact effective destinations accepted by the push audit.
+    /// Allowed destinations or wildcard destination patterns accepted by the push audit.
     pub destinations: Vec<String>,
     /// Explicitly permits upstream/cherry-picked author identities to be preserved.
     pub preserve_authors: bool,
@@ -203,9 +184,18 @@ pub struct PushPolicy {
     pub allow_branch_deletion: bool,
     /// Permit tag ref deletion only by explicit opt-in.
     pub allow_tag_deletion: bool,
-    /// Permit rewrites only with a separately captured expected remote OID lease.
+    /// Permit rewrites with an expected remote OID lease.
     pub allow_force_with_lease: bool,
-    /// Explicitly pinned remote-tracking baselines; these are never inferred from Git config.
+    /// Permit unleased force updates (`--force` / `+refspec`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_force_push: bool,
+    /// Require an explicit zero-OID `--force-with-lease` when creating a new remote tag.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_tag_lease_on_create: bool,
+    /// How upstream commit provenance is checked during push audits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provenance: Option<UpstreamProvenanceMode>,
+    /// Explicitly pinned remote-tracking baselines; required when `upstream_provenance = "pinned"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstream_baselines: Vec<UpstreamBaseline>,
 }
@@ -216,6 +206,17 @@ pub struct UpstreamBaseline {
     pub destination: String,
     pub tracking_ref: String,
     pub oid: String,
+}
+
+impl PushPolicy {
+    pub fn effective_upstream_provenance(&self) -> UpstreamProvenanceMode {
+        self.upstream_provenance
+            .unwrap_or(if self.upstream_baselines.is_empty() {
+                UpstreamProvenanceMode::RemoteTracking
+            } else {
+                UpstreamProvenanceMode::Pinned
+            })
+    }
 }
 
 impl Default for PushPolicy {
@@ -231,6 +232,9 @@ impl Default for PushPolicy {
             allow_branch_deletion: false,
             allow_tag_deletion: false,
             allow_force_with_lease: false,
+            allow_force_push: false,
+            require_tag_lease_on_create: false,
+            upstream_provenance: None,
             upstream_baselines: Vec::new(),
         }
     }
@@ -336,6 +340,7 @@ pub enum ConfigError {
     InvalidGithubMergePolicy { profile: String },
     InvalidRemotePolicy { scope: String },
     InvalidGitCommandPolicy { scope: String },
+    InvalidRunCommandPolicy { profile: String },
     InvalidSshPolicy { profile: String },
 }
 
@@ -385,6 +390,7 @@ impl Config {
         validate_github_binding(&profile)?;
         validate_ssh_policy(&profile)?;
         validate_github_merge_policy(&profile)?;
+        validate_run_command_policy(&profile)?;
         Ok(Self {
             version: 3,
             profiles: vec![profile.clone()],
@@ -409,6 +415,7 @@ impl Config {
         validate_github_binding(&profile)?;
         validate_ssh_policy(&profile)?;
         validate_github_merge_policy(&profile)?;
+        validate_run_command_policy(&profile)?;
         self.profiles.push(profile);
         self.version = 3;
         Ok(())
@@ -425,7 +432,9 @@ impl Config {
         validate_github_binding(&profile)?;
         validate_ssh_policy(&profile)?;
         validate_github_merge_policy(&profile)?;
+        validate_run_command_policy(&profile)?;
         validate_git_command_policy(&profile.name, &profile.git.commands)?;
+        validate_git_policy(&profile.name, &profile.git)?;
         for scope in self
             .scopes
             .iter()
@@ -648,6 +657,7 @@ impl Config {
                 github: None,
                 ssh: None,
                 github_merge: None,
+                run: CommandPolicy::default(),
             });
             scope_profiles.push(scope.name.clone());
             scopes.push(ScopePolicy {
@@ -687,6 +697,7 @@ impl Config {
             validate_git_command_policy(&profile.name, &profile.git.commands)?;
             validate_ssh_policy(profile)?;
             validate_github_merge_policy(profile)?;
+            validate_run_command_policy(profile)?;
             if profile.name.trim().is_empty() || profile.name.trim() != profile.name {
                 return Err(ConfigError::InvalidProfileName);
             }
@@ -748,11 +759,13 @@ impl Config {
             validate_git_command_policy(&profile.name, &profile.git.commands)?;
             validate_ssh_policy(profile)?;
             validate_github_merge_policy(profile)?;
-            if profile.git.push.as_ref().is_some_and(|push| {
-                !profile.git.remotes.iter().any(|remote| {
-                    remote.name == push.remote && remote.push_destinations == push.destinations
-                })
-            }) {
+            validate_run_command_policy(profile)?;
+            if profile
+                .git
+                .push
+                .as_ref()
+                .is_some_and(|push| !push_matches_remotes(push, &profile.git.remotes))
+            {
                 return Err(ConfigError::InvalidRemotePolicy {
                     scope: profile.name.clone(),
                 });
@@ -794,6 +807,80 @@ impl Config {
             profiles: config.profiles,
             scope_profiles,
             scopes,
+        })
+    }
+}
+
+impl GitPolicy {
+    pub fn configured_fetch_destinations(&self, remote_name: &str) -> Option<&[String]> {
+        self.remotes
+            .iter()
+            .find(|remote| remote.name == remote_name)
+            .or_else(|| self.remotes.iter().find(|remote| remote.name == "*"))
+            .map(|remote| remote.fetch_destinations.as_slice())
+            .or_else(|| {
+                self.push
+                    .as_ref()
+                    .filter(|push| push.remote == remote_name || push.remote == "*")
+                    .map(|push| push.destinations.as_slice())
+            })
+    }
+
+    pub fn configured_push_destinations(&self, remote_name: &str) -> Option<&[String]> {
+        self.remotes
+            .iter()
+            .find(|remote| remote.name == remote_name)
+            .or_else(|| self.remotes.iter().find(|remote| remote.name == "*"))
+            .map(|remote| remote.push_destinations.as_slice())
+            .or_else(|| {
+                self.push
+                    .as_ref()
+                    .filter(|push| push.remote == remote_name || push.remote == "*")
+                    .map(|push| push.destinations.as_slice())
+            })
+    }
+
+    pub fn permits_fetch_destination(&self, remote_name: &str, destination: &str) -> bool {
+        let Some(allowed) = self.configured_fetch_destinations(remote_name) else {
+            return false;
+        };
+        crate::destination::destination_is_permitted(destination, allowed, &self.deny_destinations)
+    }
+
+    pub fn permits_push_destination(&self, remote_name: &str, destination: &str) -> bool {
+        let Some(allowed) = self.configured_push_destinations(remote_name) else {
+            return false;
+        };
+        crate::destination::destination_is_permitted(destination, allowed, &self.deny_destinations)
+    }
+}
+
+fn push_matches_remotes(push: &PushPolicy, remotes: &[RemotePolicy]) -> bool {
+    if remotes.is_empty() {
+        return true;
+    }
+    if let Some(exact) = remotes.iter().find(|remote| remote.name == push.remote) {
+        return exact.push_destinations == push.destinations;
+    }
+    remotes.iter().any(|remote| {
+        remote.name == "*"
+            && (remote.push_destinations == push.destinations
+                || push.destinations.iter().all(|destination| {
+                    crate::destination::destination_is_permitted(
+                        destination,
+                        &remote.push_destinations,
+                        &[],
+                    )
+                }))
+    })
+}
+
+fn validate_run_command_policy(profile: &Profile) -> Result<(), ConfigError> {
+    if profile.run.is_valid() {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidRunCommandPolicy {
+            profile: profile.name.clone(),
         })
     }
 }
@@ -851,23 +938,23 @@ fn validate_github_binding(profile: &Profile) -> Result<(), ConfigError> {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let mut repositories = HashSet::new();
     let repositories_valid = binding.repositories.iter().all(|repository| {
-        let Some((owner, name)) = repository.split_once('/') else {
-            return false;
-        };
-        !owner.is_empty()
-            && !name.is_empty()
-            && !name.contains('/')
-            && owner.len() <= 39
-            && name.len() <= 100
-            && owner
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        crate::destination::valid_repository_pattern(repository)
             && repositories.insert(repository.to_ascii_lowercase())
     });
-    if !host_valid || !id_valid || !selector_valid || !fingerprint_valid || !repositories_valid {
+    let mut deny_repositories = HashSet::new();
+    let deny_repositories_valid = binding.deny_repositories.iter().all(|repository| {
+        crate::destination::valid_repository_pattern(repository)
+            && deny_repositories.insert(repository.to_ascii_lowercase())
+    });
+    let commands_valid = binding.commands.is_valid();
+    if !host_valid
+        || !id_valid
+        || !selector_valid
+        || !fingerprint_valid
+        || !repositories_valid
+        || !deny_repositories_valid
+        || !commands_valid
+    {
         return Err(ConfigError::InvalidGithubBinding {
             profile: profile.name.clone(),
         });
@@ -883,10 +970,7 @@ fn validate_github_merge_policy(profile: &Profile) -> Result<(), ConfigError> {
         binding.host == "github.com"
             && !policy.repositories.is_empty()
             && policy.repositories.iter().all(|rule| {
-                binding
-                    .repositories
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(&rule.repository))
+                binding.permits_repository(&rule.repository)
                     && !rule.base_branches.is_empty()
                     && !rule.strategies.is_empty()
                     && rule.strategies.iter().collect::<HashSet<_>>().len() == rule.strategies.len()
@@ -1035,13 +1119,13 @@ fn validate_git_policy(scope: &str, git: &GitPolicy) -> Result<(), ConfigError> 
 
     let mut remote_names = HashSet::new();
     for remote in &git.remotes {
-        let name_valid = !remote.name.is_empty()
-            && remote.name.len() <= 128
-            && !remote.name.starts_with('-')
-            && remote
-                .name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        let name_valid = remote.name == "*"
+            || (!remote.name.is_empty()
+                && remote.name.len() <= 128
+                && !remote.name.starts_with('-')
+                && remote.name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                }));
         let fetch_unique = remote
             .fetch_destinations
             .iter()
@@ -1063,20 +1147,25 @@ fn validate_git_policy(scope: &str, git: &GitPolicy) -> Result<(), ConfigError> 
                 .fetch_destinations
                 .iter()
                 .chain(&remote.push_destinations)
-                .any(|destination| destination.is_empty())
+                .any(|destination| !crate::destination::valid_destination_pattern(destination))
         {
             return Err(ConfigError::InvalidRemotePolicy {
                 scope: scope.to_owned(),
             });
         }
     }
+    if git
+        .deny_destinations
+        .iter()
+        .any(|destination| !crate::destination::valid_destination_pattern(destination))
+    {
+        return Err(ConfigError::InvalidRemotePolicy {
+            scope: scope.to_owned(),
+        });
+    }
 
     if let Some(push) = &git.push {
-        if !git.remotes.is_empty()
-            && !git.remotes.iter().any(|remote| {
-                remote.name == push.remote && remote.push_destinations == push.destinations
-            })
-        {
+        if !push_matches_remotes(push, &git.remotes) {
             return Err(ConfigError::InvalidRemotePolicy {
                 scope: scope.to_owned(),
             });
@@ -1105,13 +1194,29 @@ fn validate_git_policy(scope: &str, git: &GitPolicy) -> Result<(), ConfigError> 
                 scope: scope.to_owned(),
             });
         }
+        if push
+            .destinations
+            .iter()
+            .any(|destination| !crate::destination::valid_destination_pattern(destination))
+        {
+            return Err(ConfigError::InvalidRemotePolicy {
+                scope: scope.to_owned(),
+            });
+        }
         let mut baseline_refs = HashSet::new();
-        let baseline_prefix = format!("refs/remotes/{}/", push.remote);
+        let baseline_prefix = if push.remote == "*" {
+            "refs/remotes/".to_owned()
+        } else {
+            format!("refs/remotes/{}/", push.remote)
+        };
         for baseline in &push.upstream_baselines {
-            let destination_valid = push
-                .destinations
-                .iter()
-                .any(|destination| destination == &baseline.destination);
+            let destination_valid = push.destinations.iter().any(|destination| {
+                destination == &baseline.destination
+                    || crate::destination::destination_matches_pattern(
+                        &baseline.destination,
+                        destination,
+                    )
+            });
             let oid_valid = matches!(baseline.oid.len(), 40 | 64)
                 && baseline.oid.bytes().all(|byte| byte.is_ascii_hexdigit());
             let ref_name = baseline.tracking_ref.strip_prefix(&baseline_prefix);
@@ -1121,6 +1226,7 @@ fn validate_git_policy(scope: &str, git: &GitPolicy) -> Result<(), ConfigError> 
                     && !name.ends_with('/')
                     && !name.contains("..")
                     && !name.contains("@{")
+                    && (push.remote != "*" || name.contains('/'))
                     && name.bytes().all(|byte| {
                         byte > b' '
                             && byte != 0x7f
