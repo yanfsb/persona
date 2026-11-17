@@ -28,7 +28,7 @@ The planned channels are tagged source archives and the Nix flake reference for 
 
 ## Publish and verify
 
-After explicit maintainer authorization and the exact-commit hosted CI gate, use an explicit reviewed candidate Persona executable (rather than an older shadowing PATH installation). From its managed checkout, the bounded publication sequence is:
+After explicit maintainer authorization and the exact-commit hosted CI gate, refresh your managed shims/hooks to point at the reviewed candidate Persona executable (`persona install refresh --apply` and/or `persona hooks refresh`, rather than an older shadowing PATH binary). From its managed checkout, the bounded publication sequence is:
 
 ```sh
 persona run -- git tag -s -m "Persona vX.Y.Z-rc.N" vX.Y.Z-rc.N
@@ -48,6 +48,6 @@ Verify the release points to the expected tag/commit and that downloaded checksu
 
 ## Current baseline
 
-`v0.1.0-rc.1` is a historical release candidate; preserve its release-time evidence in [its notes](releases/v0.1.0-rc.1.md). Hosted run [43489260619](https://github.com/yanfsb/persona/actions/runs/43489260619) passed on all three matrix platforms for the merged open-source-preparation baseline. Run [43896139595](https://github.com/yanfsb/persona/actions/runs/43896139595) passed all three platforms for `beeadd1`, including the RC2 Git/signing changes and post-tag test fixes. Neither run is evidence for subsequent `v0.1.1-rc.3` changes; require CI on the exact reviewed candidate commit before tagging.
+`v0.1.0-rc.1` through `v0.1.1-rc.3` are prior release candidates preserved in [release notes](releases/README.md). Each new candidate commit (including `v0.2.0-rc.1`) requires green hosted CI on the exact final commit across Linux x86_64, Linux arm64, and macOS arm64 before tagging.
 
 The earlier limited real-account pilot verified account binding, repository metadata reads, and SSH fetch, not managed publication or production use. Record subsequent candidate-specific publication evidence in that release's record. GitHub reports the repository public and Apache-2.0 metadata; the private vulnerability-reporting channel is enabled. The repository owner has admin access and is the sole account returned by GitHub's contributors endpoint. Notification monitoring and separate legal rights-holder authority are not independently verified.

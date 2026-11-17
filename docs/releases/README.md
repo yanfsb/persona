@@ -1,5 +1,7 @@
 # Release notes
 
+- [Persona v0.2.0-rc.1](v0.2.0-rc.1.md) — configurable allowlist/denylist command policies, cross-profile identity guardrails, wildcard destination/repository rules, `baseline update`, and `hooks refresh`.
+
 - [Persona v0.1.1-rc.3](v0.1.1-rc.3.md) — audited existing-release asset upload, deterministic transport fixtures, and post-RC2 signing regression coverage.
 
 - [Persona v0.1.1-rc.2](v0.1.1-rc.2.md) — multi-remote fetch, configurable managed Git operation policy, and GUI-compatible Git workflow fixes.

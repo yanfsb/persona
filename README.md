@@ -1,19 +1,19 @@
 # Persona
 
-Persona is a directory-scoped Git/GitHub identity guardrail for developers who use more than one identity on the same macOS or Linux account. Its managed adapters check a bounded set of commands against a local profile before delegation.
+Persona is a directory-scoped Git/GitHub identity guardrail for developers who use more than one identity on the same macOS or Linux account. Its managed adapters enforce identity, signing, destination, SSH, and GitHub account separation while letting each profile configure allowed/denied commands for everyday workflows.
 
-> **Release candidate:** `0.1.1-rc.3` adds audited release asset uploads and transport-fixture hardening to `0.1.1-rc.2`. The earlier limited real-account pilot covered binding, repository metadata reads, and SSH fetch; release-specific publication evidence belongs in the published release record. Production use has not been evaluated. Do not rely on this release candidate as a production security boundary.
+> **Release candidate:** `0.2.0-rc.1` shifts Persona to identity-separation guardrails with configurable allowlist/denylist command policies (`denylist` by default across `git`, `gh`, and `persona run`), wildcard owner/destination rules with explicit denies, `remote_tracking` upstream provenance, cross-profile commit identity checks, `persona baseline update`, and `persona hooks refresh`. The earlier limited real-account pilot covered binding, repository metadata reads, and SSH fetch, and `v0.1.1-rc.3` exercised managed tag push and GitHub release publication; release-specific publication evidence belongs in the published release record. Production use has not been evaluated. Do not rely on this release candidate as a production security boundary.
 
 Persona is **not** a sandbox, firewall, anonymity system, or universal Git/GitHub replacement. Direct native binaries and hostile processes running as the same OS user can bypass its managed paths. See the [security model](docs/security-model.md) before use.
 
 ## What Persona does
 
-- Associates local Git identities, signing policy, destinations, and optional GitHub account bindings with directory scopes.
-- Provides offline status/diagnostics and explicit policy checks.
-- Optionally installs managed `git`, `gh`, `ssh`, and credential-helper adapters, plus repository-local pre-push hooks.
-- Rejects unsupported or ambiguous managed operations instead of silently claiming they are protected.
+- Associates local Git identities, signing policy, destinations (`OWNER/*` wildcards and `deny_destinations`), cross-profile leak checks, and optional GitHub account bindings (`repositories` and `deny_repositories`) with directory scopes.
+- Evaluates configurable per-profile allowlists and denylists across managed `git`, `gh`, and `persona run` commands (`denylist` by default so day-to-day workflows keep moving while identity boundaries hold).
+- Provides offline status/diagnostics and explicit policy checks (`status`, `doctor`, `check`, `baseline update`).
+- Optionally installs managed `git`, `gh`, `ssh`, and credential-helper adapters, plus refreshable repository-local pre-push hooks.
 
-The supported command grammar is intentionally bounded. Start with the [managed command reference](docs/managed-commands.md); passing a local check is evidence only for the properties it examined.
+Start with the [configuration](docs/configuration.md) and [managed command reference](docs/managed-commands.md); passing a local check is evidence only for the properties it examined.
 
 ## Quick start
 
