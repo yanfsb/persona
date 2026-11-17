@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitInvocation {
     pub directory_changes: Vec<PathBuf>,
+    pub git_dir: Option<PathBuf>,
+    pub work_tree: Option<PathBuf>,
     pub global_arguments: Vec<OsString>,
     pub arguments: Vec<OsString>,
 }
@@ -362,6 +364,8 @@ impl GitInvocation {
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, ParseError> {
         let mut arguments = arguments.into_iter();
         let mut directory_changes = Vec::new();
+        let mut git_dir = None;
+        let mut work_tree = None;
         let mut global_arguments = Vec::new();
         let mut native_arguments = Vec::new();
         let mut command_seen = false;
@@ -381,6 +385,48 @@ impl GitInvocation {
                     return Err(ParseError::MissingDirectory);
                 }
                 directory_changes.push(PathBuf::from(path));
+                continue;
+            }
+            if argument == "--git-dir" {
+                let path = arguments.next().ok_or(ParseError::MissingDirectory)?;
+                if path.is_empty() {
+                    return Err(ParseError::MissingDirectory);
+                }
+                git_dir = Some(PathBuf::from(&path));
+                global_arguments.push(argument);
+                global_arguments.push(path);
+                continue;
+            }
+            if let Some(path) = argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--git-dir="))
+            {
+                if path.is_empty() {
+                    return Err(ParseError::MissingDirectory);
+                }
+                git_dir = Some(PathBuf::from(path));
+                global_arguments.push(argument);
+                continue;
+            }
+            if argument == "--work-tree" {
+                let path = arguments.next().ok_or(ParseError::MissingDirectory)?;
+                if path.is_empty() {
+                    return Err(ParseError::MissingDirectory);
+                }
+                work_tree = Some(PathBuf::from(&path));
+                global_arguments.push(argument);
+                global_arguments.push(path);
+                continue;
+            }
+            if let Some(path) = argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--work-tree="))
+            {
+                if path.is_empty() {
+                    return Err(ParseError::MissingDirectory);
+                }
+                work_tree = Some(PathBuf::from(path));
+                global_arguments.push(argument);
                 continue;
             }
             if argument == "-c" {
@@ -428,6 +474,8 @@ impl GitInvocation {
         }
         Ok(Self {
             directory_changes,
+            git_dir,
+            work_tree,
             global_arguments,
             arguments: native_arguments,
         })
@@ -512,7 +560,6 @@ mod tests {
             vec!["-c", "credential.helper=store", "fetch"],
             vec!["-c", "core.sshCommand=evil", "fetch"],
             vec!["-c", "diff.external=evil", "diff"],
-            vec!["--git-dir=/tmp/other", "status"],
             vec!["--exec-path=/tmp/evil", "status"],
         ] {
             assert_eq!(
@@ -521,6 +568,20 @@ mod tests {
                 "{unsafe_args:?}"
             );
         }
+        let with_git_dir = GitInvocation::parse(args(&[
+            "--git-dir=/tmp/other/.git",
+            "--work-tree",
+            "/tmp/other",
+            "rev-parse",
+            "HEAD",
+        ]))
+        .unwrap();
+        assert_eq!(with_git_dir.git_dir, Some(PathBuf::from("/tmp/other/.git")));
+        assert_eq!(with_git_dir.work_tree, Some(PathBuf::from("/tmp/other")));
+        assert_eq!(
+            GitInvocation::parse(args(&["--git-dir="])),
+            Err(ParseError::MissingDirectory)
+        );
         assert_eq!(
             GitInvocation::parse(Vec::<OsString>::new()),
             Err(ParseError::MissingSubcommand)

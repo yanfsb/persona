@@ -265,6 +265,8 @@ pub fn run_managed_git() -> Result<u8, String> {
         .subcommand()
         .map_err(|_| "missing Git subcommand".to_owned())?;
     let command_name = subcommand.as_str().to_owned();
+    let explicit_git_dir = invocation.git_dir;
+    let explicit_work_tree = invocation.work_tree;
     let global_arguments = invocation.global_arguments;
     let mut git_arguments = invocation.arguments;
 
@@ -382,6 +384,31 @@ pub fn run_managed_git() -> Result<u8, String> {
         None
     };
 
+    let resolved_explicit_work_tree = explicit_work_tree
+        .as_ref()
+        .map(|path| {
+            let candidate = if path.is_absolute() {
+                path.clone()
+            } else {
+                directory.join(path)
+            };
+            std::fs::canonicalize(&candidate)
+                .map_err(|_| "Git --work-tree directory is missing or inaccessible".to_owned())
+        })
+        .transpose()?;
+    let resolved_explicit_git_dir = explicit_git_dir
+        .as_ref()
+        .map(|path| {
+            let candidate = if path.is_absolute() {
+                path.clone()
+            } else {
+                directory.join(path)
+            };
+            std::fs::canonicalize(&candidate)
+                .map_err(|_| "Git --git-dir directory is missing or inaccessible".to_owned())
+        })
+        .transpose()?;
+
     let selection_directory = if let Some((_, target)) = &clone_plan {
         if target.is_absolute() {
             target.clone()
@@ -395,6 +422,10 @@ pub fn run_managed_git() -> Result<u8, String> {
         } else {
             directory.join(target)
         }
+    } else if let Some(wt) = &resolved_explicit_work_tree {
+        wt.clone()
+    } else if let Some(gd) = &resolved_explicit_git_dir {
+        gd.clone()
     } else {
         match git_client.checkout_root(&directory) {
             Ok(root) => root,
@@ -409,9 +440,7 @@ pub fn run_managed_git() -> Result<u8, String> {
                     directory.clone()
                 }
             }
-            Err(_) => {
-                return Err("Git command requires a working tree in a managed scope".to_owned());
-            }
+            Err(_) => directory.clone(),
         }
     };
 
@@ -422,8 +451,51 @@ pub fn run_managed_git() -> Result<u8, String> {
     } else {
         crate::context::resolve_context(&selection_directory, &config.scopes())
     }
-    .map_err(|_| "cannot resolve managed Git scope".to_owned())?
-    .ok_or_else(|| "no managed Persona scope applies to this Git directory".to_owned())?;
+    .map_err(|_| "cannot resolve managed Git scope".to_owned())?;
+
+    let Some(selected_scope) = selected_scope else {
+        if worktree_add {
+            if let Ok(source_root) = git_client.checkout_root(&directory) {
+                if crate::context::resolve_context(&source_root, &config.scopes())
+                    .map_err(|_| "cannot resolve source worktree scope".to_owned())?
+                    .is_some()
+                {
+                    return Err(
+                        "worktree destination is outside every configured Persona scope".to_owned(),
+                    );
+                }
+            }
+        }
+        if let Some(gd) = &resolved_explicit_git_dir {
+            if crate::context::resolve_context(gd, &config.scopes())
+                .map_err(|_| "cannot resolve managed Git scope".to_owned())?
+                .is_some()
+            {
+                return Err(
+                    "Git --git-dir targets a managed Persona scope while --work-tree does not"
+                        .to_owned(),
+                );
+            }
+        }
+        let mut command = Command::new(&native_git);
+        command
+            .args(&global_arguments)
+            .args(&git_arguments)
+            .current_dir(&directory);
+        let status = wait_child_ignoring_sigint(&mut command)
+            .map_err(|error| format!("cannot launch native Git: {error}"))?;
+        return Ok(status_exit_code(status));
+    };
+
+    if let Some(gd) = &resolved_explicit_git_dir {
+        let git_dir_scope = crate::context::resolve_context(gd, &config.scopes())
+            .map_err(|_| "cannot resolve managed Git scope".to_owned())?;
+        if git_dir_scope.as_ref().map(|s| &s.name) != Some(&selected_scope.name) {
+            return Err(
+                "Git --git-dir and --work-tree must resolve to the same Persona scope".to_owned(),
+            );
+        }
+    }
     let selected_policy = config
         .policies()
         .iter()

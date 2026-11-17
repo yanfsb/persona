@@ -3839,4 +3839,120 @@ profile = "work"
         assert!(comp.status.success());
         assert!(!comp.stdout.is_empty());
     }
+
+    // 7. --git-dir / --work-tree work for unmanaged repos (e.g., nvim plugins) & same-scope repos,
+    //    while cross-scope --git-dir redirects remain blocked.
+    let unmanaged_repo = temporary.path().join("unmanaged-plugin");
+    fs::create_dir_all(&unmanaged_repo).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.name", "Plugin"],
+        vec!["config", "user.email", "plugin@example.invalid"],
+    ] {
+        assert!(
+            Command::new(&git)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&unmanaged_repo)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::write(unmanaged_repo.join("init.lua"), "return {}\n").unwrap();
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&unmanaged_repo)
+            .args(["add", "init.lua"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&unmanaged_repo)
+            .args(["commit", "-m", "plugin"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let plugin_sha = Command::new(&git_shim)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &custom_config)
+        .env("PERSONA_GIT", &git)
+        .env("PERSONA_SHIM_DIR", &bin_dir)
+        .current_dir(&outside)
+        .args([
+            "--git-dir",
+            unmanaged_repo.join(".git").to_str().unwrap(),
+            "--work-tree",
+            unmanaged_repo.to_str().unwrap(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        plugin_sha.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plugin_sha.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&plugin_sha.stdout).trim().len(), 40);
+
+    let same_scope_sha = Command::new(&git_shim)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &custom_config)
+        .env("PERSONA_GIT", &git)
+        .env("PERSONA_SHIM_DIR", &bin_dir)
+        .current_dir(&outside)
+        .args([
+            "--git-dir",
+            repo.join(".git").to_str().unwrap(),
+            "--work-tree",
+            repo.to_str().unwrap(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        same_scope_sha.status.success(),
+        "{}",
+        String::from_utf8_lossy(&same_scope_sha.stderr)
+    );
+
+    let cross_scope_redirect = Command::new(&git_shim)
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PERSONA_CONFIG_PATH", &custom_config)
+        .env("PERSONA_GIT", &git)
+        .env("PERSONA_SHIM_DIR", &bin_dir)
+        .current_dir(&repo)
+        .args([
+            "--git-dir",
+            unmanaged_repo.join(".git").to_str().unwrap(),
+            "--work-tree",
+            repo.to_str().unwrap(),
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(cross_scope_redirect.status.code(), Some(126));
 }
