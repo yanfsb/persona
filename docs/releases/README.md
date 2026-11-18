@@ -1,5 +1,6 @@
 # Release notes
 
+- [Persona v0.2.0-rc.5](v0.2.0-rc.5.md) — fix HTTPS `git-credential-persona` macOS Keychain access under isolated network `HOME` (`PERSONA_REAL_HOME`).
 - [Persona v0.2.0-rc.4](v0.2.0-rc.4.md) — fix `git pull` failing with `unknown option 'no-prune-tags'`.
 - [Persona v0.2.0-rc.3](v0.2.0-rc.3.md) — hotfix for `--git-dir` / `--work-tree` scope resolution and unmanaged-directory passthrough (unblocking Neovim `blink.cmp`, `lazy.nvim`, and IDEs).
 - [Persona v0.2.0-rc.2](v0.2.0-rc.2.md) — `clig.dev` CLI ergonomics, universal `git`/`gh` `--version` and `--help` compatibility, healthy-repo exit `0`, human-readable errors, partial `profile update`, `--json` / `NO_COLOR` / `-q` / `-n` support, `completions`, and `SIGINT`-safe child waiting.

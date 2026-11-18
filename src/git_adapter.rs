@@ -1350,6 +1350,9 @@ pub fn run_managed_git() -> Result<u8, String> {
         .env("PERSONA_GIT_OPERATION_SELECTOR", &primary_selector);
 
     let original_home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(orig) = &original_home {
+        command.env("PERSONA_REAL_HOME", orig);
+    }
     if is_network_command || !selected_policy.git.inherit_git_config {
         command
             .env("HOME", home.path())
@@ -2370,6 +2373,9 @@ fn execute_managed_fetch_all(context: ManagedFetchAllContext<'_>) -> Result<u8, 
             .env("PERSONA_GIT_CREDENTIAL_REMOTE", remote)
             .env("PERSONA_GIT_OPERATION_SELECTOR", "fetch.all")
             .env("PERSONA_SHIM_DIR", shim_directory);
+        if let Some(orig) = &original_home {
+            child.env("PERSONA_REAL_HOME", orig);
+        }
         if let Some(config_home) = &config_home {
             child.env("XDG_CONFIG_HOME", config_home).env(
                 "GH_CONFIG_DIR",

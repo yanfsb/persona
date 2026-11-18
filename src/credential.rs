@@ -160,7 +160,9 @@ impl GithubSelector {
         persona_paths: PersonaPaths,
     ) -> Result<Self, CredentialError> {
         validate_host(&host)?;
-        let home = env::var_os("HOME")
+        let home = env::var_os("PERSONA_REAL_HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| env::var_os("HOME"))
             .map(PathBuf::from)
             .ok_or(CredentialError::MissingHome)?;
         let xdg_config_home = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
