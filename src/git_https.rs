@@ -1,6 +1,9 @@
 use crate::config::GitHubBinding;
 use crate::credential::{CredentialError, GithubSelector, Secret};
+use crate::runner::{RunRequest, SubprocessRunner};
+use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 const MAX_CREDENTIAL_INPUT_BYTES: usize = 8 * 1024;
 
@@ -107,6 +110,16 @@ pub enum HttpsCredentialError {
 pub struct CredentialRequest {
     host: String,
     path: String,
+}
+
+impl CredentialRequest {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 /// Parse Git's credential-helper protocol while discarding unused metadata.
@@ -295,6 +308,173 @@ pub fn handle_credential_helper_with_denies<W: Write>(
         .map_err(|error| HttpsCredentialError::Output(error.kind()))
 }
 
+pub fn select_external_https_credential_with_denies(
+    action: &str,
+    input: &[u8],
+    policy: &crate::config::HttpsCredentialPolicy,
+    allowed_destinations: &[String],
+    denied_destinations: &[String],
+) -> Result<Option<(Secret, Secret)>, HttpsCredentialError> {
+    match action {
+        "store" | "erase" => return Ok(None),
+        "get" => {}
+        _ => return Err(HttpsCredentialError::UnsupportedOperation),
+    }
+    let request = parse_credential_request(input)?;
+    if crate::credential::is_known_github_host(&request.host)
+        || !request.host.eq_ignore_ascii_case(&policy.host)
+    {
+        return Err(HttpsCredentialError::DestinationNotAllowed);
+    }
+    let helper_metadata = std::fs::metadata(&policy.helper)
+        .map_err(|_| HttpsCredentialError::CredentialUnavailable)?;
+    if !policy.helper.is_absolute() || !helper_metadata.is_file() {
+        return Err(HttpsCredentialError::CredentialUnavailable);
+    }
+
+    let actual_url = format!("https://{}/{}", request.host, request.path);
+    if denied_destinations
+        .iter()
+        .any(|pattern| crate::destination::destination_matches_pattern(&actual_url, pattern))
+    {
+        return Err(HttpsCredentialError::DestinationNotAllowed);
+    }
+    let allowed = allowed_destinations.iter().any(|destination| {
+        parse_https_destination(destination)
+            .is_ok_and(|(host, path)| host == request.host && path == request.path)
+            || crate::destination::destination_matches_pattern(&actual_url, destination)
+    });
+    if !allowed {
+        return Err(HttpsCredentialError::DestinationNotAllowed);
+    }
+
+    let home = std::env::var_os("PERSONA_REAL_HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or(HttpsCredentialError::CredentialUnavailable)?;
+    let home_path = PathBuf::from(&home);
+    let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home_path.join(".config"));
+    let mut environment = vec![
+        (OsString::from("HOME"), home),
+        (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+        (OsString::from("LC_ALL"), OsString::from("C")),
+        (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            xdg_config.into_os_string(),
+        ),
+    ];
+    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        environment.push((
+            OsString::from("XDG_STATE_HOME"),
+            state_home.into_os_string(),
+        ));
+    }
+    let helper_stdin = format!(
+        "protocol=https\nhost={}\npath={}\n\n",
+        request.host, request.path
+    );
+    let args = policy
+        .args
+        .iter()
+        .map(OsString::from)
+        .chain(std::iter::once(OsString::from("get")))
+        .collect::<Vec<_>>();
+    let mut result = SubprocessRunner::default()
+        .run(RunRequest {
+            executable: &policy.helper,
+            args: &args,
+            cwd: Path::new("/"),
+            environment: &environment,
+            stdin: Some(helper_stdin.as_bytes()),
+        })
+        .map_err(|_| HttpsCredentialError::CredentialUnavailable)?;
+    let stdout = Secret::new(std::mem::take(&mut result.stdout));
+    result.stderr.fill(0);
+    if !result.status.success() {
+        return Err(HttpsCredentialError::CredentialUnavailable);
+    }
+    parse_external_credential_response(stdout.expose()).map(Some)
+}
+
+pub fn handle_external_credential_helper_with_denies<W: Write>(
+    action: &str,
+    input: &[u8],
+    policy: &crate::config::HttpsCredentialPolicy,
+    allowed_destinations: &[String],
+    denied_destinations: &[String],
+    output: &mut W,
+) -> Result<(), HttpsCredentialError> {
+    let Some((username, password)) = select_external_https_credential_with_denies(
+        action,
+        input,
+        policy,
+        allowed_destinations,
+        denied_destinations,
+    )?
+    else {
+        return Ok(());
+    };
+    output
+        .write_all(b"username=")
+        .and_then(|_| output.write_all(username.expose()))
+        .and_then(|_| output.write_all(b"\npassword="))
+        .and_then(|_| output.write_all(password.expose()))
+        .and_then(|_| output.write_all(b"\n\n"))
+        .map_err(|error| HttpsCredentialError::Output(error.kind()))
+}
+
+fn parse_external_credential_response(
+    input: &[u8],
+) -> Result<(Secret, Secret), HttpsCredentialError> {
+    if input.len() > MAX_CREDENTIAL_INPUT_BYTES || input.contains(&0) || input.contains(&b'\r') {
+        return Err(HttpsCredentialError::CredentialUnavailable);
+    }
+    let input =
+        std::str::from_utf8(input).map_err(|_| HttpsCredentialError::CredentialUnavailable)?;
+    let mut username: Option<Secret> = None;
+    let mut password: Option<Secret> = None;
+    let mut ended = false;
+    for line in input.lines() {
+        if line.is_empty() {
+            ended = true;
+            continue;
+        }
+        if ended {
+            return Err(HttpsCredentialError::CredentialUnavailable);
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or(HttpsCredentialError::CredentialUnavailable)?;
+        if key.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(HttpsCredentialError::CredentialUnavailable);
+        }
+        match key {
+            "username" if username.is_none() => {
+                username = Some(Secret::new(value.as_bytes().to_vec()))
+            }
+            "password" if password.is_none() => {
+                password = Some(Secret::new(value.as_bytes().to_vec()))
+            }
+            _ => return Err(HttpsCredentialError::CredentialUnavailable),
+        }
+    }
+    match (username, password) {
+        (Some(username), Some(password))
+            if !username.expose().is_empty() && !password.expose().is_empty() =>
+        {
+            Ok((username, password))
+        }
+        _ => Err(HttpsCredentialError::CredentialUnavailable),
+    }
+}
+
 fn parse_credential_host(value: &str) -> Result<String, HttpsCredentialError> {
     let (host, port) = match value.rsplit_once(':') {
         Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => (host, port),
@@ -371,9 +551,106 @@ fn valid_dns_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpsCredentialError, contains_unsafe_transport_config_key_names, parse_credential_request,
-        required_git_http_overrides, validate_repository_path,
+        HttpsCredentialError, contains_unsafe_transport_config_key_names,
+        handle_external_credential_helper_with_denies, parse_credential_request,
+        parse_external_credential_response, required_git_http_overrides, validate_repository_path,
     };
+    use crate::config::HttpsCredentialPolicy;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    #[test]
+    fn external_https_helper_is_opt_in_and_destination_checked_before_spawn() {
+        let temporary = tempdir().unwrap();
+        let helper = temporary.path().join("credential-helper");
+        let marker = temporary.path().join("helper-called");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = \"fixture-command\" ] && [ \"$2\" = \"get\" ] || exit 2\n: > '{}'\nprintf '%s\\n' 'username=synthetic-user' 'password=synthetic-token' ''\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = HttpsCredentialPolicy {
+            host: "forge.example.invalid".to_owned(),
+            helper: helper.clone(),
+            args: vec!["fixture-command".to_owned()],
+        };
+        let input = b"protocol=https\nhost=forge.example.invalid\npath=team/repo.git\n\n";
+        let allowed = vec!["https://forge.example.invalid/team/repo.git".to_owned()];
+        let mut output = Vec::new();
+        handle_external_credential_helper_with_denies(
+            "get",
+            input,
+            &policy,
+            &allowed,
+            &[],
+            &mut output,
+        )
+        .expect("authorized external helper response");
+        assert_eq!(
+            output,
+            b"username=synthetic-user\npassword=synthetic-token\n\n"
+        );
+        assert!(marker.exists());
+
+        let denied_marker = temporary.path().join("denied-helper-called");
+        let denied_helper = temporary.path().join("denied-helper");
+        fs::write(
+            &denied_helper,
+            format!("#!/bin/sh\n: > '{}'\n", denied_marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&denied_helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let denied_policy = HttpsCredentialPolicy {
+            helper: denied_helper,
+            ..policy.clone()
+        };
+        assert!(
+            handle_external_credential_helper_with_denies(
+                "get",
+                input,
+                &denied_policy,
+                &allowed,
+                &allowed,
+                &mut Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(!denied_marker.exists());
+
+        let github_policy = HttpsCredentialPolicy {
+            host: "github.com".to_owned(),
+            ..policy
+        };
+        assert!(
+            handle_external_credential_helper_with_denies(
+                "get",
+                b"protocol=https\nhost=github.com\npath=org/repo.git\n\n",
+                &github_policy,
+                &["https://github.com/org/repo.git".to_owned()],
+                &[],
+                &mut Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn external_https_helper_response_rejects_malformed_or_multiline_credentials() {
+        for response in [
+            &b"username=user\npassword=\n"[..],
+            &b"username=user\npassword=secret\nextra=value\n"[..],
+            &b"username=user\npassword=secret\npassword=second\n"[..],
+            &b"username=user\npassword=line1\nline2\n"[..],
+            &b"username=user\r\npassword=secret\r\n"[..],
+        ] {
+            assert!(parse_external_credential_response(response).is_err());
+        }
+    }
 
     #[test]
     fn required_overrides_disable_redirects_prompts_and_other_credential_helpers() {

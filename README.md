@@ -2,7 +2,7 @@
 
 Persona is a directory-scoped Git/GitHub identity guardrail for developers who use more than one identity on the same macOS or Linux account. Its managed adapters enforce identity, signing, destination, SSH, and GitHub account separation while letting each profile configure allowed/denied commands for everyday workflows.
 
-> **Release candidate:** `0.2.0-rc.5` fixes HTTPS `git-credential-persona` lookups on macOS Keychain when `git push`/`fetch`/`pull`/`clone` runs with an isolated `HOME` (`PERSONA_REAL_HOME`), building on `0.2.0-rc.4` (`git pull` flags), `0.2.0-rc.3` (`--git-dir`/`--work-tree` & unmanaged passthrough), `0.2.0-rc.2` (`clig.dev` ergonomics), and `0.2.0-rc.1` (configurable allowlist/denylist command policies). Production use has not been evaluated. Do not rely on this release candidate as a production security boundary.
+> **Release candidate:** `0.2.0-rc.6` adds multi-host SSH transport policies (`[[profiles.ssh_hosts]]`), opt-in non-GitHub HTTPS credential helpers (`[[profiles.https_credentials]]`), and host-scoped GitHub push-binding checks, building on `0.2.0-rc.5` (HTTPS `git-credential-persona` macOS Keychain access), `0.2.0-rc.4` (`git pull` flags), `0.2.0-rc.3` (`--git-dir`/`--work-tree` & unmanaged passthrough), `0.2.0-rc.2` (`clig.dev` ergonomics), and `0.2.0-rc.1` (configurable allowlist/denylist command policies). Production use has not been evaluated. Do not rely on this release candidate as a production security boundary.
 
 Persona is **not** a sandbox, firewall, anonymity system, or universal Git/GitHub replacement. Direct native binaries and hostile processes running as the same OS user can bypass its managed paths. See the [security model](docs/security-model.md) before use.
 

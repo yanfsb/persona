@@ -130,19 +130,19 @@ impl SubprocessRunner {
                 Ok(None) => {
                     if stdout_overflow.load(Ordering::Acquire) {
                         let _ = terminate(&mut child);
-                        join_readers(stdout_thread, stderr_thread);
+                        discard_readers(stdout_thread, stderr_thread);
                         let _ = join_stdin_writer(stdin_thread);
                         return Err(RunError::OutputLimit { stream: "stdout" });
                     }
                     if stderr_overflow.load(Ordering::Acquire) {
                         let _ = terminate(&mut child);
-                        join_readers(stdout_thread, stderr_thread);
+                        discard_readers(stdout_thread, stderr_thread);
                         let _ = join_stdin_writer(stdin_thread);
                         return Err(RunError::OutputLimit { stream: "stderr" });
                     }
                     if started.elapsed() >= self.limits.timeout {
                         let _ = terminate(&mut child);
-                        join_readers(stdout_thread, stderr_thread);
+                        discard_readers(stdout_thread, stderr_thread);
                         let _ = join_stdin_writer(stdin_thread);
                         return Err(RunError::Timeout);
                     }
@@ -150,7 +150,7 @@ impl SubprocessRunner {
                 }
                 Err(error) => {
                     let _ = terminate(&mut child);
-                    join_readers(stdout_thread, stderr_thread);
+                    discard_readers(stdout_thread, stderr_thread);
                     let _ = join_stdin_writer(stdin_thread);
                     return Err(RunError::Wait(error.to_string()));
                 }
@@ -160,19 +160,25 @@ impl SubprocessRunner {
         // A command can exit while a descendant still owns one of the pipes.
         // Always tear down the isolated process group before joining readers.
         let termination_error = terminate(&mut child).err();
-        let (stdout, stderr) = join_readers(stdout_thread, stderr_thread);
+        let (stdout_result, stderr_result) = join_readers(stdout_thread, stderr_thread);
+        let mut stdout = stdout_result.unwrap_or_default();
+        let mut stderr = stderr_result.unwrap_or_default();
         let stdin_error = join_stdin_writer(stdin_thread);
         if let Some(error) = termination_error {
+            zeroize_buffers(&mut stdout, &mut stderr);
             return Err(error);
         }
         if stdout_overflow.load(Ordering::Acquire) {
+            zeroize_buffers(&mut stdout, &mut stderr);
             return Err(RunError::OutputLimit { stream: "stdout" });
         }
         if stderr_overflow.load(Ordering::Acquire) {
+            zeroize_buffers(&mut stdout, &mut stderr);
             return Err(RunError::OutputLimit { stream: "stderr" });
         }
         if status.success() {
             if let Some(error) = stdin_error {
+                zeroize_buffers(&mut stdout, &mut stderr);
                 return Err(RunError::StdinWrite(error));
             }
         }
@@ -194,7 +200,7 @@ fn read_capped<R: Read + Send + 'static>(
     mut reader: R,
     limit: usize,
     overflow: Arc<AtomicBool>,
-) -> thread::JoinHandle<Vec<u8>> {
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
     thread::spawn(move || {
         let mut output = Vec::with_capacity(limit.min(4096));
         let mut buffer = [0_u8; 4096];
@@ -208,10 +214,15 @@ fn read_capped<R: Read + Send + 'static>(
                     }
                     output.extend_from_slice(&buffer[..count]);
                 }
-                Err(_) => break,
+                Err(error) => {
+                    buffer.fill(0);
+                    output.fill(0);
+                    return Err(error);
+                }
             }
         }
-        output
+        buffer.fill(0);
+        Ok(output)
     })
 }
 
@@ -233,9 +244,9 @@ fn join_stdin_writer(writer: Option<thread::JoinHandle<std::io::Result<()>>>) ->
 }
 
 fn join_readers(
-    stdout: thread::JoinHandle<Vec<u8>>,
-    stderr: thread::JoinHandle<Vec<u8>>,
-) -> (Vec<u8>, Vec<u8>) {
+    stdout: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> (std::io::Result<Vec<u8>>, std::io::Result<Vec<u8>>) {
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     (
         join_reader_until(stdout, deadline),
@@ -243,18 +254,44 @@ fn join_readers(
     )
 }
 
-fn join_reader_until(reader: thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Vec<u8> {
+fn join_reader_until(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> std::io::Result<Vec<u8>> {
     while !reader.is_finished() {
         if Instant::now() >= deadline {
             // The process group cleanup normally closes the pipe. If an
             // unusual platform failure prevents that, do not block the
             // caller forever on a reader thread.
             drop(reader);
-            return Vec::new();
+            return Err(std::io::Error::other(
+                "reader cleanup exceeded its deadline",
+            ));
         }
         thread::sleep(Duration::from_millis(1));
     }
-    reader.join().unwrap_or_default()
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other("reader thread panicked"))?
+}
+
+fn discard_readers(
+    stdout: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) {
+    let (stdout, stderr) = join_readers(stdout, stderr);
+    zeroize_reader_results(stdout, stderr);
+}
+
+fn zeroize_reader_results(stdout: std::io::Result<Vec<u8>>, stderr: std::io::Result<Vec<u8>>) {
+    for mut buffer in [stdout, stderr].into_iter().flatten() {
+        buffer.fill(0);
+    }
+}
+
+fn zeroize_buffers(stdout: &mut [u8], stderr: &mut [u8]) {
+    stdout.fill(0);
+    stderr.fill(0);
 }
 
 #[cfg(unix)]

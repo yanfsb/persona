@@ -85,6 +85,42 @@ fn fixture() -> (tempfile::TempDir, PathBuf, SshPolicy, PathBuf) {
     )
 }
 
+#[test]
+fn managed_ssh_policy_selection_routes_to_matching_host_and_fails_closed() {
+    let (_temporary, _ssh_keygen, github, _system_ssh) = fixture();
+    let mut forge = github.clone();
+    forge.host = "forge.example.invalid".to_owned();
+    let policies = [&github, &forge];
+
+    let selected = persona::ssh_adapter::select_managed_ssh_policy(
+        &policies,
+        "git@forge.example.invalid:org/repo.git",
+        "git-upload-pack",
+    )
+    .expect("matching SSH policy");
+    assert_eq!(selected.host, "forge.example.invalid");
+
+    assert_eq!(
+        persona::ssh_adapter::select_managed_ssh_policy(
+            &policies,
+            "git@unlisted.example.invalid:org/repo.git",
+            "git-upload-pack",
+        )
+        .unwrap_err(),
+        "SSH destination differs from profile policy"
+    );
+    let duplicates = [&forge, &forge];
+    assert_eq!(
+        persona::ssh_adapter::select_managed_ssh_policy(
+            &duplicates,
+            "git@forge.example.invalid:org/repo.git",
+            "git-upload-pack",
+        )
+        .unwrap_err(),
+        "SSH destination matches multiple profile policies"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn managed_ssh_uses_only_explicit_identity_hostkey_and_no_user_config_or_multiplexing() {

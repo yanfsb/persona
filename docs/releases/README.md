@@ -1,5 +1,6 @@
 # Release notes
 
+- [Persona v0.2.0-rc.6](v0.2.0-rc.6.md) — multi-host SSH transport policies, opt-in non-GitHub HTTPS credential helpers, and host-scoped GitHub push-binding checks.
 - [Persona v0.2.0-rc.5](v0.2.0-rc.5.md) — fix HTTPS `git-credential-persona` macOS Keychain access under isolated network `HOME` (`PERSONA_REAL_HOME`).
 - [Persona v0.2.0-rc.4](v0.2.0-rc.4.md) — fix `git pull` failing with `unknown option 'no-prune-tags'`.
 - [Persona v0.2.0-rc.3](v0.2.0-rc.3.md) — hotfix for `--git-dir` / `--work-tree` scope resolution and unmanaged-directory passthrough (unblocking Neovim `blink.cmp`, `lazy.nvim`, and IDEs).

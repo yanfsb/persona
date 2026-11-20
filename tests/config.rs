@@ -296,6 +296,143 @@ profile = "work"
 }
 
 #[test]
+fn profiles_accept_multiple_ssh_hosts_and_opt_in_external_https_helpers() {
+    let input = r#"
+version = 2
+[[profiles]]
+name = "work"
+[profiles.git]
+author = { name = "Synthetic", email = "synthetic@example.invalid" }
+committer = { name = "Synthetic", email = "synthetic@example.invalid" }
+[profiles.ssh]
+host = "github.com"
+user = "git"
+port = 22
+fingerprint = "SHA256:abcDEF0123+/="
+public_key = "/tmp/github.pub"
+identity_file = "/tmp/github"
+known_hosts_file = "/tmp/known_hosts"
+[[profiles.ssh_hosts]]
+host = "forge.example.invalid"
+user = "git"
+port = 22
+fingerprint = "SHA256:abcDEF0123+/="
+public_key = "/tmp/origin.pub"
+identity_file = "/tmp/origin"
+known_hosts_file = "/tmp/known_hosts"
+[[profiles.https_credentials]]
+host = "forge.example.invalid"
+helper = "/nix/store/example/bin/origin"
+args = ["auth", "git-credential"]
+[[scopes]]
+name = "work"
+path = "/tmp/work"
+profile = "work"
+"#;
+    let config = Config::parse(input).expect("multi-forge profile parses");
+    let profile = &config.profiles()[0];
+    assert!(profile.has_ssh_policy());
+    assert_eq!(profile.ssh_policies().len(), 2);
+    assert_eq!(profile.ssh_policies()[1].host, "forge.example.invalid");
+    assert_eq!(
+        profile
+            .https_credential_for_host("FORGE.EXAMPLE.INVALID")
+            .unwrap()
+            .args,
+        ["auth", "git-credential"]
+    );
+    assert_eq!(
+        Config::parse(&config.to_v3_toml().unwrap())
+            .unwrap()
+            .profiles()[0]
+            .ssh_hosts
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn profiles_reject_ambiguous_ssh_and_github_shadowing_https_helpers() {
+    let duplicate_ssh = r#"
+version = 2
+[[profiles]]
+name = "work"
+[profiles.git]
+author = { name = "Synthetic", email = "synthetic@example.invalid" }
+committer = { name = "Synthetic", email = "synthetic@example.invalid" }
+[profiles.ssh]
+host = "github.com"
+user = "git"
+port = 22
+fingerprint = "SHA256:abcDEF0123+/="
+public_key = "/tmp/key.pub"
+identity_file = "/tmp/key"
+known_hosts_file = "/tmp/known_hosts"
+[[profiles.ssh_hosts]]
+host = "GITHUB.COM"
+user = "git"
+port = 22
+fingerprint = "SHA256:abcDEF0123+/="
+public_key = "/tmp/key.pub"
+identity_file = "/tmp/key"
+known_hosts_file = "/tmp/known_hosts"
+[[scopes]]
+name = "work"
+path = "/tmp/work"
+profile = "work"
+"#;
+    assert!(matches!(
+        Config::parse(duplicate_ssh),
+        Err(ConfigError::InvalidSshPolicy { .. })
+    ));
+
+    let github_helper = r#"
+version = 2
+[[profiles]]
+name = "work"
+[profiles.git]
+author = { name = "Synthetic", email = "synthetic@example.invalid" }
+committer = { name = "Synthetic", email = "synthetic@example.invalid" }
+[[profiles.https_credentials]]
+host = "api.ghe.com"
+helper = "/usr/bin/git"
+[[scopes]]
+name = "work"
+path = "/tmp/work"
+profile = "work"
+"#;
+    assert!(matches!(
+        Config::parse(github_helper),
+        Err(ConfigError::InvalidHttpsCredentialPolicy { .. })
+    ));
+
+    let bound_host_helper = r#"
+version = 2
+[[profiles]]
+name = "work"
+[profiles.git]
+author = { name = "Synthetic", email = "synthetic@example.invalid" }
+committer = { name = "Synthetic", email = "synthetic@example.invalid" }
+[profiles.github]
+host = "forge.example.invalid"
+account_id = "4242"
+account_selector = "work-user"
+token_fingerprint = "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[[profiles.https_credentials]]
+host = "forge.example.invalid"
+helper = "/usr/bin/git"
+[[scopes]]
+name = "work"
+path = "/tmp/work"
+profile = "work"
+"#;
+    assert!(matches!(
+        Config::parse(bound_host_helper),
+        Err(ConfigError::InvalidHttpsCredentialPolicy { .. })
+    ));
+}
+
+#[test]
 fn upstream_baselines_are_pinned_to_the_configured_remote_and_valid_oid() {
     let valid = r#"
 version = 2
@@ -394,6 +531,8 @@ fn profile_and_scope_edits_are_validated_and_v1_edits_become_v3() {
         git: config.policies()[0].git.clone(),
         github: None,
         ssh: None,
+        ssh_hosts: Vec::new(),
+        https_credentials: Vec::new(),
         github_merge: None,
         run: Default::default(),
     };

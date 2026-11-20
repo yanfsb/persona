@@ -10,7 +10,7 @@ Do not commit real names/emails, local paths, tokens, passwords, private keys, r
 
 ## Model
 
-A profile holds reusable Git author/committer identity, optional signing and SSH selectors, named remotes/destinations (`allow` and `deny_destinations`), optional GitHub account/repository policy (`repositories` and `deny_repositories`), and per-profile command policies (`[profiles.git.commands]`, `[profiles.github.commands]`, `[profiles.run]`). A scope maps an absolute physical directory root to one profile. The most-specific matching scope is used; scopes do not inherit settings implicitly.
+A profile holds reusable Git author/committer identity, optional signing and SSH selectors, named remotes/destinations (`allow` and `deny_destinations`), optional GitHub account/repository policy (`repositories` and `deny_repositories`), optional external HTTPS credential helpers, and per-profile command policies (`[profiles.git.commands]`, `[profiles.github.commands]`, `[profiles.run]`). A scope maps an absolute physical directory root to one profile. The most-specific matching scope is used; scopes do not inherit settings implicitly.
 
 ## Minimal synthetic example
 
@@ -77,5 +77,38 @@ persona config migrate --preview
 ```
 
 Apply is explicit; Persona creates a private backup. `persona config rollback --backup PRIVATE_BACKUP_PATH` restores a backup created by Persona. Inspect a preview and keep backup paths private.
+
+## SSH transports and external HTTPS credentials
+
+`[profiles.ssh]` remains the primary SSH transport policy. Add one or more `[[profiles.ssh_hosts]]` entries to authorize additional `(host, user, port)` selectors in the same profile; for example, this lets one profile keep a GitHub SSH key policy while adding a separate forge host. A duplicate selector across the primary and additional policies is invalid. Every matched SSH destination still goes through the managed adapter and its exact host, user, port, key fingerprint, and known-hosts checks.
+
+```toml
+[profiles.ssh]
+host = "github.com"
+user = "git"
+port = 22
+fingerprint = "SHA256:synthetic-fingerprint"
+public_key = "/tmp/persona-example/github.pub"
+identity_file = "/tmp/persona-example/github.key"
+known_hosts_file = "/tmp/persona-example/known_hosts"
+
+[[profiles.ssh_hosts]]
+host = "forge.example.invalid"
+user = "git"
+port = 22
+fingerprint = "SHA256:synthetic-fingerprint"
+public_key = "/tmp/persona-example/forge.pub"
+identity_file = "/tmp/persona-example/forge.key"
+known_hosts_file = "/tmp/persona-example/known_hosts"
+```
+
+Non-GitHub HTTPS credentials are separately opt-in per host with `[[profiles.https_credentials]]`. Each entry has a `host`, an absolute executable `helper`, and optional argument strings `args`; Persona invokes the helper directly (not through a shell). GitHub hosts, including a profile's bound GitHub host, cannot use this mechanism: those credentials continue to require the enrolled `[profiles.github]` binding. Before invoking an external helper, Persona checks that the requested exact HTTPS repository is allowed by the operation's `fetch_destinations` or `push_destinations` and is not matched by `deny_destinations`. `store` and `erase` remain no-ops.
+
+```toml
+[[profiles.https_credentials]]
+host = "forge.example.invalid"
+helper = "/usr/local/bin/forge-credential-helper"
+args = ["--profile", "work"]
+```
 
 For command syntax and optional online enrollment, see [CLI reference](cli.md). Enrollment is an explicit online action; offline status/check does not contact GitHub or retrieve a token.

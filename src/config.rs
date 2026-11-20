@@ -34,10 +34,30 @@ pub struct Profile {
     pub github: Option<GitHubBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_hosts: Vec<SshPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub https_credentials: Vec<HttpsCredentialPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_merge: Option<GitHubMergePolicy>,
     #[serde(default, skip_serializing_if = "CommandPolicy::is_default")]
     pub run: CommandPolicy,
+}
+
+impl Profile {
+    pub fn ssh_policies(&self) -> Vec<&SshPolicy> {
+        self.ssh.iter().chain(self.ssh_hosts.iter()).collect()
+    }
+
+    pub fn has_ssh_policy(&self) -> bool {
+        !self.ssh_policies().is_empty()
+    }
+
+    pub fn https_credential_for_host(&self, host: &str) -> Option<&HttpsCredentialPolicy> {
+        self.https_credentials
+            .iter()
+            .find(|policy| policy.host.eq_ignore_ascii_case(host))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -69,6 +89,15 @@ impl GitHubBinding {
             &self.deny_repositories,
         )
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpsCredentialPolicy {
+    pub host: String,
+    pub helper: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -342,6 +371,7 @@ pub enum ConfigError {
     InvalidGitCommandPolicy { scope: String },
     InvalidRunCommandPolicy { profile: String },
     InvalidSshPolicy { profile: String },
+    InvalidHttpsCredentialPolicy { profile: String },
 }
 
 #[derive(Debug)]
@@ -442,6 +472,10 @@ impl std::fmt::Display for ConfigError {
             Self::InvalidSshPolicy { profile } => {
                 write!(f, "profile `{profile}` has an invalid SSH transport policy")
             }
+            Self::InvalidHttpsCredentialPolicy { profile } => write!(
+                f,
+                "profile `{profile}` has an invalid HTTPS credential helper policy"
+            ),
         }
     }
 }
@@ -501,6 +535,7 @@ impl Config {
         validate_git_policy(&scope_name, &profile.git)?;
         validate_github_binding(&profile)?;
         validate_ssh_policy(&profile)?;
+        validate_https_credential_policies(&profile)?;
         validate_github_merge_policy(&profile)?;
         validate_run_command_policy(&profile)?;
         Ok(Self {
@@ -526,6 +561,7 @@ impl Config {
         validate_git_policy(&profile.name, &profile.git)?;
         validate_github_binding(&profile)?;
         validate_ssh_policy(&profile)?;
+        validate_https_credential_policies(&profile)?;
         validate_github_merge_policy(&profile)?;
         validate_run_command_policy(&profile)?;
         self.profiles.push(profile);
@@ -543,6 +579,7 @@ impl Config {
         };
         validate_github_binding(&profile)?;
         validate_ssh_policy(&profile)?;
+        validate_https_credential_policies(&profile)?;
         validate_github_merge_policy(&profile)?;
         validate_run_command_policy(&profile)?;
         validate_git_command_policy(&profile.name, &profile.git.commands)?;
@@ -768,6 +805,8 @@ impl Config {
                 git: scope.git.clone(),
                 github: None,
                 ssh: None,
+                ssh_hosts: Vec::new(),
+                https_credentials: Vec::new(),
                 github_merge: None,
                 run: CommandPolicy::default(),
             });
@@ -808,6 +847,7 @@ impl Config {
             validate_github_binding(profile)?;
             validate_git_command_policy(&profile.name, &profile.git.commands)?;
             validate_ssh_policy(profile)?;
+            validate_https_credential_policies(profile)?;
             validate_github_merge_policy(profile)?;
             validate_run_command_policy(profile)?;
             if profile.name.trim().is_empty() || profile.name.trim() != profile.name {
@@ -870,6 +910,7 @@ impl Config {
             validate_github_binding(profile)?;
             validate_git_command_policy(&profile.name, &profile.git.commands)?;
             validate_ssh_policy(profile)?;
+            validate_https_credential_policies(profile)?;
             validate_github_merge_policy(profile)?;
             validate_run_command_policy(profile)?;
             if profile
@@ -1146,44 +1187,82 @@ fn valid_ssh_host(host: &str) -> bool {
 }
 
 fn validate_ssh_policy(profile: &Profile) -> Result<(), ConfigError> {
-    let Some(ssh) = &profile.ssh else {
-        return Ok(());
-    };
-    let host_valid = valid_ssh_host(&ssh.host);
-    let user_valid = !ssh.user.is_empty()
-        && ssh
-            .user
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    let fingerprint_valid = ssh
-        .fingerprint
-        .strip_prefix("SHA256:")
-        .is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-        });
-    let paths_valid = ssh.public_key.is_absolute()
-        && ssh.known_hosts_file.is_absolute()
-        && ssh
-            .identity_file
-            .as_ref()
-            .is_none_or(|path| path.is_absolute())
-        && ssh
-            .agent_socket
-            .as_ref()
-            .is_none_or(|path| path.is_absolute());
-    if !host_valid
-        || !user_valid
-        || ssh.port == 0
-        || !fingerprint_valid
-        || !paths_valid
-        || (ssh.identity_file.is_some() == ssh.agent_socket.is_some())
-    {
-        return Err(ConfigError::InvalidSshPolicy {
-            profile: profile.name.clone(),
-        });
+    let mut selectors = HashSet::new();
+    for ssh in profile.ssh_policies() {
+        let host_valid = valid_ssh_host(&ssh.host);
+        let user_valid = !ssh.user.is_empty()
+            && ssh
+                .user
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        let fingerprint_valid = ssh
+            .fingerprint
+            .strip_prefix("SHA256:")
+            .is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+                    })
+            });
+        let paths_valid = ssh.public_key.is_absolute()
+            && ssh.known_hosts_file.is_absolute()
+            && ssh
+                .identity_file
+                .as_ref()
+                .is_none_or(|path| path.is_absolute())
+            && ssh
+                .agent_socket
+                .as_ref()
+                .is_none_or(|path| path.is_absolute());
+        let selector = (ssh.host.to_ascii_lowercase(), ssh.user.clone(), ssh.port);
+        if !host_valid
+            || !user_valid
+            || ssh.port == 0
+            || !fingerprint_valid
+            || !paths_valid
+            || (ssh.identity_file.is_some() == ssh.agent_socket.is_some())
+            || !selectors.insert(selector)
+        {
+            return Err(ConfigError::InvalidSshPolicy {
+                profile: profile.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_https_credential_policies(profile: &Profile) -> Result<(), ConfigError> {
+    let bound_github_host = profile
+        .github
+        .as_ref()
+        .map(|binding| binding.host.to_ascii_lowercase());
+    let mut hosts = HashSet::new();
+    for policy in &profile.https_credentials {
+        let host = policy.host.to_ascii_lowercase();
+        let helper_valid = policy.helper.is_absolute()
+            && policy.helper.to_str().is_some_and(|path| {
+                !path.is_empty()
+                    && !path
+                        .bytes()
+                        .any(|byte| byte == 0 || byte.is_ascii_control())
+            });
+        let args_valid = policy.args.len() <= 16
+            && policy.args.iter().all(|argument| {
+                !argument.is_empty()
+                    && argument.len() <= 256
+                    && !argument.bytes().any(|byte| byte.is_ascii_control())
+            });
+        if !valid_ssh_host(&policy.host)
+            || crate::credential::is_known_github_host(&host)
+            || bound_github_host.as_deref() == Some(host.as_str())
+            || !hosts.insert(host)
+            || !helper_valid
+            || !args_valid
+        {
+            return Err(ConfigError::InvalidHttpsCredentialPolicy {
+                profile: profile.name.clone(),
+            });
+        }
     }
     Ok(())
 }

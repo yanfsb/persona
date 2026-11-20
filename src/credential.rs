@@ -139,7 +139,16 @@ pub fn destination_host(destination: &str) -> Option<String> {
 }
 
 pub fn is_known_github_host(host: &str) -> bool {
-    matches!(host, "github.com" | "ssh.github.com" | "ghe.com") || host.ends_with(".ghe.com")
+    let host = host.to_ascii_lowercase();
+    matches!(host.as_str(), "github.com" | "ssh.github.com" | "ghe.com")
+        || host.ends_with(".ghe.com")
+}
+
+pub fn requires_github_binding(destination_host: Option<&str>, binding_host: Option<&str>) -> bool {
+    let Some(host) = destination_host else {
+        return false;
+    };
+    is_known_github_host(host) || binding_host.is_some_and(|bound| bound.eq_ignore_ascii_case(host))
 }
 
 pub struct GithubSelector {
@@ -1156,8 +1165,9 @@ fn read_private_key(path: &Path) -> Result<Vec<u8>, CredentialError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialError, GithubSelector, Secret, encode_asset_query_value, parse_included_response,
-        token_fingerprint, upload_curl_executable, verify_fingerprint,
+        CredentialError, GithubSelector, Secret, encode_asset_query_value, is_known_github_host,
+        parse_included_response, requires_github_binding, token_fingerprint,
+        upload_curl_executable, verify_fingerprint,
     };
     use crate::storage::PersonaPaths;
     use std::fs;
@@ -1169,6 +1179,22 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn github_binding_is_required_only_for_github_or_the_bound_host() {
+        assert!(requires_github_binding(Some("github.com"), None));
+        assert!(requires_github_binding(Some("api.ghe.com"), None));
+        assert!(requires_github_binding(
+            Some("forge.example.invalid"),
+            Some("FORGE.EXAMPLE.INVALID")
+        ));
+        assert!(!requires_github_binding(
+            Some("forge.example.invalid"),
+            Some("github.com")
+        ));
+        assert!(!requires_github_binding(None, Some("github.com")));
+        assert!(is_known_github_host("GITHUB.COM"));
+    }
 
     #[test]
     fn included_api_responses_use_the_final_http_status_and_body() {

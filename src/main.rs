@@ -637,6 +637,9 @@ struct ProfileEditArgs {
     /// Remove the SSH transport policy from this profile.
     #[arg(long, help_heading = "SSH Transport")]
     clear_ssh: bool,
+    /// Remove all opt-in external HTTPS credential helpers from this profile.
+    #[arg(long, help_heading = "Push & Remotes")]
+    clear_https_credentials: bool,
     /// Allowed GitHub repository `OWNER/REPO` or `OWNER/*` pattern for `gh` (repeatable).
     #[arg(long = "github-repo", help_heading = "GitHub")]
     github_repositories: Vec<String>,
@@ -1964,10 +1967,12 @@ fn show_status(
     let destination_host = push
         .as_ref()
         .and_then(|request| persona::credential::destination_host(&request.destination));
-    let github_operation = destination_host.as_ref().is_some_and(|host| {
-        persona::credential::is_known_github_host(host)
-            || selected_profile.is_some_and(|profile| profile.github.is_some())
-    });
+    let github_operation = persona::credential::requires_github_binding(
+        destination_host.as_deref(),
+        selected_profile
+            .and_then(|profile| profile.github.as_ref())
+            .map(|binding| binding.host.as_str()),
+    );
     let mut findings = initial_report.findings.clone();
     findings.extend(online_findings);
     findings.extend(integration_coverage_findings(&directory));
@@ -2271,6 +2276,8 @@ fn setup(args: SetupArgs) -> Result<u8, String> {
         name: args.profile.clone(),
         github: None,
         ssh: None,
+        ssh_hosts: Vec::new(),
+        https_credentials: Vec::new(),
         github_merge: None,
         run: CommandPolicy::default(),
         git: GitPolicy {
@@ -2439,7 +2446,7 @@ fn git_credential_helper(action: &str) -> Result<u8, String> {
     if matches!(action, "store" | "erase") {
         return Ok(0);
     }
-    persona::git_https::parse_credential_request(input.expose())
+    let request = persona::git_https::parse_credential_request(input.expose())
         .map_err(|_| "invalid Git HTTPS credential request".to_owned())?;
 
     let configured_path = std::env::var_os("PERSONA_CONFIG_PATH").map(PathBuf::from);
@@ -2459,10 +2466,6 @@ fn git_credential_helper(action: &str) -> Result<u8, String> {
         .iter()
         .find(|profile| profile.name == policy.profile)
         .ok_or_else(|| "managed Persona profile is unavailable".to_owned())?;
-    let binding = profile
-        .github
-        .as_ref()
-        .ok_or_else(|| "managed Persona profile has no GitHub credential binding".to_owned())?;
     let direction = match std::env::var("PERSONA_GIT_CREDENTIAL_DIRECTION").as_deref() {
         Ok("fetch") => "fetch",
         Ok("push") | Err(_) => "push",
@@ -2513,22 +2516,48 @@ fn git_credential_helper(action: &str) -> Result<u8, String> {
     if allowed_destinations.is_empty() {
         return Err("managed Persona profile has no allowed HTTPS destinations".to_owned());
     }
-    let gh = gh_executable().ok_or_else(|| "GitHub CLI is unavailable".to_owned())?;
-    let paths =
-        PersonaPaths::discover().map_err(|_| "cannot resolve Persona private state".to_owned())?;
-    let selector = persona::credential::GithubSelector::discover(gh, binding.host.clone(), paths)
-        .map_err(|_| "cannot inspect native GitHub credential selector".to_owned())?;
     let mut output = std::io::stdout().lock();
-    persona::git_https::handle_credential_helper_with_denies(
-        action,
-        input.expose(),
-        binding,
-        &allowed_destinations,
-        &policy.git.deny_destinations,
-        &selector,
-        &mut output,
-    )
-    .map_err(|_| "Git HTTPS credential request denied".to_owned())?;
+    let github_required = persona::credential::requires_github_binding(
+        Some(request.host()),
+        profile.github.as_ref().map(|binding| binding.host.as_str()),
+    );
+    if github_required {
+        let binding = profile
+            .github
+            .as_ref()
+            .ok_or_else(|| "managed Persona profile has no GitHub credential binding".to_owned())?;
+        let gh = gh_executable().ok_or_else(|| "GitHub CLI is unavailable".to_owned())?;
+        let paths = PersonaPaths::discover()
+            .map_err(|_| "cannot resolve Persona private state".to_owned())?;
+        let selector =
+            persona::credential::GithubSelector::discover(gh, binding.host.clone(), paths)
+                .map_err(|_| "cannot inspect native GitHub credential selector".to_owned())?;
+        persona::git_https::handle_credential_helper_with_denies(
+            action,
+            input.expose(),
+            binding,
+            &allowed_destinations,
+            &policy.git.deny_destinations,
+            &selector,
+            &mut output,
+        )
+        .map_err(|_| "Git HTTPS credential request denied".to_owned())?;
+    } else if let Some(https_policy) = profile.https_credential_for_host(request.host()) {
+        persona::git_https::handle_external_credential_helper_with_denies(
+            action,
+            input.expose(),
+            https_policy,
+            &allowed_destinations,
+            &policy.git.deny_destinations,
+            &mut output,
+        )
+        .map_err(|_| "Git HTTPS credential request denied".to_owned())?;
+    } else {
+        return Err(
+            "managed Persona profile has no HTTPS credential policy for destination host"
+                .to_owned(),
+        );
+    }
     output
         .flush()
         .map_err(|_| "cannot write Git credential response".to_owned())?;
@@ -2753,7 +2782,10 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
                     },
                     "signing_configured": profile.git.signing.is_some(),
                     "push_configured": profile.git.push.is_some(),
-                    "ssh_configured": profile.ssh.is_some(),
+                    "ssh_configured": profile.has_ssh_policy(),
+                    "ssh_hosts": profile.ssh_policies().iter().map(|ssh| ssh.host.as_str()).collect::<Vec<_>>(),
+                    "https_credentials_configured": !profile.https_credentials.is_empty(),
+                    "https_credential_hosts": profile.https_credentials.iter().map(|credential| credential.host.as_str()).collect::<Vec<_>>(),
                     "github_configured": profile.github.is_some(),
                     "git_commands": {
                         "mode": match profile.git.commands.effective_mode() {
@@ -2854,12 +2886,34 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
             println!("run commands: {}", command_policy_summary(&profile.run));
             println!(
                 "SSH transport policy: {}",
-                if profile.ssh.is_some() {
+                if profile.has_ssh_policy() {
                     "configured"
                 } else {
                     "not configured"
                 }
             );
+            if profile.has_ssh_policy() {
+                println!(
+                    "SSH transport hosts: {}",
+                    profile
+                        .ssh_policies()
+                        .iter()
+                        .map(|policy| policy.host.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if !profile.https_credentials.is_empty() {
+                println!(
+                    "HTTPS credential helpers: {}",
+                    profile
+                        .https_credentials
+                        .iter()
+                        .map(|credential| credential.host.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             Ok(0)
         }
         ProfileCommands::Verify { name, config } => {
@@ -3395,6 +3449,20 @@ fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Resul
         name: args.name,
         github,
         ssh,
+        ssh_hosts: existing.map_or_else(Vec::new, |profile| {
+            if args.clear_ssh {
+                Vec::new()
+            } else {
+                profile.ssh_hosts.clone()
+            }
+        }),
+        https_credentials: existing.map_or_else(Vec::new, |profile| {
+            if args.clear_https_credentials {
+                Vec::new()
+            } else {
+                profile.https_credentials.clone()
+            }
+        }),
         github_merge,
         run,
         git: GitPolicy {

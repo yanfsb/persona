@@ -8,7 +8,7 @@ use crate::runtime::{
     persona_dispatcher_executable, resolve_config_path, sha256_file, ssh_keygen_executable,
     status_exit_code, validate_managed_shim_directory, wait_child_ignoring_sigint,
 };
-use crate::ssh_adapter::validate_managed_ssh_destination;
+use crate::ssh_adapter::validate_managed_ssh_policies;
 use crate::storage::PersonaPaths;
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -914,8 +914,8 @@ pub fn run_managed_git() -> Result<u8, String> {
         if crate::destination::is_supported_https_destination(&destination) {
             use_managed_ssh = false;
         } else {
-            validate_managed_ssh_destination(
-                profile.ssh.as_ref(),
+            validate_managed_ssh_policies(
+                &profile.ssh_policies(),
                 &destination,
                 "git-receive-pack",
             )
@@ -1168,12 +1168,20 @@ pub fn run_managed_git() -> Result<u8, String> {
                         .map(|lease| lease.expected_oid.clone()),
                 })
                 .collect(),
-            github_binding: profile.github.as_ref().map(|binding| {
-                crate::push_handoff::HandoffGithubBinding {
-                    host: binding.host.clone(),
-                    account_id: binding.account_id.clone(),
-                }
-            }),
+            github_binding: if crate::credential::requires_github_binding(
+                crate::credential::destination_host(&request.destination).as_deref(),
+                profile.github.as_ref().map(|binding| binding.host.as_str()),
+            ) {
+                profile
+                    .github
+                    .as_ref()
+                    .map(|binding| crate::push_handoff::HandoffGithubBinding {
+                        host: binding.host.clone(),
+                        account_id: binding.account_id.clone(),
+                    })
+            } else {
+                None
+            },
             dynamic_tuples: push_dynamic_tuples,
             force_requested: push_force_requested,
         };
@@ -1778,7 +1786,7 @@ fn enforce_remote_mutation_policy(profile: &Profile, args: &[OsString]) -> Resul
     if !crate::destination::is_supported_https_destination(destination)
         && (destination.contains(':') || destination.starts_with("ssh://"))
     {
-        validate_managed_ssh_destination(profile.ssh.as_ref(), destination, "git-upload-pack")
+        validate_managed_ssh_policies(&profile.ssh_policies(), destination, "git-upload-pack")
             .map_err(|reason| format!("remote destination has no managed SSH policy: {reason}"))?;
     }
     Ok(())
@@ -2062,7 +2070,7 @@ fn authorize_transport_scheme(
     if crate::destination::is_supported_https_destination(destination) {
         Ok(false)
     } else {
-        validate_managed_ssh_destination(profile.ssh.as_ref(), destination, operation).map_err(
+        validate_managed_ssh_policies(&profile.ssh_policies(), destination, operation).map_err(
             |reason| format!("SSH destination has no valid managed transport: {reason}"),
         )?;
         Ok(true)
@@ -2147,9 +2155,10 @@ fn authorize_managed_push(
     let manifest_digest = sha256_file(&manifest_path)?;
 
     let destination_host = crate::credential::destination_host(&request.destination);
-    let github_required = destination_host.as_deref().is_some_and(|host| {
-        crate::credential::is_known_github_host(host) || profile.github.is_some()
-    }) || profile.github.is_some();
+    let github_required = crate::credential::requires_github_binding(
+        destination_host.as_deref(),
+        profile.github.as_ref().map(|binding| binding.host.as_str()),
+    );
     if github_required {
         let binding = profile
             .github

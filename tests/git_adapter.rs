@@ -1347,3 +1347,187 @@ fn managed_https_push_succeeds_and_rejects_a_server_update_race() {
         String::from_utf8_lossy(&expected_local_head.stdout).trim()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn managed_fetch_uses_additional_ssh_host_and_rejects_unconfigured_host() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let git = std::path::PathBuf::from(
+        std::env::var_os("PERSONA_TEST_GIT").expect("PERSONA_TEST_GIT must be set"),
+    );
+    let ssh_keygen = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join("ssh-keygen"))
+        .find(|path| path.is_file())
+        .expect("ssh-keygen executable required");
+    let temporary = tempdir().unwrap();
+    let repo = temporary.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+
+    let key = temporary.path().join("client-key");
+    let generated = Command::new(&ssh_keygen)
+        .env_clear()
+        .env("HOME", temporary.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let public_key = Path::new(&format!("{}.pub", key.display())).to_path_buf();
+    let fingerprint_output = Command::new(&ssh_keygen)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("-lf")
+        .arg(&public_key)
+        .args(["-E", "sha256"])
+        .output()
+        .unwrap();
+    assert!(fingerprint_output.status.success());
+    let fingerprint = String::from_utf8_lossy(&fingerprint_output.stdout)
+        .split_whitespace()
+        .find(|field| field.starts_with("SHA256:"))
+        .unwrap()
+        .to_owned();
+    let known_hosts = temporary.path().join("known_hosts");
+    fs::write(
+        &known_hosts,
+        "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFixtureHostKey\nforge.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFixtureHostKey\n",
+    )
+    .unwrap();
+
+    let ssh_marker = temporary.path().join("ssh-calls");
+    let fake_ssh = temporary.path().join("ssh-fixture");
+    fs::write(
+        &fake_ssh,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexit 71\n",
+            ssh_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let forge = "git@forge.example.invalid:org/repo.git";
+    let unconfigured = "git@unconfigured.example.invalid:org/repo.git";
+    let initialized = fixture_git(&git, temporary.path())
+        .args(["init", "--quiet"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    for (name, url) in [("origin", forge), ("third", unconfigured)] {
+        let added = fixture_git(&git, temporary.path())
+            .args(["-C"])
+            .arg(&repo)
+            .args(["remote", "add", name, url])
+            .output()
+            .unwrap();
+        assert!(added.status.success());
+    }
+
+    let policy = temporary.path().join("persona.toml");
+    let repo_path =
+        toml::Value::String(repo.canonicalize().unwrap().to_string_lossy().into_owned());
+    let public_key_value = toml::Value::String(public_key.to_string_lossy().into_owned());
+    let key_value = toml::Value::String(key.to_string_lossy().into_owned());
+    let known_hosts_value = toml::Value::String(known_hosts.to_string_lossy().into_owned());
+    fs::write(
+        &policy,
+        format!(
+            r#"version = 3
+
+[[profiles]]
+name = "fixture"
+[profiles.git]
+author = {{ name = "Fixture", email = "fixture@example.invalid" }}
+committer = {{ name = "Fixture", email = "fixture@example.invalid" }}
+[[profiles.git.remotes]]
+name = "origin"
+fetch_destinations = ["{forge}"]
+push_destinations = []
+[[profiles.git.remotes]]
+name = "third"
+fetch_destinations = ["{unconfigured}"]
+push_destinations = []
+[profiles.github]
+host = "github.com"
+account_id = "4242"
+account_selector = "synthetic-user"
+token_fingerprint = "hmac-sha256:{fingerprint_hash}"
+[profiles.ssh]
+host = "github.com"
+user = "git"
+port = 22
+fingerprint = "{fingerprint}"
+public_key = {public_key_value}
+identity_file = {key_value}
+known_hosts_file = {known_hosts_value}
+[[profiles.ssh_hosts]]
+host = "forge.example.invalid"
+user = "git"
+port = 22
+fingerprint = "{fingerprint}"
+public_key = {public_key_value}
+identity_file = {key_value}
+known_hosts_file = {known_hosts_value}
+[[scopes]]
+name = "fixture"
+path = {repo_path}
+profile = "fixture"
+"#,
+            fingerprint_hash = "0".repeat(64),
+        ),
+    )
+    .unwrap();
+
+    let run_fetch = |remote: &str| {
+        Command::new(env!("CARGO_BIN_EXE_persona"))
+            .env_clear()
+            .env("HOME", temporary.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("PERSONA_GIT", &git)
+            .env("PERSONA_SSH", &fake_ssh)
+            .env("PERSONA_SSH_KEYGEN", &ssh_keygen)
+            .current_dir(&repo)
+            .args(["run", "--config"])
+            .arg(&policy)
+            .args(["--cwd"])
+            .arg(&repo)
+            .args(["--", "git", "fetch", remote])
+            .output()
+            .unwrap()
+    };
+
+    let configured = run_fetch("origin");
+    assert!(
+        !configured.status.success(),
+        "fixture SSH transport exits 71"
+    );
+    assert!(
+        ssh_marker.exists(),
+        "configured additional SSH host should reach the managed SSH adapter: {}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let calls = fs::read_to_string(&ssh_marker).unwrap();
+    assert!(
+        calls.contains("forge.example.invalid"),
+        "SSH calls: {calls}"
+    );
+    assert!(calls.contains("git-upload-pack 'org/repo.git'"));
+
+    fs::remove_file(&ssh_marker).unwrap();
+    let rejected = run_fetch("third");
+    assert!(!rejected.status.success());
+    assert!(
+        !ssh_marker.exists(),
+        "unconfigured SSH host must be rejected before transport: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("SSH destination differs from profile policy"),
+        "unexpected rejection: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}

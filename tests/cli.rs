@@ -4129,3 +4129,348 @@ profile = "work"
         "managed git pull passed unsupported option: {pull_stderr}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn external_https_credentials_are_opt_in_and_github_binding_remains_host_scoped() {
+    use serde_json::Value;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let xdg = temporary.path().join("xdg-config");
+    let state = temporary.path().join("state");
+    let repo = temporary.path().join("repo");
+    let helper_marker = temporary.path().join("external-helper-called");
+    let helper = temporary.path().join("external-credential-helper");
+    let git = PathBuf::from(std::env::var_os("PERSONA_TEST_GIT").expect("PERSONA_TEST_GIT"));
+    fs::create_dir_all(&repo).unwrap();
+
+    let run_git = |args: &[&str]| {
+        Command::new(&git)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(run_git(&["init", "-q", "-b", "main"]).status.success());
+    assert!(
+        run_git(&["config", "user.name", "Synthetic"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(&["config", "user.email", "synthetic@example.invalid"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(&[
+            "remote",
+            "add",
+            "origin",
+            "git@forge.example.invalid:org/repo.git"
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        run_git(&[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "git@forge.example.invalid:org/repo.git",
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        run_git(&[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            "https://github.com/org/repo.git",
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        run_git(&["commit", "--allow-empty", "-m", "fixture"])
+            .status
+            .success()
+    );
+    let oid = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = fixture-command ] && [ \"$2\" = get ] || exit 64\n: > '{}'\ncat >/dev/null\nprintf '%s\\n' 'username=synthetic-user' 'password=synthetic-password' ''\n",
+            helper_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config_dir = xdg.join("persona");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = config_dir.join("config.toml");
+    let scope_value =
+        toml::Value::String(repo.canonicalize().unwrap().to_string_lossy().into_owned());
+    let helper_value = toml::Value::String(helper.to_string_lossy().into_owned());
+    let ssh_public_key = toml::Value::String(
+        temporary
+            .path()
+            .join("synthetic.pub")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let ssh_identity = toml::Value::String(
+        temporary
+            .path()
+            .join("synthetic.key")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let known_hosts = toml::Value::String(
+        temporary
+            .path()
+            .join("known_hosts")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let contents = format!(
+        r#"version = 3
+
+[[profiles]]
+name = "work"
+[profiles.git]
+author = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
+committer = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
+deny_destinations = ["https://forge.example.invalid/org/denied.git"]
+[[profiles.git.remotes]]
+name = "origin"
+fetch_destinations = [
+  "https://forge.example.invalid/org/repo.git",
+  "https://forge.example.invalid/org/denied.git",
+]
+push_destinations = [
+  "git@forge.example.invalid:org/repo.git",
+  "https://forge.example.invalid/org/repo.git",
+  "https://github.com/org/repo.git",
+]
+[profiles.git.push]
+remote = "origin"
+destinations = [
+  "git@forge.example.invalid:org/repo.git",
+  "https://forge.example.invalid/org/repo.git",
+  "https://github.com/org/repo.git",
+]
+allow_initial_push = true
+[profiles.github]
+host = "github.com"
+account_id = "4242"
+account_selector = "synthetic-user"
+token_fingerprint = "hmac-sha256:{fingerprint}"
+[profiles.ssh]
+host = "github.com"
+user = "git"
+port = 22
+fingerprint = "SHA256:syntheticfingerprint"
+public_key = {ssh_public_key}
+identity_file = {ssh_identity}
+known_hosts_file = {known_hosts}
+[[profiles.ssh_hosts]]
+host = "forge.example.invalid"
+user = "git"
+port = 22
+fingerprint = "SHA256:syntheticfingerprint"
+public_key = {ssh_public_key}
+identity_file = {ssh_identity}
+known_hosts_file = {known_hosts}
+[[profiles.https_credentials]]
+host = "forge.example.invalid"
+helper = {helper_value}
+args = ["fixture-command"]
+[[scopes]]
+name = "fixture"
+path = {scope_value}
+profile = "work"
+"#,
+        fingerprint = "0".repeat(64),
+    );
+    fs::write(&config, contents).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let environment = || {
+        vec![
+            ("HOME", home.as_path()),
+            ("XDG_CONFIG_HOME", xdg.as_path()),
+            ("XDG_STATE_HOME", state.as_path()),
+            ("PERSONA_GIT", git.as_path()),
+            ("PATH", Path::new("/usr/bin:/bin")),
+        ]
+    };
+
+    let push_check = |destination: &str| {
+        let tuple = format!(
+            "refs/heads/main {oid} refs/heads/main {}\n",
+            "0".repeat(oid.len())
+        );
+        persona_command(&repo)
+            .envs(environment())
+            .args([
+                "check",
+                "--cwd",
+                repo.to_str().unwrap(),
+                "--operation",
+                "push",
+                "--remote",
+                "origin",
+                "--destination",
+                destination,
+                "--format",
+                "json",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().unwrap().write_all(tuple.as_bytes())?;
+                child.wait_with_output()
+            })
+            .unwrap()
+    };
+
+    let forge_check = push_check("git@forge.example.invalid:org/repo.git");
+    let forge_decision: Value = serde_json::from_slice(&forge_check.stdout).unwrap();
+    assert!(
+        !forge_decision["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|property| property == "github.credential.binding"),
+        "non-GitHub destination must not require GitHub account evidence: {forge_decision}"
+    );
+    assert!(
+        !forge_decision["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["property"] == "github.credential.binding"),
+        "non-GitHub destination must not emit GitHub account findings: {forge_decision}"
+    );
+
+    let github_check = push_check("https://github.com/org/repo.git");
+    let github_decision: Value = serde_json::from_slice(&github_check.stdout).unwrap();
+    assert!(
+        github_decision["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|property| property == "github.credential.binding"),
+        "GitHub destinations must keep the enrolled-account requirement: {github_decision}"
+    );
+    assert!(
+        github_decision["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker["property"] == "github.credential.binding"),
+        "offline GitHub push check must fail closed without credential evidence: {github_decision}"
+    );
+
+    let credential_request = |path: &str| {
+        let mut child = persona_command(&repo)
+            .envs(environment())
+            .env("PERSONA_GIT_CREDENTIAL_DIRECTION", "fetch")
+            .env("PERSONA_GIT_CREDENTIAL_REMOTE", "origin")
+            .args(["credential-helper", "get"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                format!("protocol=https\nhost=forge.example.invalid\npath={path}\n\n").as_bytes(),
+            )
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let allowed = credential_request("org/repo.git");
+    assert!(
+        allowed.status.success(),
+        "allowed external helper failed: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(
+        allowed.stdout,
+        b"username=synthetic-user\npassword=synthetic-password\n\n"
+    );
+    assert!(helper_marker.exists());
+
+    fs::remove_file(&helper_marker).unwrap();
+    let not_allowed = credential_request("org/not-allowed.git");
+    assert_eq!(not_allowed.status.code(), Some(2));
+    assert!(not_allowed.stdout.is_empty());
+    assert!(
+        !helper_marker.exists(),
+        "destination outside fetch allowlist must be rejected before helper invocation"
+    );
+
+    let denied = credential_request("org/denied.git");
+    assert_eq!(denied.status.code(), Some(2));
+    assert!(denied.stdout.is_empty());
+    assert!(
+        !helper_marker.exists(),
+        "deny_destinations must be checked before helper invocation"
+    );
+
+    let show_json = persona_command(&repo)
+        .envs(environment())
+        .args(["profile", "show", "work", "--json"])
+        .output()
+        .unwrap();
+    assert!(show_json.status.success());
+    let profile: Value = serde_json::from_slice(&show_json.stdout).unwrap();
+    assert_eq!(
+        profile["ssh_hosts"],
+        serde_json::json!(["github.com", "forge.example.invalid"])
+    );
+    assert_eq!(
+        profile["https_credential_hosts"],
+        serde_json::json!(["forge.example.invalid"])
+    );
+
+    let show_text = persona_command(&repo)
+        .envs(environment())
+        .args(["profile", "show", "work"])
+        .output()
+        .unwrap();
+    assert!(show_text.status.success());
+    let text = String::from_utf8_lossy(&show_text.stdout);
+    assert!(
+        text.contains("github.com, forge.example.invalid"),
+        "profile output: {text}"
+    );
+    assert!(
+        text.contains("HTTPS credential helpers: forge.example.invalid"),
+        "profile output: {text}"
+    );
+}

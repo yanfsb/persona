@@ -146,14 +146,21 @@ pub fn validate_primary_handoff(
     if profile.name != handoff.profile {
         return Err("selected profile changed after primary push authorization".to_owned());
     }
-    let binding =
+    let github_required = crate::credential::requires_github_binding(
+        crate::credential::destination_host(&request.destination).as_deref(),
+        profile.github.as_ref().map(|binding| binding.host.as_str()),
+    );
+    let binding = if github_required {
         profile
             .github
             .as_ref()
             .map(|binding| crate::push_handoff::HandoffGithubBinding {
                 host: binding.host.clone(),
                 account_id: binding.account_id.clone(),
-            });
+            })
+    } else {
+        None
+    };
     if handoff.github_binding != binding {
         return Err("enrolled GitHub binding changed after primary push authorization".to_owned());
     }

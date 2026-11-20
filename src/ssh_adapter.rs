@@ -7,6 +7,104 @@ use crate::runtime::{
 };
 use std::path::PathBuf;
 
+pub fn select_managed_ssh_policy<'a>(
+    policies: &[&'a SshPolicy],
+    destination: &str,
+    operation: &str,
+) -> Result<&'a SshPolicy, &'static str> {
+    if policies.is_empty() {
+        return Err("SSH profile is not configured");
+    }
+    let Some((authority, _)) = crate::destination::parse_ssh_remote(destination) else {
+        return Err("SSH URL syntax is unsupported");
+    };
+    if destination.starts_with("ssh://") {
+        let Some((user, host_port)) = authority.split_once('@') else {
+            return Err("SSH URL syntax is unsupported");
+        };
+        if authority.matches('@').count() != 1 || user.is_empty() || user.contains(':') {
+            return Err("SSH URL syntax is unsupported");
+        }
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => {
+                let Ok(port) = port.parse::<u16>() else {
+                    return Err("SSH URL syntax is unsupported");
+                };
+                if port == 0 {
+                    return Err("SSH URL syntax is unsupported");
+                }
+                (host, port)
+            }
+            _ => (host_port, 22),
+        };
+        if !valid_managed_ssh_host(host) {
+            return Err("SSH URL syntax is unsupported");
+        }
+        select_policy_for_selector(policies, user, host, port, destination, operation)
+    } else {
+        let Some((user, host)) = authority.split_once('@') else {
+            return Err("SSH URL syntax is unsupported");
+        };
+        if authority.matches('@').count() != 1 || user.is_empty() || user.contains(':') {
+            return Err("SSH URL syntax is unsupported");
+        }
+        if !valid_managed_ssh_host(host) {
+            return Err("SSH URL syntax is unsupported");
+        }
+        select_policy_for_selector(policies, user, host, 22, destination, operation)
+    }
+}
+
+fn select_policy_for_selector<'a>(
+    policies: &[&'a SshPolicy],
+    user: &str,
+    host: &str,
+    port: u16,
+    destination: &str,
+    operation: &str,
+) -> Result<&'a SshPolicy, &'static str> {
+    let mut matching = policies.iter().copied().filter(|policy| {
+        policy.host.eq_ignore_ascii_case(host) && policy.user == user && policy.port == port
+    });
+    let Some(policy) = matching.next() else {
+        return Err("SSH destination differs from profile policy");
+    };
+    if matching.next().is_some() {
+        return Err("SSH destination matches multiple profile policies");
+    }
+    validate_managed_ssh_destination(Some(policy), destination, operation)?;
+    Ok(policy)
+}
+
+fn valid_managed_ssh_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.is_ascii()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+pub fn validate_managed_ssh_policies(
+    policies: &[&SshPolicy],
+    destination: &str,
+    operation: &str,
+) -> Result<(), &'static str> {
+    select_managed_ssh_policy(policies, destination, operation).map(|_| ())
+}
+
 pub fn validate_managed_ssh_destination(
     policy: Option<&SshPolicy>,
     destination: &str,
@@ -219,10 +317,10 @@ pub fn run_managed_ssh() -> Result<u8, String> {
             .map(|push| push.destinations.clone())
             .unwrap_or_default()
     };
-    let ssh_policy = profile
-        .ssh
-        .as_ref()
-        .ok_or_else(|| "SSH profile has no transport policy".to_owned())?;
+    let ssh_policies = profile.ssh_policies();
+    if ssh_policies.is_empty() {
+        return Err("SSH profile has no transport policy".to_owned());
+    }
     let candidates = ssh_destination_candidates(user, host, port, path);
     if !candidates.iter().any(|candidate| {
         crate::destination::destination_is_permitted(
@@ -233,7 +331,7 @@ pub fn run_managed_ssh() -> Result<u8, String> {
     }) {
         return Err("SSH destination is not explicitly allowed".to_owned());
     }
-    validate_managed_ssh_destination(Some(ssh_policy), &ssh_url, expected_program)
+    let ssh_policy = select_managed_ssh_policy(&ssh_policies, &ssh_url, expected_program)
         .map_err(|reason| format!("managed SSH policy rejected the request: {reason}"))?;
     let _ = gh_executable();
     let ssh = ssh_executable().ok_or_else(|| "OpenSSH executable is unavailable".to_owned())?;
