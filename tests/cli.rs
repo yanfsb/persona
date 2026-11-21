@@ -56,6 +56,10 @@ scopes = [{{ name = "base", path = {base_path} }}]
     fs::create_dir(&gate).unwrap();
     let real_git =
         PathBuf::from(std::env::var_os("PERSONA_TEST_GIT").expect("test Git executable"));
+    let sleep_bin = std::env::var_os("PERSONA_TEST_COREUTILS")
+        .map(|dir| PathBuf::from(dir).join("sleep"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("/bin/sleep"));
     let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
 
     // The first CLI pauses in Git after loading config while holding the
@@ -69,6 +73,7 @@ set -eu
 gate_dir={}
 gate_id={}
 real_git={}
+sleep_bin={}
 printf '%s\n' "$*" >> "$gate_dir/calls-$gate_id"
 if [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then
     : > "$gate_dir/entered-$gate_id"
@@ -76,7 +81,7 @@ if [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then
     while [ ! -f "$gate_dir/release" ]; do
         attempt=$((attempt + 1))
         [ "$attempt" -lt 2000 ] || exit 98
-        /bin/sleep 0.01
+        "$sleep_bin" 0.01
     done
 fi
 exec "$real_git" "$@"
@@ -84,6 +89,7 @@ exec "$real_git" "$@"
                 shell_quote(&gate.to_string_lossy()),
                 shell_quote(gate_id),
                 shell_quote(&real_git.to_string_lossy()),
+                shell_quote(&sleep_bin.to_string_lossy()),
             );
             fs::write(&git_wrapper, wrapper_script).unwrap();
             {
@@ -4438,7 +4444,7 @@ fn external_https_credentials_are_opt_in_and_github_binding_remains_host_scoped(
     fs::write(
         &helper,
         format!(
-            "#!/bin/sh\n[ \"$1\" = fixture-command ] && [ \"$2\" = get ] || exit 64\n: > '{}'\ncat >/dev/null\nprintf '%s\\n' 'username=synthetic-user' 'password=synthetic-password' ''\n",
+            "#!/bin/sh\n[ \"$1\" = fixture-command ] && [ \"$2\" = get ] || exit 64\n: > '{}'\nwhile IFS= read -r line; do [ -n \"$line\" ] || break; done\nprintf '%s\\n' 'username=synthetic-user' 'password=synthetic-password' ''\n",
             helper_marker.display()
         ),
     )

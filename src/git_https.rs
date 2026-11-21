@@ -568,7 +568,7 @@ mod tests {
         fs::write(
             &helper,
             format!(
-                "#!/bin/sh\n[ \"$1\" = \"fixture-command\" ] && [ \"$2\" = \"get\" ] || exit 2\n: > '{}'\nprintf '%s\\n' 'username=synthetic-user' 'password=synthetic-token' ''\n",
+                "#!/bin/sh\n[ \"$1\" = \"fixture-command\" ] && [ \"$2\" = \"get\" ] || exit 2\n: > '{}'\nwhile IFS= read -r line; do [ -n \"$line\" ] || break; done\nprintf '%s\\n' 'username=synthetic-user' 'password=synthetic-token' ''\n",
                 marker.display()
             ),
         )
