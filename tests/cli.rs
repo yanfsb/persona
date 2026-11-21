@@ -3369,7 +3369,10 @@ fn config_edit_validates_creates_private_backup_and_rolls_back() {
     fs::write(&replacement_file, &updated_contents).unwrap();
     fs::write(
         &valid_editor,
-        format!("#!/bin/sh\ncp '{}' \"$1\"\n", replacement_file.display()),
+        format!(
+            "#!/bin/sh\nexec > \"$1\"\nwhile IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\"; done < '{}'\n",
+            replacement_file.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&valid_editor, fs::Permissions::from_mode(0o700)).unwrap();
