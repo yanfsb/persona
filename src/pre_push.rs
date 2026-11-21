@@ -94,7 +94,7 @@ pub fn validate_primary_handoff(
                     tuple.local_ref == planned.local_ref
                         && tuple.local_oid == planned.local_oid
                         && tuple.remote_ref == planned.remote_ref
-                        && tuple.remote_oid == planned.remote_oid
+                        && (handoff.force_requested || tuple.remote_oid == planned.remote_oid)
                         && planned
                             .expected_lease_oid
                             .as_deref()
@@ -108,6 +108,56 @@ pub fn validate_primary_handoff(
     }
     if handoff.dynamic_tuples {
         request.allow_unleased_force = handoff.force_requested;
+        let mut leases: Vec<crate::git_command::ExactPushLease> = handoff
+            .exact_leases
+            .iter()
+            .map(|lease| crate::git_command::ExactPushLease {
+                remote_ref: lease.remote_ref.clone(),
+                expected_oid: lease.expected_oid.clone(),
+            })
+            .collect();
+        for tuple in &request.tuples {
+            if leases
+                .iter()
+                .any(|lease| lease.remote_ref == tuple.remote_ref)
+            {
+                continue;
+            }
+            let zero_oid = "0".repeat(tuple.remote_oid.len());
+            if handoff
+                .empty_lease_refs
+                .iter()
+                .any(|leased| leased == &tuple.remote_ref)
+            {
+                leases.push(crate::git_command::ExactPushLease {
+                    remote_ref: tuple.remote_ref.clone(),
+                    expected_oid: zero_oid,
+                });
+            } else if handoff.bare_force_with_lease
+                || handoff
+                    .lease_refs
+                    .iter()
+                    .any(|leased| leased == &tuple.remote_ref)
+            {
+                let expected_oid = if let Some(branch) =
+                    tuple.remote_ref.strip_prefix("refs/heads/")
+                {
+                    let tracking_ref = format!("refs/remotes/{}/{branch}", request.remote);
+                    git.optional_commit_oid(&root, &tracking_ref)
+                        .map_err(|_| {
+                            "cannot resolve the cached remote OID for leased publication".to_owned()
+                        })?
+                        .unwrap_or(zero_oid)
+                } else {
+                    zero_oid
+                };
+                leases.push(crate::git_command::ExactPushLease {
+                    remote_ref: tuple.remote_ref.clone(),
+                    expected_oid,
+                });
+            }
+        }
+        request.leases = leases;
     } else {
         request.allow_unleased_force = handoff.force_requested;
         request.leases = handoff

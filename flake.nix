@@ -15,7 +15,7 @@
       mkRustPackage = pkgs: extra:
         pkgs.rustPlatform.buildRustPackage ({
           pname = "persona";
-          version = "0.2.0-rc.6";
+          version = "0.2.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = testTools pkgs;

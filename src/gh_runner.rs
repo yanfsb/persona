@@ -148,11 +148,6 @@ pub fn run_managed_gh() -> Result<u8, String> {
         return Ok(status_exit_code(status));
     }
 
-    let inferred_repository = infer_github_repository_from_cwd(&cwd);
-    let request = crate::gh_adapter::parse_with_inferred_repository(
-        &arguments,
-        inferred_repository.as_deref(),
-    )?;
     for variable in [
         "GH_TOKEN",
         "GITHUB_TOKEN",
@@ -185,13 +180,14 @@ pub fn run_managed_gh() -> Result<u8, String> {
         }
     }
 
+    let clone_directory = crate::gh_adapter::clone_target_directory(&arguments)?;
     let config_path = match std::env::var_os("PERSONA_CONFIG_PATH") {
         Some(path) => PathBuf::from(path),
         None => resolve_config_path(None)?,
     };
     let config_path = absolute_path(&config_path, &cwd);
     let config = Config::load(&config_path).map_err(|error| error.to_string())?;
-    let target_directory = request.clone_directory.as_ref().map(|clone_directory| {
+    let target_directory = clone_directory.as_ref().map(|clone_directory| {
         if clone_directory.is_absolute() {
             clone_directory.clone()
         } else {
@@ -234,6 +230,14 @@ pub fn run_managed_gh() -> Result<u8, String> {
     if binding.host != "github.com" {
         return Err("managed gh supports only the explicitly bound github.com host".to_owned());
     }
+
+    let inferred_repository = infer_github_repository_from_cwd(&cwd);
+    let request = crate::gh_adapter::parse_with_context(
+        &arguments,
+        inferred_repository.as_deref(),
+        binding.account_selector.as_deref(),
+        Some(&cwd),
+    )?;
 
     let flag_refs = request.flags.iter().map(String::as_str).collect::<Vec<_>>();
     binding

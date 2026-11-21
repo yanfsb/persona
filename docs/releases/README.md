@@ -1,5 +1,6 @@
 # Release notes
 
+- [Persona v0.2.0](v0.2.0.md) — first stable release: concise configuration schema v4 (`[profiles.<name>]`, `extends`, inline scopes, `~/`, forge shorthands, smart defaults, `persona config path|validate|show|edit`), bare `--force-with-lease` lease resolution, opt-in `allow_force_push`, and `gh repo create`/`clone` guardrails.
 - [Persona v0.2.0-rc.6](v0.2.0-rc.6.md) — multi-host SSH transport policies, opt-in non-GitHub HTTPS credential helpers, and host-scoped GitHub push-binding checks.
 - [Persona v0.2.0-rc.5](v0.2.0-rc.5.md) — fix HTTPS `git-credential-persona` macOS Keychain access under isolated network `HOME` (`PERSONA_REAL_HOME`).
 - [Persona v0.2.0-rc.4](v0.2.0-rc.4.md) — fix `git pull` failing with `unknown option 'no-prune-tags'`.

@@ -53,11 +53,11 @@ fn call_with_git(
 fn write_private_config(path: &Path, scope: &Path) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    let scope_path = toml::Value::String(scope.to_string_lossy().into_owned());
     fs::write(
         path,
         format!(
-            "version=1\n[[scopes]]\nname=\"work\"\npath={:?}\n[scopes.git]\nauthor={{name=\"Test Author\",email=\"author@example.invalid\"}}\ncommitter={{name=\"Test Committer\",email=\"committer@example.invalid\"}}\n",
-            scope.to_string_lossy()
+            "version = 4\n[profiles.work]\nauthor = {{ name = \"Test Author\", email = \"author@example.invalid\" }}\ncommitter = {{ name = \"Test Committer\", email = \"committer@example.invalid\" }}\nscopes = [{scope_path}]\n"
         ),
     )
     .unwrap();
@@ -1006,7 +1006,7 @@ fn pr_checkout_uses_managed_fetch_without_exposing_token_to_git_or_hooks() {
     let mut profile = strict_config.profiles()[0].clone();
     profile.git.strict_repo_hooks = true;
     strict_config.update_profile(profile).unwrap();
-    fs::write(&config, strict_config.to_v3_toml().unwrap()).unwrap();
+    fs::write(&config, strict_config.to_v4_toml().unwrap()).unwrap();
 
     let blocked = call_with_git(
         &repo,
@@ -1792,7 +1792,7 @@ exit 0
     binding.repositories = vec!["acme/*".to_owned()];
     binding.deny_repositories = vec!["acme/secret".to_owned()];
     config.update_profile(profile).unwrap();
-    fs::write(&config_path, config.to_v3_toml().unwrap()).unwrap();
+    fs::write(&config_path, config.to_v4_toml().unwrap()).unwrap();
 
     // Without `--repo`, `gh` infers `acme/public-app` from the checkout's `origin` remote.
     let inferred_ok = call(

@@ -68,11 +68,11 @@ fn set_worktree_identity(home: &Path, root: &Path, name: &str, email: &str) {
 }
 
 fn write_policy(path: &Path, scopes: &[(&str, &Path, &str, &str)]) {
-    let mut contents = String::from("version = 1\n\n");
+    let mut contents = String::from("version = 4\n\n");
     for (name, root, author_name, author_email) in scopes {
         let root = toml::Value::String(root.to_string_lossy().into_owned());
         contents.push_str(&format!(
-            "[[scopes]]\nname = {name:?}\npath = {root}\n\n[scopes.git]\nauthor = {{ name = {author_name:?}, email = {author_email:?} }}\ncommitter = {{ name = {author_name:?}, email = {author_email:?} }}\n\n"
+            "[profiles.{name:?}]\nname = {author_name:?}\nemail = {author_email:?}\nscopes = [{root}]\n\n"
         ));
     }
     fs::write(path, contents).expect("write policy");

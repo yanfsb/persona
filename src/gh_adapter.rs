@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GhOperation {
@@ -77,12 +78,45 @@ pub struct GhCheckoutRequest {
 }
 
 pub fn parse(arguments: &[OsString]) -> Result<GhRequest, String> {
-    parse_with_inferred_repository(arguments, None)
+    parse_with_context(arguments, None, None, None)
 }
 
 pub fn parse_with_inferred_repository(
     arguments: &[OsString],
     inferred_repository: Option<&str>,
+) -> Result<GhRequest, String> {
+    parse_with_context(arguments, inferred_repository, None, None)
+}
+
+pub fn clone_target_directory(arguments: &[OsString]) -> Result<Option<PathBuf>, String> {
+    let words = arguments
+        .iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "gh arguments must be valid UTF-8".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if words.len() < 2 {
+        return Ok(None);
+    }
+    if normalize_group(&words[0]) == "repo" && words[1] == "clone" {
+        let mut command = words;
+        command[0] = "repo".to_owned();
+        check_hostname(&command)?;
+        let raw_flags = extract_flags(&command[1..]);
+        let request = parse_clone_operation(command, "repo.clone".to_owned(), raw_flags)?;
+        return Ok(request.clone_directory);
+    }
+    Ok(None)
+}
+
+pub fn parse_with_context(
+    arguments: &[OsString],
+    inferred_repository: Option<&str>,
+    default_owner: Option<&str>,
+    cwd: Option<&Path>,
 ) -> Result<GhRequest, String> {
     let words = arguments
         .iter()
@@ -172,6 +206,9 @@ pub fn parse_with_inferred_repository(
             parse_audited_operation(command, selector, raw_flags, inferred_repository)
         }
         ("repo", "clone") => parse_clone_operation(command, selector, raw_flags),
+        ("repo", "create") => {
+            parse_repo_create_operation(command, selector, raw_flags, default_owner, cwd)
+        }
         ("repo", "fork") => parse_fork_operation(command, selector, raw_flags, inferred_repository),
         _ => parse_general_operation(command, selector, raw_flags, inferred_repository),
     }
@@ -255,6 +292,69 @@ fn parse_clone_operation(
         repositories: vec![repository],
         operation: GhOperation::Clone,
         clone_directory: Some(clone_directory),
+        merge: None,
+        release: None,
+        asset_upload: None,
+        review: None,
+        checkout: None,
+    })
+}
+
+fn parse_repo_create_operation(
+    command: Vec<String>,
+    selector: String,
+    flags: Vec<String>,
+    default_owner: Option<&str>,
+    cwd: Option<&Path>,
+) -> Result<GhRequest, String> {
+    let args = &command[2..];
+    let positionals = general_positionals(args);
+    let repository = if let Some(target) = positionals.first().copied() {
+        if target.contains('/')
+            || target.starts_with("https://")
+            || target.starts_with("ssh://")
+            || target.contains('@')
+        {
+            normalize_repo_or_url(target)?
+        } else if let Some(owner) = default_owner {
+            normalize_repository(&format!("{owner}/{target}"))?
+        } else {
+            return Err("GitHub target must be an explicit OWNER/REPO".to_owned());
+        }
+    } else if let Some(source) =
+        find_flag_value(args, "--source").or_else(|| find_flag_value(args, "-s"))
+    {
+        let owner = default_owner
+            .ok_or_else(|| "GitHub target must be an explicit OWNER/REPO".to_owned())?;
+        let base = cwd.ok_or_else(|| {
+            "cannot resolve --source directory without a working directory".to_owned()
+        })?;
+        let source_path = if Path::new(source).is_absolute() {
+            PathBuf::from(source)
+        } else {
+            base.join(source)
+        };
+        let canonical = std::fs::canonicalize(&source_path)
+            .map_err(|_| "gh repo create --source path does not exist".to_owned())?;
+        let name = canonical
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "cannot derive repository name from --source directory".to_owned())?;
+        normalize_repository(&format!("{owner}/{name}"))?
+    } else {
+        return Err(
+            "gh repo create requires a repository name or --source=. because interactive prompts are disabled to enforce Persona's repository allowlist (for example: gh repo create my-repo --private --source=. --push)"
+                .to_owned(),
+        );
+    };
+
+    Ok(GhRequest {
+        arguments: command.into_iter().map(OsString::from).collect(),
+        selector,
+        flags,
+        repositories: vec![repository],
+        operation: GhOperation::Create,
+        clone_directory: None,
         merge: None,
         release: None,
         asset_upload: None,
@@ -838,6 +938,14 @@ fn general_positionals(words: &[String]) -> Vec<&str> {
                 | "--hostname"
                 | "--org"
                 | "--description"
+                | "-d"
+                | "--source"
+                | "--remote"
+                | "--gitignore"
+                | "-g"
+                | "--license"
+                | "--homepage"
+                | "--team"
                 | "--json"
                 | "--jq"
                 | "-q"
@@ -1355,5 +1463,76 @@ mod tests {
         assert!(parse_words(&["auth", "status"]).is_err());
         assert!(parse_words(&["pr", "view", "2"]).is_err());
         assert!(parse_words(&["repo", "create", "acme/persona", "--public", "--private"]).is_err());
+        let bare_create = parse_with_context(
+            &["repo", "create"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            None,
+            Some("synthetic-user"),
+            None,
+        );
+        assert!(bare_create.is_err());
+        assert!(
+            bare_create
+                .unwrap_err()
+                .contains("requires a repository name or --source=.")
+        );
+    }
+
+    #[test]
+    fn repo_create_resolves_short_names_and_source_directory_under_profile_owner() {
+        let short_name = parse_with_context(
+            &[
+                "repo",
+                "create",
+                "drive-dl",
+                "--private",
+                "--source",
+                ".",
+                "--remote",
+                "origin",
+                "--description",
+                "synthetic repo",
+                "--push",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>(),
+            None,
+            Some("synthetic-user"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(short_name.selector, "repo.create");
+        assert_eq!(short_name.operation, GhOperation::Create);
+        assert_eq!(short_name.repositories, ["synthetic-user/drive-dl"]);
+
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("drive-dl");
+        std::fs::create_dir(&project).unwrap();
+        let from_source = parse_with_context(
+            &["repo", "create", "--source=.", "--private", "--push"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            None,
+            Some("synthetic-user"),
+            Some(&project),
+        )
+        .unwrap();
+        assert_eq!(from_source.repositories, ["synthetic-user/drive-dl"]);
+
+        let explicit_owner = parse_with_context(
+            &["repo", "create", "org-example/drive-dl", "--private"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            None,
+            Some("synthetic-user"),
+            Some(&project),
+        )
+        .unwrap();
+        assert_eq!(explicit_owner.repositories, ["org-example/drive-dl"]);
     }
 }

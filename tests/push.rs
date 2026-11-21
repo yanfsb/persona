@@ -108,7 +108,7 @@ impl Fixture {
     fn write_policy_with_author_preservation(&self, destinations: &str, preserve_authors: bool) {
         let root = self.repo.to_string_lossy();
         fs::write(&self.policy, format!(
-            "version=1\n[[scopes]]\nname=\"scope\"\npath=\"{root}\"\n[scopes.git]\nauthor={{name=\"Good Author\",email=\"good@example.invalid\"}}\ncommitter={{name=\"Good Author\",email=\"good@example.invalid\"}}\n[scopes.git.push]\nremote=\"origin\"\ndestinations={destinations}\npreserve_authors={preserve_authors}\n"
+            "version = 4\n[profiles.scope]\nname = \"Good Author\"\nemail = \"good@example.invalid\"\nscopes = [\"{root}\"]\n[profiles.scope.git]\nremote = \"origin\"\npush = {destinations}\npreserve_authors = {preserve_authors}\n"
         )).expect("policy");
     }
 
@@ -186,8 +186,8 @@ fn publication_policy_blocks_first_push_when_disabled() {
     fs::write(
         &fixture.policy,
         policy.replace(
-            "preserve_authors=false",
-            "preserve_authors=false\nallow_initial_push=false",
+            "preserve_authors = false",
+            "preserve_authors = false\nallow_initial_push = false",
         ),
     )
     .unwrap();
@@ -213,8 +213,8 @@ fn fast_forward_is_blocked_when_fast_forward_policy_is_disabled() {
     fs::write(
         &fixture.policy,
         policy.replace(
-            "preserve_authors=false",
-            "preserve_authors=false\nallow_fast_forward=false",
+            "preserve_authors = false",
+            "preserve_authors = false\nallow_fast_forward = false",
         ),
     )
     .unwrap();
@@ -419,10 +419,10 @@ fn tag_policy_denials_and_unimplemented_opt_ins_never_authorize() {
     fs::write(
         &fixture.policy,
         format!(
-            "{}\n[scopes.git.signing]\nfingerprint=\"{}\"\npublic_key=\"/tmp/persona-synthetic-public-key.asc\"\n",
+            "{}\n[profiles.scope.signing]\nfingerprint = \"{}\"\npublic_key = \"/tmp/persona-synthetic-public-key.asc\"\n",
             policy.replace(
-                "preserve_authors=false",
-                "preserve_authors=false\nallow_lightweight_tags=true\nallow_annotated_tags=true\nallow_tag_deletion=true",
+                "preserve_authors = false",
+                "preserve_authors = false\nallow_lightweight_tags = true\nallow_annotated_tags = true\nallow_tag_deletion = true",
             ),
             "A".repeat(40),
         ),
@@ -477,20 +477,18 @@ fn pinned_upstream_baseline_allows_foreign_identity_but_blocks_when_ref_moves() 
     fs::write(
         &fixture.policy,
         format!(
-            r#"version=1
-[[scopes]]
-name="scope"
-path={:?}
-[scopes.git]
-author={{name="Good Author",email="good@example.invalid"}}
-committer={{name="Good Author",email="good@example.invalid"}}
-[scopes.git.push]
-remote="origin"
-destinations=[{:?}]
-[[scopes.git.push.upstream_baselines]]
-destination={:?}
-tracking_ref="refs/remotes/origin/main"
-oid="{oid}"
+            r#"version = 4
+[profiles.scope]
+name = "Good Author"
+email = "good@example.invalid"
+scopes = [{:?}]
+[profiles.scope.git]
+remote = "origin"
+push = [{:?}]
+[[profiles.scope.git.baselines]]
+destination = {:?}
+tracking_ref = "refs/remotes/origin/main"
+oid = "{oid}"
 "#,
             fixture.repo, destination, destination
         ),
@@ -584,11 +582,8 @@ fn offline_rewrite_audit_requires_exact_command_bound_lease() {
     fs::write(
         &fixture.policy,
         config.replace(
-            &format!("destinations=[{:?}]", destination),
-            &format!(
-                "destinations=[{:?}]\nallow_force_with_lease=true",
-                destination
-            ),
+            &format!("push = [{:?}]", destination),
+            &format!("push = [{:?}]\nallow_force_with_lease = true", destination),
         ),
     )
     .unwrap();
@@ -852,8 +847,8 @@ fn rejects_deletion_and_force_updates_as_unknown() {
     fs::write(
         &fixture.policy,
         policy.replace(
-            "preserve_authors=false",
-            "preserve_authors=false\nallow_force_with_lease=true\nallow_branch_deletion=true",
+            "preserve_authors = false",
+            "preserve_authors = false\nallow_force_with_lease = true\nallow_branch_deletion = true",
         ),
     )
     .unwrap();
@@ -947,37 +942,25 @@ fn cross_profile_identity_check_blocks_other_profile_commits_even_with_preserve_
     fs::write(
         &fixture.policy,
         format!(
-            r#"version = 3
+            r#"version = 4
 
-[[profiles]]
+[profiles.yanfsb]
 name = "yanfsb"
-[profiles.git]
-author = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
-committer = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
+email = "yanfsb@example.invalid"
+scopes = [{{ name = "yanfsb-repo", path = "{yanfsb_root}" }}]
 
-[[profiles]]
-name = "opsec"
-[profiles.git]
-author = {{ name = "Good Author", email = "opsec@example.invalid" }}
-committer = {{ name = "Good Author", email = "opsec@example.invalid" }}
+[profiles.opsec]
+name = "Good Author"
+email = "opsec@example.invalid"
+scopes = [{{ name = "opsec-repo", path = "{root}" }}]
+[profiles.opsec.git]
 cross_profile_identity_check = true
-[profiles.git.push]
 remote = "origin"
-destinations = ["{remote}"]
+push = ["{remote}"]
 preserve_authors = true
 allow_initial_push = true
 allow_fast_forward = true
 upstream_provenance = "remote_tracking"
-
-[[scopes]]
-name = "opsec-repo"
-path = "{root}"
-profile = "opsec"
-
-[[scopes]]
-name = "yanfsb-repo"
-path = "{yanfsb_root}"
-profile = "yanfsb"
 "#
         ),
     )

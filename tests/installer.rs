@@ -266,14 +266,12 @@ fn installed_path_shim_dispatches_without_a_persona_run_wrapper() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            r#"version = 1
-[[scopes]]
-name = "work"
-path = {root}
-[scopes.git]
+            r#"version = 4
+[profiles.work]
 author = {{ name = "Test Author", email = "author@example.invalid" }}
 committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
-[scopes.git.commands]
+scopes = [{root}]
+[profiles.work.git.commands]
 allow = ["status", "branch.list"]
 "#
         ),

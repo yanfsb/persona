@@ -1,69 +1,58 @@
-use persona::config::{Config, ConfigError};
+use persona::config::{Config, ConfigError, SigningFormat};
 use std::path::Path;
 
-const VALID_CONFIG: &str = r#"
-   version = 1
+const MINIMAL_V4: &str = r#"
+version = 4
 
-   [[scopes]]
-   name = "work"
-   path = "/work"
-
-   [scopes.git]
-   author = { name = "Test Author", email = "author@example.invalid" }
-   committer = { name = "Test Committer", email = "committer@example.invalid" }
-   "#;
-
-const VALID_V2: &str = r#"
-version = 2
-
-[[profiles]]
-name = "work"
-[profiles.git]
+[profiles.work]
+scopes = ["/work"]
 author = { name = "Test Author", email = "author@example.invalid" }
 committer = { name = "Test Committer", email = "committer@example.invalid" }
-
-[[scopes]]
-name = "work-one"
-path = "/work/one"
-profile = "work"
-
-[[scopes]]
-name = "work-two"
-path = "/work/two"
-profile = "work"
 "#;
 
-const VALID_V3: &str = r#"
-version = 3
+const MULTI_SCOPE_V4: &str = r#"
+version = 4
 
-[[profiles]]
-name = "work"
-[profiles.git]
+[profiles.work]
 author = { name = "Test Author", email = "author@example.invalid" }
 committer = { name = "Test Committer", email = "committer@example.invalid" }
-remotes = [{ name = "upstream", fetch_destinations = ["https://github.com/acme/project.git"], push_destinations = [] }, { name = "origin", fetch_destinations = ["https://github.com/ybarbara/project.git"], push_destinations = ["https://github.com/ybarbara/project.git"] }]
-[profiles.git.push]
-remote = "origin"
-destinations = ["https://github.com/ybarbara/project.git"]
-[profiles.github]
-host = "github.com"
+
+[scopes]
+work-one = { path = "/work/one", profile = "work" }
+work-two = { path = "/work/two", profile = "work" }
+"#;
+
+const FULL_V4: &str = r#"
+version = 4
+
+[profiles.work]
+scopes = ["/work"]
+author = { name = "Test Author", email = "author@example.invalid" }
+committer = { name = "Test Committer", email = "committer@example.invalid" }
+
+[profiles.work.git.remotes.upstream]
+fetch = ["https://github.com/acme/project.git"]
+
+[profiles.work.git.remotes.origin]
+fetch = ["https://github.com/example/project.git"]
+push = ["https://github.com/example/project.git"]
+
+[profiles.work.github]
 account_id = "4242"
 account_selector = "work-user"
 token_fingerprint = "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-repositories = ["acme/project", "ybarbara/project"]
-[profiles.github_merge]
-repositories = [{ repository = "acme/project", base_branches = ["main"], strategies = ["squash"] }]
+repos = ["acme/project", "example/project"]
 
-[[scopes]]
-name = "work"
-path = "/work"
-profile = "work"
+[profiles.work.github.merge."acme/project"]
+base_branches = ["main"]
+strategies = ["squash"]
 "#;
 
 #[test]
 fn parses_expected_identities_and_converts_scopes() {
-    let config = Config::parse(VALID_CONFIG).expect("valid policy");
+    let config = Config::parse(MINIMAL_V4).expect("valid v4 policy");
 
+    assert_eq!(config.version(), 4);
     let policy = &config.policies()[0];
 
     assert_eq!(policy.name, "work");
@@ -73,27 +62,60 @@ fn parses_expected_identities_and_converts_scopes() {
     assert_eq!(policy.git.committer.email, "committer@example.invalid");
 
     let scopes = config.scopes();
-
     assert_eq!(scopes.len(), 1);
     assert_eq!(scopes[0].name, "work");
     assert_eq!(scopes[0].root.as_path(), Path::new("/work"));
 }
 
 #[test]
-fn rejects_unsupported_versions() {
-    let input = VALID_CONFIG.replace("version = 1", "version = 4");
+fn flat_name_and_email_populate_both_author_and_committer() {
+    let input = r#"
+version = 4
 
-    assert_eq!(
-        Config::parse(&input).unwrap_err(),
-        ConfigError::UnsupportedVersion(4)
-    );
+[profiles.personal]
+scopes = ["/personal"]
+name = "Synthetic Dev"
+email = "dev@example.invalid"
+"#;
+    let config = Config::parse(input).expect("flat identity parses");
+    let git = &config.profiles()[0].git;
+    assert_eq!(git.author.name, "Synthetic Dev");
+    assert_eq!(git.author.email, "dev@example.invalid");
+    assert_eq!(git.committer, git.author);
 }
 
 #[test]
-fn v2_profiles_can_be_reused_by_scopes_without_inheritance() {
-    let config = Config::parse(VALID_V2).expect("valid v2 policy");
+fn rejects_ambiguous_flat_and_explicit_author_identity() {
+    let input = r#"
+version = 4
 
-    assert_eq!(config.version(), 2);
+[profiles.work]
+scopes = ["/work"]
+name = "Flat"
+author = { name = "Explicit", email = "author@example.invalid" }
+"#;
+    assert!(matches!(
+        Config::parse(input),
+        Err(ConfigError::AmbiguousIdentity { .. })
+    ));
+}
+
+#[test]
+fn rejects_unsupported_versions() {
+    for legacy in [1, 2, 3, 5] {
+        let input = MINIMAL_V4.replace("version = 4", &format!("version = {legacy}"));
+        assert_eq!(
+            Config::parse(&input).unwrap_err(),
+            ConfigError::UnsupportedVersion(legacy)
+        );
+    }
+}
+
+#[test]
+fn profiles_can_be_reused_by_multiple_scopes() {
+    let config = Config::parse(MULTI_SCOPE_V4).expect("valid multi-scope v4 policy");
+
+    assert_eq!(config.version(), 4);
     assert_eq!(config.profiles().len(), 1);
     assert_eq!(config.policies().len(), 2);
     assert_eq!(config.policies()[0].name, "work-one");
@@ -106,10 +128,282 @@ fn v2_profiles_can_be_reused_by_scopes_without_inheritance() {
 }
 
 #[test]
+fn profile_extends_inherits_scalars_replaces_lists_and_keeps_scopes_independent() {
+    let input = r#"
+version = 4
+
+[profiles.base]
+scopes = ["/work"]
+name = "Base Dev"
+email = "base@example.invalid"
+
+[profiles.base.signing]
+fingerprint = "0123456789abcdef0123456789abcdef01234567"
+public_key = "/tmp/base.asc"
+
+[profiles.base.ssh]
+hosts = ["github.com", "forge.example.invalid"]
+fingerprint = "SHA256:abcDEF0123+/="
+identity_file = "/tmp/id_ed25519"
+known_hosts_file = "/tmp/known_hosts"
+
+[profiles.base.github]
+account_id = "1001"
+account_selector = "base-user"
+token_fingerprint = "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+repos = ["org-a/*", "org-b/*"]
+
+[profiles.base.git]
+fetch = ["github.com/*", "forge.example.invalid/*"]
+push = ["github.com/org-a/*", "forge.example.invalid/team/*"]
+preserve_authors = true
+allow_annotated_tags = true
+allow_branch_deletion = true
+allow_force_with_lease = true
+allow_force_push = true
+
+[profiles.base.https."forge.example.invalid"]
+helper = "/usr/local/bin/forge-helper"
+args = ["credential-helper"]
+
+[profiles.strict]
+extends = "base"
+scopes = [{ name = "strict-repo", path = "/work/strict" }]
+github.repos = ["org-a/strict"]
+git.remote = "origin"
+git.push = ["git@github.com:org-a/strict.git"]
+git.fetch = ["git@github.com:org-a/strict.git"]
+git.preserve_authors = false
+git.allow_branch_deletion = false
+git.allow_force_with_lease = false
+git.allow_force_push = false
+
+[profiles.alt]
+extends = "base"
+scopes = ["/alt"]
+name = "Alt Name"
+"#;
+
+    let config = Config::parse(input).expect("inherited v4 policy parses");
+    assert_eq!(config.profiles().len(), 3);
+    assert_eq!(config.policies().len(), 3);
+
+    let strict = config
+        .profiles()
+        .iter()
+        .find(|p| p.name == "strict")
+        .unwrap();
+    assert_eq!(strict.extends.as_deref(), Some("base"));
+    assert_eq!(strict.git.author.name, "Base Dev");
+    assert_eq!(strict.git.author.email, "base@example.invalid");
+    assert_eq!(
+        strict.git.signing.as_ref().unwrap().format,
+        SigningFormat::OpenPgp
+    );
+    assert_eq!(strict.ssh_policies().len(), 2);
+    assert_eq!(
+        strict.ssh.as_ref().unwrap().public_key,
+        Path::new("/tmp/id_ed25519.pub")
+    );
+    assert_eq!(strict.ssh.as_ref().unwrap().user, "git");
+    assert_eq!(strict.ssh.as_ref().unwrap().port, 22);
+    assert_eq!(
+        strict.github.as_ref().unwrap().repositories,
+        ["org-a/strict"]
+    );
+    assert_eq!(strict.github.as_ref().unwrap().account_id, "1001");
+    let push = strict.git.push.as_ref().unwrap();
+    assert_eq!(push.remote, "origin");
+    assert_eq!(push.destinations, ["git@github.com:org-a/strict.git"]);
+    assert!(push.allow_annotated_tags);
+    assert!(!push.preserve_authors);
+    assert!(!push.allow_branch_deletion);
+    assert!(!push.allow_force_with_lease);
+    assert!(!push.allow_force_push);
+    assert!(
+        strict
+            .git
+            .permits_push_destination("origin", "git@github.com:org-a/strict.git")
+    );
+    assert!(
+        !strict
+            .git
+            .permits_push_destination("origin", "https://github.com/org-a/strict.git")
+    );
+    assert!(
+        !strict
+            .git
+            .permits_push_destination("origin", "git@github.com:org-a/other.git")
+    );
+
+    let alt = config.profiles().iter().find(|p| p.name == "alt").unwrap();
+    assert_eq!(alt.git.author.name, "Alt Name");
+    assert_eq!(alt.git.author.email, "base@example.invalid");
+    assert_eq!(alt.git.committer.name, "Alt Name");
+    assert_eq!(alt.git.committer.email, "base@example.invalid");
+
+    // Round-trip preserves `extends` and remains compact.
+    let serialized = config.to_v4_toml().expect("serialize v4");
+    assert!(serialized.contains("extends = \"base\""));
+    let reparsed = Config::parse(&serialized).expect("reparse v4");
+    assert_eq!(reparsed.profiles(), config.profiles());
+
+    // Resolved view flattens inheritance.
+    let resolved_toml = config.to_resolved_v4_toml().expect("serialize resolved v4");
+    assert!(!resolved_toml.contains("extends ="));
+    let reparsed_resolved = Config::parse(&resolved_toml).expect("reparse resolved v4");
+    assert_eq!(reparsed_resolved.profiles().len(), 3);
+}
+
+#[test]
+fn rejects_unknown_and_cyclic_profile_extends() {
+    let missing_parent = r#"
+version = 4
+
+[profiles.child]
+extends = "nonexistent"
+scopes = ["/work"]
+name = "Child"
+email = "child@example.invalid"
+"#;
+    assert!(matches!(
+        Config::parse(missing_parent),
+        Err(ConfigError::UnknownParentProfile { .. })
+    ));
+
+    let cyclic = r#"
+version = 4
+
+[profiles.a]
+extends = "b"
+scopes = ["/a"]
+name = "A"
+email = "a@example.invalid"
+
+[profiles.b]
+extends = "a"
+scopes = ["/b"]
+"#;
+    assert!(matches!(
+        Config::parse(cyclic),
+        Err(ConfigError::CyclicProfileInheritance(_))
+    ));
+}
+
+#[test]
+fn forge_shorthands_expand_to_ssh_and_https_while_explicit_urls_stay_protocol_scoped() {
+    let input = r#"
+version = 4
+
+[profiles.dev]
+scopes = ["/work"]
+name = "Dev"
+email = "dev@example.invalid"
+
+[profiles.dev.git]
+fetch = ["github.com/*"]
+push = ["github.com/org-a/*", "github.com/org-b/repo", "git@forge.example.invalid:team/ssh-only.git"]
+deny = ["github.com/org-a/secret"]
+"#;
+    let config = Config::parse(input).expect("shorthands parse");
+    let git = &config.profiles()[0].git;
+
+    // Wildcard shorthand matches both SSH and HTTPS.
+    assert!(git.permits_push_destination("origin", "git@github.com:org-a/app.git"));
+    assert!(git.permits_push_destination("origin", "https://github.com/org-a/app.git"));
+    // Exact shorthand matches with or without `.git` over both protocols.
+    assert!(git.permits_push_destination("origin", "git@github.com:org-b/repo.git"));
+    assert!(git.permits_push_destination("origin", "https://github.com/org-b/repo.git"));
+    assert!(git.permits_push_destination("origin", "https://github.com/org-b/repo"));
+    // Deny shorthand blocks both SSH and HTTPS.
+    assert!(!git.permits_push_destination("origin", "git@github.com:org-a/secret.git"));
+    assert!(!git.permits_push_destination("origin", "https://github.com/org-a/secret.git"));
+    // Explicit SSH URL blocks HTTPS.
+    assert!(git.permits_push_destination("origin", "git@forge.example.invalid:team/ssh-only.git"));
+    assert!(
+        !git.permits_push_destination("origin", "https://forge.example.invalid/team/ssh-only.git")
+    );
+    // Fetch wildcard allows any GitHub repo.
+    assert!(git.permits_fetch_destination("upstream", "https://github.com/other/project.git"));
+    assert!(git.permits_fetch_destination("upstream", "git@github.com:other/project.git"));
+}
+
+#[test]
+fn expands_leading_tilde_against_home_and_rejects_relative_or_env_paths() {
+    let input = r#"
+version = 4
+
+[profiles.home]
+scopes = ["~/projects"]
+name = "Home"
+email = "home@example.invalid"
+
+[profiles.home.signing]
+fingerprint = "0123456789abcdef0123456789abcdef01234567"
+public_key = "~/.config/persona/keys/pub.asc"
+
+[profiles.home.ssh]
+host = "github.com"
+fingerprint = "SHA256:abcDEF0123+/="
+identity_file = "~/.ssh/id_ed25519"
+"#;
+    let config =
+        Config::parse_with_home(input, Some(Path::new("/home/synthetic"))).expect("tilde parses");
+    assert_eq!(
+        config.policies()[0].path,
+        Path::new("/home/synthetic/projects")
+    );
+    assert_eq!(
+        config.profiles()[0]
+            .git
+            .signing
+            .as_ref()
+            .unwrap()
+            .public_key,
+        Path::new("/home/synthetic/.config/persona/keys/pub.asc")
+    );
+    let ssh = config.profiles()[0].ssh.as_ref().unwrap();
+    assert_eq!(
+        ssh.identity_file.as_deref(),
+        Some(Path::new("/home/synthetic/.ssh/id_ed25519"))
+    );
+    assert_eq!(
+        ssh.public_key,
+        Path::new("/home/synthetic/.ssh/id_ed25519.pub")
+    );
+    assert_eq!(
+        ssh.known_hosts_file,
+        Path::new("/home/synthetic/.ssh/known_hosts")
+    );
+
+    // Fails closed if HOME is unavailable when `~/` is used.
+    assert!(matches!(
+        Config::parse_with_home(input, None),
+        Err(ConfigError::RelativeSigningKey { .. } | ConfigError::RelativeScopePath(_))
+    ));
+    let tilde_scope_only = MINIMAL_V4.replace("\"/work\"", "\"~/work\"");
+    assert!(matches!(
+        Config::parse_with_home(&tilde_scope_only, None),
+        Err(ConfigError::RelativeScopePath(_))
+    ));
+
+    // Still rejects relative paths, `$HOME`, `~other`, and `~/../escape`.
+    for bad in ["work", "./work", "$HOME/work", "~other/work", "~/../escape"] {
+        let invalid = MINIMAL_V4.replace("\"/work\"", &format!("{bad:?}"));
+        assert!(
+            matches!(
+                Config::parse_with_home(&invalid, Some(Path::new("/home/synthetic"))),
+                Err(ConfigError::RelativeScopePath(_))
+            ),
+            "expected RelativeScopePath for {bad:?}"
+        );
+    }
+}
+
+#[test]
 fn git_command_policy_supports_allow_deny_precedence_and_round_trips() {
-    let input = VALID_V3.replace(
-        "remotes = [{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }, { name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }]",
-        "remotes = [{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }, { name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }]\n[profiles.git.commands]\nallow = [\"status\", \"fetch.all\"]\ndeny = [\"push\"]",
+    let input = format!(
+        "{FULL_V4}\n[profiles.work.git.commands]\nallow = [\"status\", \"fetch.all\"]\ndeny = [\"push\"]\n"
     );
     let config = Config::parse(&input).expect("valid command policy");
     let commands = &config.profiles()[0].git.commands;
@@ -118,22 +412,19 @@ fn git_command_policy_supports_allow_deny_precedence_and_round_trips() {
     assert!(!commands.permits("fetch"));
     assert!(!commands.permits("push"));
 
-    let serialized = config.to_v3_toml().expect("serialize v3");
-    let reparsed = Config::parse(&serialized).expect("reparse v3");
+    let serialized = config.to_v4_toml().expect("serialize v4");
+    let reparsed = Config::parse(&serialized).expect("reparse v4");
     assert_eq!(reparsed.profiles()[0].git.commands, *commands);
 }
 
 #[test]
 fn git_command_policy_rejects_unknown_and_duplicate_selectors() {
     for commands in [
-        "[profiles.git.commands]\nallow = [\"status;id\"]",
-        "[profiles.git.commands]\ndeny = [\"*status\"]",
-        "[profiles.git.commands]\ndeny = [\"status\", \"status\"]",
+        "[profiles.work.git.commands]\nallow = [\"status;id\"]",
+        "[profiles.work.git.commands]\ndeny = [\"*status\"]",
+        "[profiles.work.git.commands]\ndeny = [\"status\", \"status\"]",
     ] {
-        let input = VALID_V3.replace(
-            "remotes = [{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }, { name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }]",
-            &format!("remotes = [{{ name = \"upstream\", fetch_destinations = [\"https://github.com/acme/project.git\"], push_destinations = [] }}, {{ name = \"origin\", fetch_destinations = [\"https://github.com/ybarbara/project.git\"], push_destinations = [\"https://github.com/ybarbara/project.git\"] }}]\n{commands}"),
-        );
+        let input = format!("{FULL_V4}\n{commands}\n");
         assert!(Config::parse(&input).is_err());
     }
 }
@@ -163,34 +454,21 @@ fn command_policy_empty_allowlist_denies_all_and_broad_deny_wins() {
 }
 
 #[test]
-fn legacy_command_policy_defaults_to_current_supported_surface() {
-    let config = Config::parse(VALID_CONFIG).expect("valid legacy policy");
-    assert!(config.profiles()[0].git.commands.permits("status"));
-    assert!(config.profiles()[0].git.commands.permits("push"));
-}
-
-#[test]
-fn command_policy_survives_legacy_v1_migration() {
-    let input = VALID_CONFIG.replace(
-        "committer = { name = \"Test Committer\", email = \"committer@example.invalid\" }",
-        "committer = { name = \"Test Committer\", email = \"committer@example.invalid\" }\n[scopes.git.commands]\nallow = [\"status\"]\ndeny = [\"push\"]",
-    );
-    let config = Config::parse(&input).expect("valid v1 command policy");
-    let migrated = config.to_v3_toml().expect("migrate to v3");
-    let reparsed = Config::parse(&migrated).expect("parse migrated v3");
-    assert!(reparsed.profiles()[0].git.commands.permits("status"));
-    assert!(!reparsed.profiles()[0].git.commands.permits("push"));
-}
-
-#[test]
-fn v3_remotes_and_github_merge_policy_round_trip_without_implicit_grants() {
-    let config = Config::parse(VALID_V3).expect("valid v3 policy");
-    assert_eq!(config.version(), 3);
+fn remotes_auto_derive_push_policy_and_merge_policy_round_trips() {
+    let config = Config::parse(FULL_V4).expect("valid full v4 policy");
+    assert_eq!(config.version(), 4);
     let profile = &config.profiles()[0];
-    let remotes = &profile.git.remotes;
-    assert_eq!(remotes.len(), 2);
-    assert!(remotes[0].push_destinations.is_empty());
-    assert_eq!(remotes[1].name, "origin");
+    assert_eq!(profile.git.remotes.len(), 2);
+    let push = profile
+        .git
+        .push
+        .as_ref()
+        .expect("push policy derived from origin remote");
+    assert_eq!(push.remote, "origin");
+    assert_eq!(
+        push.destinations,
+        ["https://github.com/example/project.git"]
+    );
     let merge = profile
         .github_merge
         .as_ref()
@@ -202,138 +480,64 @@ fn v3_remotes_and_github_merge_policy_round_trip_without_implicit_grants() {
         [persona::config::MergeStrategy::Squash]
     );
 
-    let serialized = config.to_v3_toml().expect("serialize v3");
-    let reparsed = Config::parse(&serialized).expect("reparse v3");
-    assert_eq!(reparsed.version(), 3);
-    assert_eq!(reparsed.profiles()[0].git.remotes, remotes.clone());
+    let serialized = config.to_v4_toml().expect("serialize v4");
+    let reparsed = Config::parse(&serialized).expect("reparse v4");
+    assert_eq!(reparsed.profiles()[0].git.remotes, profile.git.remotes);
     assert_eq!(reparsed.profiles()[0].github_merge, profile.github_merge);
 }
 
 #[test]
-fn v2_configuration_upgrades_to_v3_without_granting_merge_permissions() {
-    let legacy = Config::parse(VALID_V2).expect("valid v2 policy");
-    let upgraded_text = legacy.to_v3_toml().expect("serialize upgraded policy");
-    let upgraded = Config::parse(&upgraded_text).expect("parse upgraded policy");
-
-    assert_eq!(upgraded.version(), 3);
-    assert_eq!(upgraded.profiles().len(), 1);
-    assert!(upgraded.profiles()[0].github_merge.is_none());
-    assert!(upgraded.profiles()[0].git.remotes.is_empty());
-    assert_eq!(upgraded.policies().len(), 2);
-    assert!(
-        upgraded
-            .policies()
-            .iter()
-            .all(|scope| scope.git.push.is_none())
+fn merge_policy_requires_enrolled_allowlisted_repository() {
+    let non_allowlisted = FULL_V4.replace(
+        "[profiles.work.github.merge.\"acme/project\"]",
+        "[profiles.work.github.merge.\"other/project\"]",
     );
+    assert!(matches!(
+        Config::parse(&non_allowlisted),
+        Err(ConfigError::InvalidGithubMergePolicy { .. })
+    ));
+
+    let mismatched_push = format!(
+        "{FULL_V4}\n[profiles.work.git]\nremote = \"origin\"\npush = [\"https://github.com/other/project.git\"]\n"
+    );
+    assert!(Config::parse(&mismatched_push).is_err());
 }
 
 #[test]
-fn v3_merge_policy_requires_enrolled_allowlisted_repository() {
-    let missing_binding = VALID_V3.replace("[profiles.github]\n", "").replace("host = \"github.com\"\n", "").replace("account_id = \"4242\"\n", "").replace("account_selector = \"work-user\"\n", "").replace("token_fingerprint = \"hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n", "").replace("repositories = [\"acme/project\", \"ybarbara/project\"]\n", "");
-    assert!(Config::parse(&missing_binding).is_err());
-    let non_allowlisted = VALID_V3.replace(
-        "repository = \"acme/project\"",
-        "repository = \"other/project\"",
-    );
-    assert!(Config::parse(&non_allowlisted).is_err());
-    let mismatched_remote = VALID_V3.replace(
-        "push_destinations = [\"https://github.com/ybarbara/project.git\"]",
-        "push_destinations = [\"https://github.com/other/project.git\"]",
-    );
-    assert!(Config::parse(&mismatched_remote).is_err());
-}
-
-#[test]
-fn v2_ssh_policy_requires_exact_host_key_and_private_transport_paths() {
+fn ssh_policy_supports_multi_host_extra_and_rejects_duplicates_or_ambiguous_auth() {
     let valid = r#"
-version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = { name = "Synthetic", email = "synthetic@example.invalid" }
-committer = { name = "Synthetic", email = "synthetic@example.invalid" }
-[profiles.ssh]
-host = "github.com"
-user = "git"
-port = 22
-fingerprint = "SHA256:abcDEF0123+/="
-public_key = "/tmp/synthetic.pub"
-identity_file = "/tmp/synthetic"
-known_hosts_file = "/tmp/known_hosts"
-[[scopes]]
-name = "work"
-path = "/tmp/work"
-profile = "work"
-"#;
-    let config = Config::parse(valid).expect("valid SSH policy");
-    assert_eq!(
-        config.profiles()[0].ssh.as_ref().unwrap().host,
-        "github.com"
-    );
+version = 4
 
-    let missing_identity = valid.replace(
-        "identity_file = \"/tmp/synthetic\"",
-        "# no identity or agent",
-    );
-    assert!(matches!(
-        Config::parse(&missing_identity),
-        Err(ConfigError::InvalidSshPolicy { .. })
-    ));
-    let unsafe_host = valid.replace("host = \"github.com\"", "host = \"github.com;proxy\"");
-    assert!(matches!(
-        Config::parse(&unsafe_host),
-        Err(ConfigError::InvalidSshPolicy { .. })
-    ));
-    let ambiguous_identity = valid.replace(
-        "identity_file = \"/tmp/synthetic\"",
-        "identity_file = \"/tmp/synthetic\"\nagent_socket = \"/tmp/agent.sock\"",
-    );
-    assert!(matches!(
-        Config::parse(&ambiguous_identity),
-        Err(ConfigError::InvalidSshPolicy { .. })
-    ));
-}
+[profiles.work]
+scopes = ["/tmp/work"]
+name = "Synthetic"
+email = "synthetic@example.invalid"
 
-#[test]
-fn profiles_accept_multiple_ssh_hosts_and_opt_in_external_https_helpers() {
-    let input = r#"
-version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = { name = "Synthetic", email = "synthetic@example.invalid" }
-committer = { name = "Synthetic", email = "synthetic@example.invalid" }
-[profiles.ssh]
-host = "github.com"
-user = "git"
-port = 22
+[profiles.work.ssh]
+hosts = ["github.com", "forge.example.invalid"]
 fingerprint = "SHA256:abcDEF0123+/="
 public_key = "/tmp/github.pub"
 identity_file = "/tmp/github"
 known_hosts_file = "/tmp/known_hosts"
-[[profiles.ssh_hosts]]
-host = "forge.example.invalid"
-user = "git"
-port = 22
-fingerprint = "SHA256:abcDEF0123+/="
-public_key = "/tmp/origin.pub"
-identity_file = "/tmp/origin"
+
+[[profiles.work.ssh.extra]]
+host = "alt.example.invalid"
+port = 2222
+fingerprint = "SHA256:xyzDEF0123+/="
+public_key = "/tmp/alt.pub"
+agent_socket = "/tmp/agent.sock"
 known_hosts_file = "/tmp/known_hosts"
-[[profiles.https_credentials]]
-host = "forge.example.invalid"
+
+[profiles.work.https."forge.example.invalid"]
 helper = "/nix/store/example/bin/origin"
 args = ["auth", "git-credential"]
-[[scopes]]
-name = "work"
-path = "/tmp/work"
-profile = "work"
 "#;
-    let config = Config::parse(input).expect("multi-forge profile parses");
+    let config = Config::parse(valid).expect("multi-forge profile parses");
     let profile = &config.profiles()[0];
     assert!(profile.has_ssh_policy());
-    assert_eq!(profile.ssh_policies().len(), 2);
+    assert_eq!(profile.ssh_policies().len(), 3);
     assert_eq!(profile.ssh_policies()[1].host, "forge.example.invalid");
+    assert_eq!(profile.ssh_policies()[2].port, 2222);
     assert_eq!(
         profile
             .https_credential_for_host("FORGE.EXAMPLE.INVALID")
@@ -341,126 +545,65 @@ profile = "work"
             .args,
         ["auth", "git-credential"]
     );
-    assert_eq!(
-        Config::parse(&config.to_v3_toml().unwrap())
-            .unwrap()
-            .profiles()[0]
-            .ssh_hosts
-            .len(),
-        1
-    );
-}
+    let reparsed = Config::parse(&config.to_v4_toml().unwrap()).unwrap();
+    assert_eq!(reparsed.profiles()[0].ssh_policies().len(), 3);
 
-#[test]
-fn profiles_reject_ambiguous_ssh_and_github_shadowing_https_helpers() {
-    let duplicate_ssh = r#"
-version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = { name = "Synthetic", email = "synthetic@example.invalid" }
-committer = { name = "Synthetic", email = "synthetic@example.invalid" }
-[profiles.ssh]
-host = "github.com"
-user = "git"
-port = 22
-fingerprint = "SHA256:abcDEF0123+/="
-public_key = "/tmp/key.pub"
-identity_file = "/tmp/key"
-known_hosts_file = "/tmp/known_hosts"
-[[profiles.ssh_hosts]]
-host = "GITHUB.COM"
-user = "git"
-port = 22
-fingerprint = "SHA256:abcDEF0123+/="
-public_key = "/tmp/key.pub"
-identity_file = "/tmp/key"
-known_hosts_file = "/tmp/known_hosts"
-[[scopes]]
-name = "work"
-path = "/tmp/work"
-profile = "work"
-"#;
+    // Reject duplicate SSH selector across hosts / extra.
+    let duplicate_ssh = valid.replace(
+        "host = \"alt.example.invalid\"\nport = 2222",
+        "host = \"GITHUB.COM\"",
+    );
     assert!(matches!(
-        Config::parse(duplicate_ssh),
+        Config::parse(&duplicate_ssh),
         Err(ConfigError::InvalidSshPolicy { .. })
     ));
 
+    // Reject both identity_file and agent_socket.
+    let ambiguous = valid.replace(
+        "identity_file = \"/tmp/github\"",
+        "identity_file = \"/tmp/github\"\nagent_socket = \"/tmp/agent.sock\"",
+    );
+    assert!(matches!(
+        Config::parse(&ambiguous),
+        Err(ConfigError::InvalidSshPolicy { .. })
+    ));
+
+    // Reject GitHub host in https credentials.
     let github_helper = r#"
-version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = { name = "Synthetic", email = "synthetic@example.invalid" }
-committer = { name = "Synthetic", email = "synthetic@example.invalid" }
-[[profiles.https_credentials]]
-host = "api.ghe.com"
+version = 4
+
+[profiles.work]
+scopes = ["/tmp/work"]
+name = "Synthetic"
+email = "synthetic@example.invalid"
+
+[profiles.work.https."api.ghe.com"]
 helper = "/usr/bin/git"
-[[scopes]]
-name = "work"
-path = "/tmp/work"
-profile = "work"
 "#;
     assert!(matches!(
         Config::parse(github_helper),
         Err(ConfigError::InvalidHttpsCredentialPolicy { .. })
     ));
-
-    let bound_host_helper = r#"
-version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = { name = "Synthetic", email = "synthetic@example.invalid" }
-committer = { name = "Synthetic", email = "synthetic@example.invalid" }
-[profiles.github]
-host = "forge.example.invalid"
-account_id = "4242"
-account_selector = "work-user"
-token_fingerprint = "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-[[profiles.https_credentials]]
-host = "forge.example.invalid"
-helper = "/usr/bin/git"
-[[scopes]]
-name = "work"
-path = "/tmp/work"
-profile = "work"
-"#;
-    assert!(matches!(
-        Config::parse(bound_host_helper),
-        Err(ConfigError::InvalidHttpsCredentialPolicy { .. })
-    ));
 }
 
 #[test]
-fn upstream_baselines_are_pinned_to_the_configured_remote_and_valid_oid() {
+fn upstream_baselines_and_annotated_tags_are_validated() {
     let valid = r#"
-version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = { name = "Synthetic", email = "synthetic@example.invalid" }
-committer = { name = "Synthetic", email = "synthetic@example.invalid" }
-[profiles.git.push]
+version = 4
+
+[profiles.work]
+scopes = ["/tmp/work"]
+name = "Synthetic"
+email = "synthetic@example.invalid"
+
+[profiles.work.git]
 remote = "origin"
-destinations = ["https://example.invalid/repo.git"]
-upstream_baselines = [{ destination = "https://example.invalid/repo.git", tracking_ref = "refs/remotes/origin/main", oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }]
-[[scopes]]
-name = "work"
-path = "/tmp/work"
-profile = "work"
+push = ["https://example.invalid/repo.git"]
+baselines = [{ destination = "https://example.invalid/repo.git", tracking_ref = "refs/remotes/origin/main", oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }]
 "#;
     let config = Config::parse(valid).expect("valid pinned baseline");
     let policy = config.profiles()[0].git.push.as_ref().unwrap();
     assert_eq!(policy.upstream_baselines.len(), 1);
-    assert_eq!(
-        policy.upstream_baselines[0].tracking_ref,
-        "refs/remotes/origin/main"
-    );
-    assert_eq!(
-        policy.upstream_baselines[0].destination,
-        "https://example.invalid/repo.git"
-    );
 
     for invalid in [
         valid.replace("refs/remotes/origin/main", "refs/remotes/other/main"),
@@ -471,25 +614,29 @@ profile = "work"
             Err(ConfigError::InvalidUpstreamBaseline { .. })
         ));
     }
-}
 
-#[test]
-fn annotated_tag_push_opt_in_requires_a_signing_policy() {
-    let input = format!(
-        "{VALID_CONFIG}\n[scopes.git.push]\nremote = \"origin\"\ndestinations = [\"file:///synthetic.git\"]\nallow_annotated_tags = true\n"
-    );
+    let tags_without_signing = format!("{valid}\nallow_annotated_tags = true\n");
     assert!(matches!(
-        Config::parse(&input),
+        Config::parse(&tags_without_signing),
         Err(ConfigError::AnnotatedTagsRequireSigning { .. })
     ));
 }
 
 #[test]
-fn publication_policy_defaults_are_conservative_and_survive_v2_migration() {
-    let legacy = format!(
-        "{VALID_CONFIG}\n[scopes.git.push]\nremote = \"origin\"\ndestinations = [\"https://github.com/example/repo.git\"]\n"
-    );
-    let parsed = Config::parse(&legacy).expect("legacy push policy");
+fn publication_policy_defaults_are_conservative_and_omitted_on_serialization() {
+    let input = r#"
+version = 4
+
+[profiles.work]
+scopes = ["/work"]
+name = "Test"
+email = "test@example.invalid"
+
+[profiles.work.git]
+remote = "origin"
+push = ["https://github.com/example/repo.git"]
+"#;
+    let parsed = Config::parse(input).expect("push policy");
     let policy = parsed.policies()[0].git.push.as_ref().unwrap();
     assert!(policy.allow_initial_push);
     assert!(policy.allow_fast_forward);
@@ -498,45 +645,25 @@ fn publication_policy_defaults_are_conservative_and_survive_v2_migration() {
     assert!(!policy.allow_branch_deletion);
     assert!(!policy.allow_tag_deletion);
     assert!(!policy.allow_force_with_lease);
+    assert!(!policy.allow_force_push);
 
-    let migrated = parsed.to_v2_toml().expect("serialize v2 policy");
-    let reparsed = Config::parse(&migrated).expect("reparse migrated policy");
-    assert_eq!(
-        reparsed.policies()[0].git.push,
-        parsed.policies()[0].git.push
-    );
+    let serialized = parsed.to_v4_toml().expect("serialize v4");
+    assert!(!serialized.contains("allow_fast_forward"));
+    assert!(!serialized.contains("allow_force_with_lease"));
+    assert!(!serialized.contains("preserve_authors"));
 }
 
 #[test]
-fn v1_configuration_can_be_migrated_explicitly_to_v2() {
-    let legacy = Config::parse(VALID_CONFIG).expect("valid v1 policy");
-    let migrated = legacy.to_v2_toml().expect("serialize v2 preview");
-    let current = Config::parse(&migrated).expect("migrated config parses");
+fn profile_and_scope_mutations_validate_and_block_removing_parent_or_in_use_profile() {
+    let mut config = Config::parse(MINIMAL_V4).expect("base config");
+    let mut personal = config.profiles()[0].clone();
+    personal.name = "personal".to_owned();
+    personal.extends = Some("work".to_owned());
+    config
+        .add_profile(personal.clone())
+        .expect("add child profile");
 
-    assert_eq!(current.version(), 2);
-    assert_eq!(current.profiles().len(), 1);
-    assert_eq!(current.profiles()[0].name, "work");
-    assert_eq!(current.policies()[0].name, "work");
-    assert_eq!(
-        current.policies()[0].git.author.email,
-        "author@example.invalid"
-    );
-}
-
-#[test]
-fn profile_and_scope_edits_are_validated_and_v1_edits_become_v3() {
-    let mut config = Config::parse(VALID_CONFIG).expect("legacy config");
-    let profile = persona::config::Profile {
-        name: "personal".to_owned(),
-        git: config.policies()[0].git.clone(),
-        github: None,
-        ssh: None,
-        ssh_hosts: Vec::new(),
-        https_credentials: Vec::new(),
-        github_merge: None,
-        run: Default::default(),
-    };
-    config.add_profile(profile.clone()).expect("add profile");
+    // Removing `work` while `personal` extends it must fail.
     config
         .add_scope(
             "personal-project".to_owned(),
@@ -544,17 +671,26 @@ fn profile_and_scope_edits_are_validated_and_v1_edits_become_v3() {
             "personal",
         )
         .expect("add profile-backed scope");
-    assert_eq!(config.version(), 3);
-    assert_eq!(config.policies()[1].profile, "personal");
     assert_eq!(
         config.remove_profile("personal"),
         Err(ConfigError::ProfileInUse("personal".to_owned()))
     );
 
-    let mut changed = profile;
+    let mut changed = personal;
     changed.git.author.name = "Updated Author".to_owned();
     config.update_profile(changed).expect("update profile");
-    assert_eq!(config.policies()[1].git.author.name, "Updated Author");
+    assert_eq!(
+        config
+            .policies()
+            .iter()
+            .find(|scope| scope.name == "personal-project")
+            .unwrap()
+            .git
+            .author
+            .name,
+        "Updated Author"
+    );
+
     config
         .remove_scope("personal-project")
         .expect("remove scope");
@@ -565,264 +701,59 @@ fn profile_and_scope_edits_are_validated_and_v1_edits_become_v3() {
 }
 
 #[test]
-fn v2_rejects_missing_profile_references_and_unknown_fields() {
-    let missing = VALID_V2.replace("profile = \"work\"", "profile = \"missing\"");
+fn rejects_unknown_fields_empty_scopes_duplicate_names_and_empty_identities() {
+    let unknown = MINIMAL_V4.replace("version = 4", "version = 4\nunexpected = true");
     assert!(matches!(
-        Config::parse(&missing),
+        Config::parse(&unknown),
+        Err(ConfigError::InvalidToml(msg)) if msg.contains("unexpected")
+    ));
+
+    let no_scopes = "version = 4\n[profiles.work]\nname = \"A\"\nemail = \"a@example.invalid\"\n";
+    assert_eq!(
+        Config::parse(no_scopes).unwrap_err(),
+        ConfigError::EmptyScopes
+    );
+
+    let missing_profile =
+        format!("{MINIMAL_V4}\n[scopes]\nextra = {{ path = \"/extra\", profile = \"missing\" }}\n");
+    assert!(matches!(
+        Config::parse(&missing_profile),
         Err(ConfigError::UnknownProfile { .. })
     ));
 
-    let unknown = VALID_V2.replace("name = \"work\"", "name = \"work\"\nunexpected = true");
+    let empty_email = MINIMAL_V4.replace("author@example.invalid", "");
     assert_eq!(
-        Config::parse(&unknown).unwrap_err(),
-        ConfigError::InvalidToml
-    );
-}
-
-#[test]
-fn rejects_unknown_fields_at_different_levels() {
-    let inputs = [
-        VALID_CONFIG.replace("version = 1", "version = 1\nunexpected = true"),
-        VALID_CONFIG.replace(
-            "name = \"Test Author\"",
-            "name = \"Test Author\", unexpected = true",
-        ),
-    ];
-
-    for input in inputs {
-        assert_eq!(Config::parse(&input).unwrap_err(), ConfigError::InvalidToml);
-    }
-}
-
-#[test]
-fn rejects_an_empty_scope_list() {
-    let input = "version = 1\nscopes = []";
-
-    assert_eq!(Config::parse(input).unwrap_err(), ConfigError::EmptyScopes);
-}
-
-#[test]
-fn rejects_duplicate_scope_names() {
-    let second_scope = VALID_CONFIG.replacen("version = 1", "", 1);
-    let input = format!("{VALID_CONFIG}\n{second_scope}");
-
-    assert_eq!(
-        Config::parse(&input).unwrap_err(),
-        ConfigError::DuplicateScopeName("work".to_owned())
-    );
-}
-
-#[test]
-fn rejects_empty_or_padded_scope_names() {
-    for name in ["", " ", " work "] {
-        let input = VALID_CONFIG.replace("name = \"work\"", &format!("name = \"{name}\""));
-
-        assert_eq!(
-            Config::parse(&input).unwrap_err(),
-            ConfigError::InvalidScopeName
-        );
-    }
-}
-
-#[test]
-fn rejects_paths_that_are_not_absolute() {
-    for path in ["work", "~/work", "$HOME/work"] {
-        let input = VALID_CONFIG.replace("path = \"/work\"", &format!("path = \"{path}\""));
-
-        assert_eq!(
-            Config::parse(&input).unwrap_err(),
-            ConfigError::RelativeScopePath(path.into())
-        );
-    }
-}
-
-#[test]
-fn accepts_an_explicit_full_fingerprint_and_public_key() {
-    let input = format!(
-        "{VALID_CONFIG}\n[scopes.git.signing]\nfingerprint = \"0123456789abcdef0123456789abcdef01234567\"\npublic_key = \"/tmp/public.asc\"\n"
-    );
-    let config = Config::parse(&input).expect("valid signing policy");
-    let signing = config.policies()[0]
-        .git
-        .signing
-        .as_ref()
-        .expect("signing policy");
-    assert_eq!(
-        signing.fingerprint,
-        "0123456789abcdef0123456789abcdef01234567"
-    );
-    assert_eq!(signing.public_key, Path::new("/tmp/public.asc"));
-}
-
-#[test]
-fn rejects_malformed_signing_policy() {
-    for (field, value) in [
-        ("fingerprint", "\"short\""),
-        ("public_key", "\"relative.asc\""),
-    ] {
-        let input = format!(
-            "{VALID_CONFIG}\n[scopes.git.signing]\nfingerprint = \"0123456789abcdef0123456789abcdef01234567\"\npublic_key = \"/tmp/public.asc\"\n"
-        )
-        .replace(
-            &format!("{field} = {}", if field == "fingerprint" { "\"0123456789abcdef0123456789abcdef01234567\"" } else { "\"/tmp/public.asc\"" }),
-            &format!("{field} = {value}"),
-        );
-        assert!(Config::parse(&input).is_err(), "{field} should be rejected");
-    }
-}
-
-#[test]
-fn rejects_empty_author_or_committer_fields() {
-    for (email, role) in [
-        ("author@example.invalid", "author"),
-        ("committer@example.invalid", "committer"),
-    ] {
-        let input = VALID_CONFIG.replace(email, "");
-
-        assert_eq!(
-            Config::parse(&input).unwrap_err(),
-            ConfigError::EmptyIdentity {
-                scope: "work".to_owned(),
-                role: role.to_owned(),
-            }
-        );
-    }
-}
-
-#[test]
-fn v3_wildcard_destinations_deny_rules_and_command_policies_round_trip() {
-    let input = r#"
-version = 3
-
-[[profiles]]
-name = "yanfsb"
-
-[profiles.run]
-mode = "denylist"
-deny = ["curl", "cargo --frozen"]
-
-[profiles.git]
-author = { name = "yanfsb", email = "yanfsb@users.noreply.github.com" }
-committer = { name = "yanfsb", email = "yanfsb@users.noreply.github.com" }
-deny_destinations = ["https://github.com/yanfsb/secret.git", "git@github.com:yanfsb/secret.git"]
-strict_repo_hooks = false
-strict_git_filters = false
-strict_merge_drivers = false
-inherit_git_config = true
-cross_profile_identity_check = true
-
-[profiles.git.commands]
-mode = "denylist"
-deny = ["push --force", "tag.*"]
-
-[profiles.git.push]
-remote = "*"
-destinations = ["https://github.com/yanfsb/*", "git@github.com:yanfsb/*"]
-preserve_authors = false
-allow_initial_push = true
-allow_fast_forward = true
-allow_annotated_tags = false
-allow_lightweight_tags = false
-allow_branch_deletion = true
-allow_tag_deletion = false
-allow_force_with_lease = true
-allow_force_push = false
-require_tag_lease_on_create = false
-upstream_provenance = "remote_tracking"
-
-[profiles.github]
-host = "github.com"
-account_id = "102800044"
-account_selector = "yanfsb"
-token_fingerprint = "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-repositories = ["yanfsb/*"]
-deny_repositories = ["yanfsb/secret"]
-
-[profiles.github.commands]
-mode = "allowlist"
-allow = ["pr", "issue.view"]
-deny = ["pr.merge"]
-
-[[scopes]]
-name = "yanfsb-projects"
-path = "/yanfsb"
-profile = "yanfsb"
-"#;
-
-    let parsed = Config::parse(input).expect("valid wildcard v3 config");
-    let profile = &parsed.profiles()[0];
-    let github = profile.github.as_ref().expect("github binding");
-    assert!(github.permits_repository("yanfsb/persona"));
-    assert!(!github.permits_repository("yanfsb/secret"));
-    assert!(!github.permits_repository("opsec/repo"));
-
-    assert!(
-        profile
-            .git
-            .permits_push_destination("upstream", "git@github.com:yanfsb/persona.git")
-    );
-    assert!(
-        !profile
-            .git
-            .permits_push_destination("origin", "https://github.com/yanfsb/secret.git")
-    );
-    assert!(
-        !profile
-            .git
-            .permits_push_destination("origin", "https://github.com/opsec/persona.git")
+        Config::parse(&empty_email).unwrap_err(),
+        ConfigError::EmptyIdentity {
+            scope: "work".to_owned(),
+            role: "author".to_owned(),
+        }
     );
 
-    assert!(profile.git.commands.evaluate(&["log"], &[]).is_ok());
-    assert!(
-        profile
-            .git
-            .commands
-            .evaluate(&["push"], &["--force"])
-            .is_err()
-    );
-    assert!(profile.git.commands.evaluate(&["tag.create"], &[]).is_err());
-
-    assert!(github.commands.evaluate(&["pr.diff"], &[]).is_ok());
-    assert!(github.commands.evaluate(&["pr.merge"], &[]).is_err());
-    assert!(github.commands.evaluate(&["repo.delete"], &[]).is_err());
-
-    assert!(profile.run.evaluate(&["cargo"], &["--locked"]).is_ok());
-    assert!(profile.run.evaluate(&["cargo"], &["--frozen"]).is_err());
-    assert!(profile.run.evaluate(&["curl"], &[]).is_err());
-
-    let serialized = parsed.to_v3_toml().expect("serialize v3");
-    let reparsed = Config::parse(&serialized).expect("reparse v3");
-    let reparsed_profile = &reparsed.profiles()[0];
-    assert_eq!(reparsed_profile.git.commands, profile.git.commands);
-    assert_eq!(
-        reparsed_profile.git.deny_destinations,
-        profile.git.deny_destinations
-    );
-    assert_eq!(reparsed_profile.run, profile.run);
-    assert_eq!(
-        reparsed_profile.github.as_ref().unwrap().commands,
-        github.commands
-    );
-    assert_eq!(
-        reparsed_profile.github.as_ref().unwrap().deny_repositories,
-        github.deny_repositories
-    );
-    assert_eq!(
-        reparsed_profile
-            .git
-            .push
-            .as_ref()
-            .unwrap()
-            .upstream_provenance,
-        profile.git.push.as_ref().unwrap().upstream_provenance
-    );
-
-    let bad_run = input.replace(
-        "deny = [\"curl\", \"cargo --frozen\"]",
-        "deny = [\"curl;sh\"]",
-    );
+    let invalid_run = format!("{MINIMAL_V4}\n[profiles.work.run]\ndeny = [\"curl;id\"]\n");
     assert!(matches!(
-        Config::parse(&bad_run),
+        Config::parse(&invalid_run),
         Err(ConfigError::InvalidRunCommandPolicy { .. })
     ));
+}
+
+#[test]
+fn signing_format_is_inferred_from_fingerprint_when_omitted() {
+    let ssh_sig = format!(
+        "{MINIMAL_V4}\n[profiles.work.signing]\nfingerprint = \"SHA256:abcDEF0123+/=\"\npublic_key = \"/tmp/signing.pub\"\n"
+    );
+    let config = Config::parse(&ssh_sig).expect("ssh signing inferred");
+    assert_eq!(
+        config.profiles()[0].git.signing.as_ref().unwrap().format,
+        SigningFormat::Ssh
+    );
+
+    let pgp_sig = format!(
+        "{MINIMAL_V4}\n[profiles.work.signing]\nfingerprint = \"0123456789abcdef0123456789abcdef01234567\"\npublic_key = \"/tmp/public.asc\"\n"
+    );
+    let config = Config::parse(&pgp_sig).expect("openpgp signing inferred");
+    assert_eq!(
+        config.profiles()[0].git.signing.as_ref().unwrap().format,
+        SigningFormat::OpenPgp
+    );
 }

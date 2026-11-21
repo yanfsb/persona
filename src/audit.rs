@@ -1359,6 +1359,8 @@ fn add_push_findings(
         );
         return;
     }
+    let allow_missing_remote_ancestor =
+        request.allow_unleased_force && push_policy.allow_force_push;
     let plan = PublicationPlan::new(
         request.remote.clone(),
         request.destination.clone(),
@@ -1369,7 +1371,9 @@ fn add_push_findings(
             plan.with_expected_lease(&lease.remote_ref, &lease.expected_oid)
         })
     })
-    .and_then(|plan| plan.with_local_history(git, root, audit_deadline));
+    .and_then(|plan| {
+        plan.with_local_history_for_push(git, root, audit_deadline, allow_missing_remote_ancestor)
+    });
     let plan = match plan {
         Ok(plan) => plan,
         Err(error) => {
@@ -1644,7 +1648,19 @@ fn add_push_findings(
                 remote_oid: "0".repeat(update.remote_oid.len()),
             });
         } else if update.remote_ref.starts_with("refs/heads/") {
-            commit_updates.push(update.clone());
+            if allow_missing_remote_ancestor
+                && !update.remote_oid.bytes().all(|byte| byte == b'0')
+                && git.object_type(root, &update.remote_oid).is_err()
+            {
+                commit_updates.push(PushTuple {
+                    local_ref: update.local_ref.clone(),
+                    local_oid: update.local_oid.clone(),
+                    remote_ref: update.remote_ref.clone(),
+                    remote_oid: "0".repeat(update.remote_oid.len()),
+                });
+            } else {
+                commit_updates.push(update.clone());
+            }
         }
     }
     if std::time::Instant::now() >= audit_deadline {

@@ -665,6 +665,9 @@ pub fn run_managed_git() -> Result<u8, String> {
     let mut expected_ssh_push_path = None;
     let mut push_dynamic_tuples = false;
     let mut push_force_requested = false;
+    let mut push_bare_force_with_lease = false;
+    let mut push_lease_refs: Vec<String> = Vec::new();
+    let mut push_empty_lease_refs: Vec<String> = Vec::new();
     let mut push_dry_run = false;
     let mut push_follow_tags = false;
 
@@ -841,8 +844,10 @@ pub fn run_managed_git() -> Result<u8, String> {
         }
         push_dry_run = push.dry_run;
         push_follow_tags = push.follow_tags;
-        push_force_requested =
-            push.force || push.bare_force_with_lease || !push.lease_refs.is_empty();
+        push_force_requested = push.force;
+        push_bare_force_with_lease = push.bare_force_with_lease;
+        push_lease_refs = push.lease_refs.clone();
+        push_empty_lease_refs = push.empty_lease_refs.clone();
         let remote = match push.remote.clone() {
             Some(remote) => remote,
             None => {
@@ -932,10 +937,7 @@ pub fn run_managed_git() -> Result<u8, String> {
             use_managed_ssh = true;
         }
 
-        push_dynamic_tuples = push.tags
-            || push.follow_tags
-            || push.bare_force_with_lease
-            || !push.lease_refs.is_empty();
+        push_dynamic_tuples = push.tags || push.follow_tags;
         if push_dynamic_tuples {
             managed_push_request = Some(PushRequest {
                 remote: remote.clone(),
@@ -978,6 +980,9 @@ pub fn run_managed_git() -> Result<u8, String> {
             if push.force {
                 canonical.push(OsString::from("--force"));
             }
+            if push.force_if_includes {
+                canonical.push(OsString::from("--force-if-includes"));
+            }
             if push.dry_run {
                 canonical.push(OsString::from("--dry-run"));
             }
@@ -987,17 +992,12 @@ pub fn run_managed_git() -> Result<u8, String> {
             if push.quiet {
                 canonical.push(OsString::from("--quiet"));
             }
-            for lease in &push.leases {
-                canonical.push(OsString::from(format!(
-                    "--force-with-lease={}:{}",
-                    lease.remote_ref, lease.expected_oid
-                )));
-            }
-            canonical.push(OsString::from(&remote));
             let object_width = git_client
                 .resolve_commit_oid(&directory, "HEAD")
                 .map_or(40, |oid| oid.len());
             let mut tuples = Vec::with_capacity(resolved_refspecs.len());
+            let mut resolved_leases = Vec::new();
+            let mut canonical_refspecs = Vec::with_capacity(resolved_refspecs.len());
             for (local_ref, remote_ref) in resolved_refspecs {
                 let is_deletion = local_ref == "(delete)";
                 let is_branch = remote_ref.starts_with("refs/heads/");
@@ -1017,15 +1017,30 @@ pub fn run_managed_git() -> Result<u8, String> {
                 } else {
                     format!("{local_ref}:{remote_ref}")
                 };
-                canonical.push(OsString::from(canonical_refspec));
+                canonical_refspecs.push(OsString::from(canonical_refspec));
+
+                let explicit_lease = push
+                    .leases
+                    .iter()
+                    .find(|lease| lease.remote_ref == remote_ref);
+                let empty_lease_requested = push
+                    .empty_lease_refs
+                    .iter()
+                    .any(|leased| leased == &remote_ref);
+                let tracking_lease_requested = push.bare_force_with_lease
+                    || push.lease_refs.iter().any(|leased| leased == &remote_ref);
 
                 let remote_oid = if is_tag {
-                    if let Some(lease) = push
-                        .leases
-                        .iter()
-                        .find(|lease| lease.remote_ref == remote_ref)
-                    {
+                    if let Some(lease) = explicit_lease {
+                        resolved_leases.push(lease.clone());
                         lease.expected_oid.clone()
+                    } else if empty_lease_requested || tracking_lease_requested {
+                        let zero_oid = "0".repeat(object_width);
+                        resolved_leases.push(crate::git_command::ExactPushLease {
+                            remote_ref: remote_ref.clone(),
+                            expected_oid: zero_oid.clone(),
+                        });
+                        zero_oid
                     } else if push_policy.require_tag_lease_on_create {
                         return Err(
                             "tag publication requires an exact --force-with-lease=<ref>:<oid> for the advertised remote state"
@@ -1043,17 +1058,31 @@ pub fn run_managed_git() -> Result<u8, String> {
                             "cannot resolve the cached remote OID for publication".to_owned()
                         })?
                         .unwrap_or_else(|| "0".repeat(object_width));
-                    if let Some(lease) = push
-                        .leases
-                        .iter()
-                        .find(|lease| lease.remote_ref == remote_ref)
-                    {
+                    if let Some(lease) = explicit_lease {
                         if lease.expected_oid != cached {
                             return Err(
                                 "force-with-lease OID does not match the cached remote ref; fetch and re-authorize explicitly"
                                     .to_owned(),
                             );
                         }
+                        resolved_leases.push(lease.clone());
+                    } else if empty_lease_requested {
+                        let zero_oid = "0".repeat(object_width);
+                        if cached != zero_oid {
+                            return Err(
+                                "force-with-lease OID does not match the cached remote ref; fetch and re-authorize explicitly"
+                                    .to_owned(),
+                            );
+                        }
+                        resolved_leases.push(crate::git_command::ExactPushLease {
+                            remote_ref: remote_ref.clone(),
+                            expected_oid: zero_oid,
+                        });
+                    } else if tracking_lease_requested {
+                        resolved_leases.push(crate::git_command::ExactPushLease {
+                            remote_ref: remote_ref.clone(),
+                            expected_oid: cached.clone(),
+                        });
                     }
                     cached
                 };
@@ -1103,12 +1132,36 @@ pub fn run_managed_git() -> Result<u8, String> {
                     remote_oid,
                 });
             }
+            for requested_lease_ref in push
+                .leases
+                .iter()
+                .map(|lease| lease.remote_ref.as_str())
+                .chain(push.lease_refs.iter().map(String::as_str))
+                .chain(push.empty_lease_refs.iter().map(String::as_str))
+            {
+                if !tuples
+                    .iter()
+                    .any(|tuple| tuple.remote_ref == requested_lease_ref)
+                {
+                    return Err(
+                        "force-with-lease must match a requested destination ref".to_owned()
+                    );
+                }
+            }
+            for lease in &resolved_leases {
+                canonical.push(OsString::from(format!(
+                    "--force-with-lease={}:{}",
+                    lease.remote_ref, lease.expected_oid
+                )));
+            }
+            canonical.push(OsString::from(&remote));
+            canonical.extend(canonical_refspecs);
             git_arguments = canonical;
             managed_push_request = Some(PushRequest {
                 remote: remote.clone(),
                 destination: destination.clone(),
                 tuples,
-                leases: push.leases,
+                leases: resolved_leases,
                 allow_unleased_force: push.force,
             });
         }
@@ -1184,6 +1237,17 @@ pub fn run_managed_git() -> Result<u8, String> {
             },
             dynamic_tuples: push_dynamic_tuples,
             force_requested: push_force_requested,
+            bare_force_with_lease: push_bare_force_with_lease,
+            lease_refs: push_lease_refs,
+            empty_lease_refs: push_empty_lease_refs,
+            exact_leases: request
+                .leases
+                .iter()
+                .map(|lease| crate::push_handoff::HandoffLease {
+                    remote_ref: lease.remote_ref.clone(),
+                    expected_oid: lease.expected_oid.clone(),
+                })
+                .collect(),
         };
         push_handoff_file = Some(crate::push_handoff::write(&paths, &handoff)?);
     }

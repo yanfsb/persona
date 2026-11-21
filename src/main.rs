@@ -70,7 +70,7 @@ enum Commands {
     Run(RunArgs),
     /// Create the initial private Persona configuration and first scope/profile.
     Setup(SetupArgs),
-    /// Migrate or roll back Persona's private configuration file.
+    /// Inspect, validate, edit, or roll back Persona's private configuration file.
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
@@ -269,24 +269,35 @@ enum InstallCommands {
 
 #[derive(Subcommand)]
 enum ConfigCommands {
-    /// Migrate configuration to the v3 schema (preview or apply).
-    Migrate {
-        /// Explicit configuration file to preview migration for.
+    /// Print the active Persona configuration file path.
+    Path {
+        /// Explicit Persona configuration file path.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Print the v3 TOML preview without modifying the configuration file.
-        #[arg(
-            long,
-            short = 'n',
-            visible_alias = "dry-run",
-            conflicts_with = "apply",
-            required_unless_present = "apply"
-        )]
-        preview: bool,
-        /// Atomically write the migrated v3 configuration to the private config store.
-        #[arg(long, conflicts_with = "preview")]
-        apply: bool,
     },
+    /// Validate Persona's configuration syntax and policy invariants offline.
+    Validate {
+        /// Explicit Persona configuration file path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Display Persona's configuration (optionally resolving `extends`, defaults, and shorthands).
+    Show {
+        /// Explicit Persona configuration file path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Show only a single profile by name.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Expand `extends` inheritance, defaults, `~/` paths, and forge shorthands.
+        #[arg(long)]
+        resolved: bool,
+        /// Output resolved profiles and scopes as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Edit Persona's private configuration in `$VISUAL`/`$EDITOR` and validate before saving.
+    Edit,
     /// Restore a backup created by Persona's private config store.
     Rollback {
         /// Path to the backup file inside Persona's private state backups directory.
@@ -538,7 +549,13 @@ struct RunArgs {
 struct ProfileEditArgs {
     /// Profile name.
     name: String,
-    /// Expected Git author name (required on `add`; kept if omitted on `update`).
+    /// Parent profile to inherit settings from.
+    #[arg(long, conflicts_with = "clear_extends", help_heading = "Identity")]
+    extends: Option<String>,
+    /// Detach this profile from its parent `extends` profile (materializing its current settings).
+    #[arg(long, conflicts_with = "extends", help_heading = "Identity")]
+    clear_extends: bool,
+    /// Expected Git author name (required on `add` unless `--extends` is used; kept if omitted on `update`).
     #[arg(long, help_heading = "Identity")]
     author_name: Option<String>,
     /// Expected Git author email (required on `add`; kept if omitted on `update`).
@@ -1120,24 +1137,32 @@ fn main() -> ExitCode {
                 Ok(0)
             }
             Some(Commands::Config { command }) => match command {
-                ConfigCommands::Migrate {
-                    config,
-                    preview: _,
-                    apply,
-                } if apply => {
-                    if config.is_some() {
-                        return Err("--config cannot be combined with --apply; migration writes only the private XDG config".to_owned());
+                ConfigCommands::Path { config } => {
+                    let path = resolve_config_path(config.as_deref())?;
+                    println!("{}", path.display());
+                    Ok(0)
+                }
+                ConfigCommands::Validate { config } => {
+                    let path = resolve_config_path(config.as_deref())?;
+                    let loaded = Config::load(&path).map_err(|error| error.to_string())?;
+                    if !is_quiet() {
+                        println!(
+                            "Configuration at {} is valid (v{}, {} profile(s), {} scope(s)).",
+                            path.display(),
+                            loaded.version(),
+                            loaded.profiles().len(),
+                            loaded.policies().len()
+                        );
                     }
-                    apply_config_migration()
+                    Ok(0)
                 }
-                ConfigCommands::Migrate {
+                ConfigCommands::Show {
                     config,
-                    preview: _,
-                    apply: _,
-                } => {
-                    let config = resolve_config_path(config.as_deref())?;
-                    preview_config_migration(&config)
-                }
+                    profile,
+                    resolved,
+                    json,
+                } => show_config(config.as_deref(), profile.as_deref(), resolved, json),
+                ConfigCommands::Edit => edit_config(),
                 ConfigCommands::Rollback { backup } => rollback_config(&backup),
             },
             Some(Commands::Profile { command }) => profile_command(command),
@@ -2274,6 +2299,7 @@ fn setup(args: SetupArgs) -> Result<u8, String> {
     )?;
     let profile = Profile {
         name: args.profile.clone(),
+        extends: None,
         github: None,
         ssh: None,
         ssh_hosts: Vec::new(),
@@ -2304,7 +2330,7 @@ fn setup(args: SetupArgs) -> Result<u8, String> {
     let config = Config::single_scope(profile, args.scope_name, scope_root)
         .map_err(|error| format!("invalid initial profile/scope: {error}"))?;
     let contents = config
-        .to_v3_toml()
+        .to_v4_toml()
         .map_err(|error| format!("cannot encode initial configuration: {error}"))?;
     paths
         .ensure_private_directories()
@@ -2379,37 +2405,150 @@ fn physical_scope_root(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn preview_config_migration(config_path: &Path) -> Result<u8, String> {
-    let config = Config::load(config_path).map_err(|error| error.to_string())?;
-    let preview = config
-        .to_v3_toml()
-        .map_err(|error| format!("cannot migrate configuration: {error}"))?;
-    print!("{preview}");
+fn show_config(
+    explicit: Option<&Path>,
+    profile: Option<&str>,
+    resolved: bool,
+    json: bool,
+) -> Result<u8, String> {
+    let config = load_config(explicit)?;
+    if json {
+        let payload = if let Some(profile_name) = profile {
+            let item = config
+                .profiles()
+                .iter()
+                .find(|item| item.name == profile_name)
+                .ok_or_else(|| format!("profile `{profile_name}` does not exist"))?;
+            let scopes: Vec<_> = config
+                .policies()
+                .iter()
+                .filter(|scope| scope.profile == profile_name)
+                .map(|scope| {
+                    serde_json::json!({
+                        "name": scope.name,
+                        "path": scope.path,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "version": config.version(),
+                "profile": item,
+                "scopes": scopes,
+            })
+        } else {
+            let scopes: Vec<_> = config
+                .policies()
+                .iter()
+                .map(|scope| {
+                    serde_json::json!({
+                        "name": scope.name,
+                        "path": scope.path,
+                        "profile": scope.profile,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "version": config.version(),
+                "profiles": config.profiles(),
+                "scopes": scopes,
+            })
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .map_err(|error| format!("cannot encode configuration as JSON: {error}"))?
+        );
+        return Ok(0);
+    }
+
+    let rendered = match (profile, resolved) {
+        (Some(name), true) => config.to_resolved_profile_v4_toml(name),
+        (Some(name), false) => config.to_profile_v4_toml(name),
+        (None, true) => config.to_resolved_v4_toml(),
+        (None, false) => config.to_v4_toml(),
+    }
+    .map_err(|error| format!("cannot display configuration: {error}"))?;
+    print!("{rendered}");
     Ok(0)
 }
 
-fn apply_config_migration() -> Result<u8, String> {
+fn edit_config() -> Result<u8, String> {
     let paths = PersonaPaths::discover()
         .map_err(|error| format!("cannot resolve Persona paths: {error}"))?;
     let _update_lock = paths
         .lock_config_update()
-        .map_err(|error| format!("cannot lock private configuration for migration: {error}"))?;
+        .map_err(|error| format!("cannot lock private configuration for edit: {error}"))?;
     paths
         .validate_private_config()
         .map_err(|error| format!("unsafe private configuration: {error}"))?;
-    let config = Config::load(&paths.config_file)
-        .map_err(|error| format!("cannot load private configuration: {error}"))?;
-    if config.version() == 3 {
-        return Err("configuration is already version 3".to_owned());
+    if !paths.config_file.is_file() {
+        return Err(format!(
+            "no Persona configuration at {}; run `persona setup` first",
+            paths.config_file.display()
+        ));
     }
-    let contents = config
-        .to_v3_toml()
-        .map_err(|error| format!("cannot migrate configuration: {error}"))?;
+    let original = std::fs::read(&paths.config_file)
+        .map_err(|error| format!("cannot read private configuration: {error}"))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix("persona-edit-")
+        .suffix(".toml")
+        .tempfile_in(&paths.state_dir)
+        .map_err(|error| format!("cannot create private editor buffer: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot restrict editor buffer permissions: {error}"))?;
+    }
+    temp.write_all(&original)
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|error| format!("cannot write private editor buffer: {error}"))?;
+
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_owned());
+    let mut parts = editor.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| "configured editor command is empty".to_owned())?;
+    let mut command = Command::new(program);
+    command.args(parts);
+    command.arg(temp.path());
+    let status = wait_child_ignoring_sigint(&mut command)
+        .map_err(|error| format!("cannot launch editor `{program}`: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "editor `{program}` exited with status {}; configuration unchanged",
+            status_exit_code(status)
+        ));
+    }
+
+    let edited = std::fs::read(temp.path())
+        .map_err(|error| format!("cannot read edited configuration: {error}"))?;
+    if edited == original {
+        if !is_quiet() {
+            println!("No changes made; configuration unchanged.");
+        }
+        return Ok(0);
+    }
+    let edited_text = String::from_utf8(edited.clone()).map_err(|_| {
+        "edited configuration is not valid UTF-8; configuration unchanged".to_owned()
+    })?;
+    Config::parse(&edited_text).map_err(|error| {
+        format!("refusing invalid edited configuration ({error}); original configuration unchanged")
+    })?;
     let backup = paths
-        .write_config(contents.as_bytes())
-        .map_err(|error| format!("cannot atomically migrate configuration: {error}"))?;
+        .write_config(&edited)
+        .map_err(|error| format!("cannot atomically save edited configuration: {error}"))?;
     if !is_quiet() {
-        println!("Migrated private configuration to v3.");
+        println!("Updated private Persona configuration.");
         if let Some(backup) = backup {
             println!("Backup: {}", backup.display());
         }
@@ -2732,8 +2871,14 @@ fn baseline_command(command: BaselineCommands) -> Result<u8, String> {
             if touched == 0 {
                 return Err("no remote-tracking refs found to update".to_owned());
             }
+            let updated_baselines = updated
+                .git
+                .push
+                .as_ref()
+                .map(|push| push.upstream_baselines.clone())
+                .unwrap_or_default();
             config
-                .update_profile(updated)
+                .update_profile_baselines(&updated.name, updated_baselines)
                 .map_err(|error| format!("cannot update upstream baselines: {error}"))?;
             persist_private_config(&paths, &update_lock, &config, preview)
         }
@@ -2770,8 +2915,21 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
                 .find(|profile| profile.name == name)
                 .ok_or_else(|| format!("profile `{name}` does not exist"))?;
             if json {
+                let bound_scopes: Vec<_> = config
+                    .policies()
+                    .iter()
+                    .filter(|scope| scope.profile == profile.name)
+                    .map(|scope| {
+                        serde_json::json!({
+                            "name": scope.name,
+                            "path": scope.path,
+                        })
+                    })
+                    .collect();
                 let payload = serde_json::json!({
                     "name": profile.name,
+                    "extends": profile.extends,
+                    "scopes": bound_scopes,
                     "author": {
                         "name": profile.git.author.name,
                         "email": profile.git.author.email,
@@ -2812,6 +2970,18 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
                 return Ok(0);
             }
             println!("profile: {}", profile.name);
+            if let Some(parent) = &profile.extends {
+                println!("extends: {parent}");
+            }
+            let bound_scopes: Vec<String> = config
+                .policies()
+                .iter()
+                .filter(|scope| scope.profile == profile.name)
+                .map(|scope| format!("{} ({})", scope.name, scope.path.display()))
+                .collect();
+            if !bound_scopes.is_empty() {
+                println!("scopes: {}", bound_scopes.join(", "));
+            }
             println!(
                 "author: {} <{}>",
                 profile.git.author.name, profile.git.author.email
@@ -2937,7 +3107,19 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
         ProfileCommands::Add(args) => {
             let (paths, update_lock, mut config) = load_private_config_for_update()?;
             let preview = args.preview;
-            let profile = profile_from_args(*args, None)?;
+            let parent = args
+                .extends
+                .as_deref()
+                .map(|parent_name| {
+                    config
+                        .profiles()
+                        .iter()
+                        .find(|profile| profile.name == parent_name)
+                        .cloned()
+                        .ok_or_else(|| format!("parent profile `{parent_name}` does not exist"))
+                })
+                .transpose()?;
+            let profile = profile_from_args(*args, parent.as_ref(), true)?;
             config
                 .add_profile(profile)
                 .map_err(|error| format!("cannot add profile: {error}"))?;
@@ -2952,7 +3134,7 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
                 .ok_or_else(|| format!("profile `{}` does not exist", args.name))?;
             let existing = existing.clone();
             let preview = args.preview;
-            let profile = profile_from_args(*args, Some(&existing))?;
+            let profile = profile_from_args(*args, Some(&existing), false)?;
             config
                 .update_profile(profile)
                 .map_err(|error| format!("cannot update profile: {error}"))?;
@@ -3030,7 +3212,20 @@ fn profile_command(command: ProfileCommands) -> Result<u8, String> {
     }
 }
 
-fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Result<Profile, String> {
+fn profile_from_args(
+    args: ProfileEditArgs,
+    existing: Option<&Profile>,
+    is_add: bool,
+) -> Result<Profile, String> {
+    let extends = if args.clear_extends {
+        None
+    } else if args.extends.is_some() {
+        args.extends
+    } else if is_add {
+        None
+    } else {
+        existing.and_then(|profile| profile.extends.clone())
+    };
     let author_name = match (args.author_name, existing) {
         (Some(name), _) => name,
         (None, Some(profile)) => profile.git.author.name.clone(),
@@ -3447,6 +3642,7 @@ fn profile_from_args(args: ProfileEditArgs, existing: Option<&Profile>) -> Resul
     )?;
     Ok(Profile {
         name: args.name,
+        extends,
         github,
         ssh,
         ssh_hosts: existing.map_or_else(Vec::new, |profile| {
@@ -3798,7 +3994,7 @@ fn persist_private_config(
         .validate_private_config()
         .map_err(|error| format!("unsafe private configuration: {error}"))?;
     let contents = config
-        .to_v3_toml()
+        .to_v4_toml()
         .map_err(|error| format!("cannot serialize configuration: {error}"))?;
     Config::parse(&contents).map_err(|error| format!("refusing invalid configuration: {error}"))?;
     if preview {

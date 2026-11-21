@@ -10,7 +10,7 @@ Persona deliberately refuses unsupported flags, ambiguous targets, unlisted dest
 
 ## Config is invalid or unsafe
 
-The parser rejects unknown fields and unsupported versions. Validate syntax and names; scope paths must be absolute and profile references must exist. Use `persona config migrate --preview` before migration. Persona refuses unsafe default configuration paths rather than silently changing ownership or permissions.
+The parser rejects unknown fields and unsupported versions with line/column diagnostics. Run `persona config validate` to verify syntax and policy invariants, or `persona config show --resolved` to inspect effective settings after `extends` inheritance and defaults. Scope paths must be absolute (or start with `~/`) and profile references must exist. Persona refuses unsafe default configuration paths rather than silently changing ownership or permissions.
 
 ## Installation or hook conflict
 

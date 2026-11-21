@@ -10,21 +10,17 @@ fn policy_for(scope_root: &Path) -> String {
         .to_str()
         .expect("fixture path should be valid UTF-8");
 
-    // Produz uma string TOML corretamente escapada.
     let quoted_root = toml::Value::String(root.to_owned());
 
     format!(
         r#"
-   version = 1
+version = 4
 
-   [[scopes]]
-   name = "work"
-   path = {quoted_root}
-
-   [scopes.git]
-   author = {{ name = "Test Author", email = "author@example.invalid" }}
-   committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
-   "#
+[profiles.work]
+scopes = [{quoted_root}]
+author = {{ name = "Test Author", email = "author@example.invalid" }}
+committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
+"#
     )
 }
 
@@ -80,13 +76,13 @@ fn preserves_policy_validation_errors() {
     let temporary = tempdir().expect("create temporary directory");
     let config_path = temporary.path().join("policy.toml");
 
-    fs::write(&config_path, "version = 4\nscopes = []").expect("write invalid policy");
+    fs::write(&config_path, "version = 3\nscopes = []").expect("write invalid policy");
 
     let result = Config::load(&config_path);
 
     assert!(matches!(
         result,
-        Err(ConfigLoadError::Invalid(ConfigError::UnsupportedVersion(4)))
+        Err(ConfigLoadError::Invalid(ConfigError::UnsupportedVersion(3)))
     ));
 }
 
@@ -101,7 +97,7 @@ fn reports_malformed_toml() {
 
     assert!(matches!(
         result,
-        Err(ConfigLoadError::Invalid(ConfigError::InvalidToml))
+        Err(ConfigLoadError::Invalid(ConfigError::InvalidToml(_)))
     ));
 }
 

@@ -556,18 +556,56 @@ fn managed_ssh_authenticates_to_a_local_sshd_with_only_the_pinned_key_and_host_k
     fs::write(
         &config,
         format!(
-            "version = 2\n[[profiles]]\nname = \\\"fixture\\\"\n[profiles.git]\nauthor = {{ name = \\\"Synthetic\\\", email = \\\"synthetic@example.invalid\\\" }}\ncommitter = {{ name = \\\"Synthetic\\\", email = \\\"synthetic@example.invalid\\\" }}\n[profiles.git.signing]\nfingerprint = {signing_fingerprint:?}\nformat = \"ssh\"\npublic_key = {public_key:?}\n[profiles.git.push]\nremote = \\\"origin\\\"\ndestinations = [{destination:?}]\nallow_lightweight_tags = true\nallow_annotated_tags = true\nallow_branch_deletion = true\nallow_tag_deletion = true\nallow_force_with_lease = true\npreserve_authors = true\n[[profiles.git.push.upstream_baselines]]\ndestination = {destination:?}\ntracking_ref = \"refs/remotes/origin/upstream\"\noid = {base_oid:?}\n[profiles.ssh]\nhost = \\\"127.0.0.1\\\"\nuser = {:?}\nport = {port}\nfingerprint = {:?}\npublic_key = {:?}\nagent_socket = {:?}\nknown_hosts_file = {:?}\n[[scopes]]\nname = \\\"fixture\\\"\npath = {:?}\nprofile = \\\"fixture\\\"\n",
-            policy.user,
-            policy.fingerprint,
-            policy.public_key,
-            policy.agent_socket.as_ref().unwrap(),
-            policy.known_hosts_file,
-            worktree,
+            r#"version = 4
+
+[profiles.fixture]
+name = "Synthetic"
+email = "synthetic@example.invalid"
+scopes = [{worktree:?}]
+
+[profiles.fixture.signing]
+fingerprint = {signing_fingerprint:?}
+format = "ssh"
+public_key = {public_key:?}
+
+[profiles.fixture.git]
+remote = "origin"
+push = [{destination:?}]
+allow_lightweight_tags = true
+allow_annotated_tags = true
+allow_branch_deletion = true
+allow_tag_deletion = true
+allow_force_with_lease = true
+preserve_authors = true
+
+[[profiles.fixture.git.baselines]]
+destination = {destination:?}
+tracking_ref = "refs/remotes/origin/upstream"
+oid = {base_oid:?}
+
+[profiles.fixture.ssh]
+host = "127.0.0.1"
+user = {user:?}
+port = {port}
+fingerprint = {ssh_fingerprint:?}
+public_key = {ssh_public_key:?}
+agent_socket = {agent_socket:?}
+known_hosts_file = {known_hosts_file:?}
+"#,
+            worktree = worktree,
+            signing_fingerprint = signing_fingerprint,
+            public_key = public_key,
+            destination = destination,
+            base_oid = base_oid,
+            user = policy.user,
+            port = port,
+            ssh_fingerprint = policy.fingerprint,
+            ssh_public_key = policy.public_key,
+            agent_socket = policy.agent_socket.as_ref().unwrap(),
+            known_hosts_file = policy.known_hosts_file,
         ),
     )
     .unwrap();
-    let config_contents = fs::read_to_string(&config).unwrap().replace("\\\"", "\"");
-    fs::write(&config, config_contents).unwrap();
     let persona = PathBuf::from(env!("CARGO_BIN_EXE_persona"));
     let blocked_without_hook = Command::new(&persona)
         .env_clear()

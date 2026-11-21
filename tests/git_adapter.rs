@@ -196,22 +196,20 @@ fn managed_fetch_routes_ssh_only_through_the_profile_transport() {
         &config,
         format!(
             r#"
-version = 2
-[[profiles]]
-name = "fixture"
-[profiles.git]
-author = {{ name = "Fixture", email = "fixture@example.invalid" }}
-committer = {{ name = "Fixture", email = "fixture@example.invalid" }}
-remotes = [
-  {{ name = "origin", fetch_destinations = ["{remote}"], push_destinations = ["{remote}"] }},
-  {{ name = "https", fetch_destinations = ["{https_destination}"], push_destinations = [] }},
-  {{ name = "upstream", fetch_destinations = ["{upstream}"], push_destinations = [] }},
-  {{ name = "skipped", fetch_destinations = ["{skipped}"], push_destinations = [] }}
-]
-[profiles.git.push]
-remote = "origin"
-destinations = [{remote_value}]
-[profiles.ssh]
+version = 4
+
+[profiles.fixture]
+name = "Fixture"
+email = "fixture@example.invalid"
+scopes = [{scope_path}]
+
+[profiles.fixture.git.remotes]
+origin = {{ fetch = [{remote_value}], push = [{remote_value}] }}
+https = {{ fetch = ["{https_destination}"] }}
+upstream = {{ fetch = ["{upstream}"] }}
+skipped = {{ fetch = ["{skipped}"] }}
+
+[profiles.fixture.ssh]
 host = "github.com"
 user = "git"
 port = 22
@@ -219,10 +217,6 @@ fingerprint = "{fingerprint}"
 public_key = {public_key_value}
 identity_file = {identity_file_value}
 known_hosts_file = {known_hosts_value}
-[[scopes]]
-name = "fixture"
-path = {scope_path}
-profile = "fixture"
 "#
         ),
     )
@@ -303,10 +297,8 @@ profile = "fixture"
     fs::remove_file(&marker).unwrap();
     let _ = fs::remove_file(&fetch_calls);
     let mut denied_config = fs::read_to_string(&config).unwrap();
-    denied_config = denied_config.replace(
-        &format!("  {{ name = \"upstream\", fetch_destinations = [\"{upstream}\"], push_destinations = [] }},\n"),
-        "",
-    );
+    denied_config =
+        denied_config.replace(&format!("upstream = {{ fetch = [\"{upstream}\"] }}\n"), "");
     fs::write(&config, denied_config).unwrap();
     let unauthorized = Command::new(env!("CARGO_BIN_EXE_persona"))
         .env_clear()
@@ -412,19 +404,15 @@ fn mixed_remote_fetch_all_preflight_rejects_before_any_transport() {
         &config,
         format!(
             r#"
-version = 2
-[[profiles]]
-name = "fixture"
-[profiles.git]
-author = {{ name = "Fixture", email = "fixture@example.invalid" }}
-committer = {{ name = "Fixture", email = "fixture@example.invalid" }}
-remotes = [
-  {{ name = "zz-ssh", fetch_destinations = ["git@github.com:org/repo.git"], push_destinations = [] }}
-]
-[[scopes]]
-name = "fixture"
-path = {scope_path}
-profile = "fixture"
+version = 4
+
+[profiles.fixture]
+name = "Fixture"
+email = "fixture@example.invalid"
+scopes = [{scope_path}]
+
+[profiles.fixture.git.remotes]
+zz-ssh = {{ fetch = ["git@github.com:org/repo.git"] }}
 "#
         ),
     )
@@ -519,7 +507,7 @@ fn managed_fetch_only_connects_to_an_exact_https_destination() {
     fs::write(
         &config,
         format!(
-            "version = 1\n[[scopes]]\nname = \"fixture\"\npath = {quoted_root}\n[scopes.git]\nauthor = {{ name = \"Fixture Author\", email = \"author@example.invalid\" }}\ncommitter = {{ name = \"Fixture Committer\", email = \"committer@example.invalid\" }}\npush = {{ remote = \"origin\", destinations = [{quoted_destination}] }}\n"
+            "version = 4\n[profiles.fixture]\nauthor = {{ name = \"Fixture Author\", email = \"author@example.invalid\" }}\ncommitter = {{ name = \"Fixture Committer\", email = \"committer@example.invalid\" }}\nscopes = [{quoted_root}]\n[profiles.fixture.git]\nremote = \"origin\"\npush = [{quoted_destination}]\n"
         ),
     )
     .unwrap();
@@ -856,10 +844,10 @@ fn managed_https_push_succeeds_and_rejects_a_server_update_race() {
     fs::write(
         &config,
         format!(
-            "version = 2\n[[profiles]]\nname = \"fixture\"\n[profiles.git]\nauthor = {{ name = \"Synthetic\", email = \"synthetic@example.invalid\" }}\ncommitter = {{ name = \"Synthetic\", email = \"synthetic@example.invalid\" }}\n[profiles.git.signing]\nfingerprint = {fingerprint:?}\nformat = \"ssh\"\npublic_key = {public_key:?}\n[profiles.git.push]\nremote = \"origin\"\ndestinations = [{}]\nallow_lightweight_tags = true\nallow_annotated_tags = true\nallow_branch_deletion = true\nallow_tag_deletion = true\nallow_force_with_lease = true\npreserve_authors = true\n[[profiles.git.push.upstream_baselines]]\ndestination = {}\ntracking_ref = \"refs/remotes/origin/upstream\"\noid = {base_oid:?}\n[[scopes]]\nname = \"fixture\"\npath = {}\nprofile = \"fixture\"\n",
-            q(&destination),
-            q(&destination),
+            "version = 4\n[profiles.fixture]\nname = \"Synthetic\"\nemail = \"synthetic@example.invalid\"\nscopes = [{}]\n[profiles.fixture.signing]\nfingerprint = {fingerprint:?}\nformat = \"ssh\"\npublic_key = {public_key:?}\n[profiles.fixture.git]\nremote = \"origin\"\npush = [{}]\nallow_lightweight_tags = true\nallow_annotated_tags = true\nallow_branch_deletion = true\nallow_tag_deletion = true\nallow_force_with_lease = true\npreserve_authors = true\n[[profiles.fixture.git.baselines]]\ndestination = {}\ntracking_ref = \"refs/remotes/origin/upstream\"\noid = {base_oid:?}\n",
             q(&worktree.to_string_lossy()),
+            q(&destination),
+            q(&destination),
         ),
     )
     .unwrap();
@@ -1346,6 +1334,269 @@ fn managed_https_push_succeeds_and_rejects_a_server_update_race() {
         String::from_utf8_lossy(&after_leased_rewrite.stdout).trim(),
         String::from_utf8_lossy(&expected_local_head.stdout).trim()
     );
+
+    // Configure upstream tracking on `main` so bare `git push --force-with-lease`
+    // and `git push --force` work without manually specifying remote/refspec/OID.
+    assert!(
+        run_git(
+            &worktree,
+            &["branch", "--set-upstream-to=origin/main", "main"]
+        )
+        .status
+        .success()
+    );
+    let amend_for_bare_lease = run_git(
+        &worktree,
+        &[
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=synthetic@example.invalid",
+            "commit",
+            "--amend",
+            "--no-edit",
+            "-m",
+            "amended for bare force-with-lease",
+        ],
+    );
+    assert!(
+        amend_for_bare_lease.status.success(),
+        "{}",
+        String::from_utf8_lossy(&amend_for_bare_lease.stderr)
+    );
+    let bare_force_with_lease = persona_command(&["run"])
+        .args(["--", "git", "push", "--force-with-lease"])
+        .output()
+        .unwrap();
+    assert!(
+        bare_force_with_lease.status.success(),
+        "bare --force-with-lease branch rewrite should resolve cached tracking OID automatically: stdout {}; stderr {}",
+        String::from_utf8_lossy(&bare_force_with_lease.stdout),
+        String::from_utf8_lossy(&bare_force_with_lease.stderr)
+    );
+    let head_after_bare_lease =
+        String::from_utf8_lossy(&run_git(&worktree, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+    let remote_after_bare_lease = String::from_utf8_lossy(
+        &fixture_git(&git, root.path())
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+    assert_eq!(remote_after_bare_lease, head_after_bare_lease);
+
+    // `--force-with-lease=<ref>` (without `:oid`) also resolves the cached remote-tracking OID.
+    let amend_for_ref_lease = run_git(
+        &worktree,
+        &[
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=synthetic@example.invalid",
+            "commit",
+            "--amend",
+            "--no-edit",
+            "-m",
+            "amended for ref-only force-with-lease",
+        ],
+    );
+    assert!(amend_for_ref_lease.status.success());
+    let ref_only_lease = persona_command(&["run"])
+        .args([
+            "--",
+            "git",
+            "push",
+            "--force-with-lease=main",
+            "origin",
+            "main",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        ref_only_lease.status.success(),
+        "ref-only --force-with-lease=main should succeed: stdout {}; stderr {}",
+        String::from_utf8_lossy(&ref_only_lease.stdout),
+        String::from_utf8_lossy(&ref_only_lease.stderr)
+    );
+
+    // Bare `--force-with-lease` must still fail closed when the remote moved ahead of
+    // our cached tracking ref (race protection preserved).
+    let racing_commit_two = fixture_git(&git, root.path())
+        .arg("-C")
+        .arg(&racing_worktree)
+        .args([
+            "-c",
+            "user.name=Racer",
+            "-c",
+            "user.email=racer@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "concurrent two",
+        ])
+        .output()
+        .unwrap();
+    assert!(racing_commit_two.status.success());
+    let racing_oid_two = String::from_utf8_lossy(
+        &run_git(&racing_worktree, &["rev-parse", "refs/heads/main"]).stdout,
+    )
+    .trim()
+    .to_owned();
+    assert!(
+        fixture_git(&git, root.path())
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["fetch", "--quiet"])
+            .arg(&racing_worktree)
+            .arg("refs/heads/main")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let amend_for_raced_lease = run_git(
+        &worktree,
+        &[
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=synthetic@example.invalid",
+            "commit",
+            "--amend",
+            "--no-edit",
+            "-m",
+            "amended against raced remote",
+        ],
+    );
+    assert!(amend_for_raced_lease.status.success());
+    fs::write(&race_file, format!("refs/heads/main {racing_oid_two}\n")).unwrap();
+    let raced_bare_lease = persona_command(&["run"])
+        .args(["--", "git", "push", "--force-with-lease"])
+        .output()
+        .unwrap();
+    assert!(
+        !raced_bare_lease.status.success(),
+        "bare --force-with-lease must fail closed when the remote ref moved concurrently"
+    );
+    let remote_still_raced = String::from_utf8_lossy(
+        &fixture_git(&git, root.path())
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+    assert_eq!(remote_still_raced, racing_oid_two);
+    if race_file.exists() {
+        fs::remove_file(&race_file).unwrap();
+    }
+
+    // Unleased `--force` is refused while `allow_force_push` is false (default opt-in).
+    let blocked_force = persona_command(&["run"])
+        .args(["--", "git", "push", "--force"])
+        .output()
+        .unwrap();
+    assert!(!blocked_force.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked_force.stderr)
+            .contains("unleased force push is disabled by the active profile's push policy"),
+        "unexpected force rejection: {}",
+        String::from_utf8_lossy(&blocked_force.stderr)
+    );
+
+    // Opting in via `allow_force_push = true` permits `git push --force` even when the
+    // remote has an unfetched commit (`racing_oid_two`), while still auditing local commits.
+    let base_config = fs::read_to_string(&config).unwrap();
+    let force_enabled_config = base_config.replace(
+        "allow_force_with_lease = true\n",
+        "allow_force_with_lease = true\nallow_force_push = true\n",
+    );
+    fs::write(&config, &force_enabled_config).unwrap();
+    let allowed_force = persona_command(&["run"])
+        .args(["--", "git", "push", "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        allowed_force.status.success(),
+        "opt-in allow_force_push = true should allow git push --force: stdout {}; stderr {}",
+        String::from_utf8_lossy(&allowed_force.stdout),
+        String::from_utf8_lossy(&allowed_force.stderr)
+    );
+    let head_after_force =
+        String::from_utf8_lossy(&run_git(&worktree, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+    let remote_after_force = String::from_utf8_lossy(
+        &fixture_git(&git, root.path())
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+    assert_eq!(remote_after_force, head_after_force);
+
+    // Bare `--force-with-lease` must NOT bypass `allow_force_with_lease = false` even when
+    // `allow_force_push = true`.
+    let lease_disabled_config = force_enabled_config.replace(
+        "allow_force_with_lease = true\n",
+        "allow_force_with_lease = false\n",
+    );
+    fs::write(&config, &lease_disabled_config).unwrap();
+    let amend_for_disabled_lease = run_git(
+        &worktree,
+        &[
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=synthetic@example.invalid",
+            "commit",
+            "--amend",
+            "--no-edit",
+            "-m",
+            "amended with allow_force_with_lease disabled",
+        ],
+    );
+    assert!(amend_for_disabled_lease.status.success());
+    let blocked_bare_lease = persona_command(&["run"])
+        .args(["--", "git", "push", "--force-with-lease"])
+        .output()
+        .unwrap();
+    assert!(
+        !blocked_bare_lease.status.success(),
+        "bare --force-with-lease must stay blocked when allow_force_with_lease = false"
+    );
+
+    // `[profiles.<name>.git.commands]` denylist takes precedence even when `allow_force_push = true`.
+    let force_denied_by_command_policy = format!(
+        "{force_enabled_config}[profiles.fixture.git.commands]\nmode = \"denylist\"\ndeny = [\"push.force\"]\n"
+    );
+    fs::write(&config, &force_denied_by_command_policy).unwrap();
+    let denied_force = persona_command(&["run"])
+        .args(["--", "git", "push", "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        !denied_force.status.success(),
+        "command denylist must still block push.force when allow_force_push = true"
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_force.stderr).contains("push.force"),
+        "unexpected denylist rejection: {}",
+        String::from_utf8_lossy(&denied_force.stderr)
+    );
 }
 
 #[cfg(unix)]
@@ -1435,27 +1686,24 @@ fn managed_fetch_uses_additional_ssh_host_and_rejects_unconfigured_host() {
     fs::write(
         &policy,
         format!(
-            r#"version = 3
+            r#"version = 4
 
-[[profiles]]
-name = "fixture"
-[profiles.git]
-author = {{ name = "Fixture", email = "fixture@example.invalid" }}
-committer = {{ name = "Fixture", email = "fixture@example.invalid" }}
-[[profiles.git.remotes]]
-name = "origin"
-fetch_destinations = ["{forge}"]
-push_destinations = []
-[[profiles.git.remotes]]
-name = "third"
-fetch_destinations = ["{unconfigured}"]
-push_destinations = []
-[profiles.github]
+[profiles.fixture]
+name = "Fixture"
+email = "fixture@example.invalid"
+scopes = [{repo_path}]
+
+[profiles.fixture.git.remotes]
+origin = {{ fetch = ["{forge}"] }}
+third = {{ fetch = ["{unconfigured}"] }}
+
+[profiles.fixture.github]
 host = "github.com"
 account_id = "4242"
 account_selector = "synthetic-user"
 token_fingerprint = "hmac-sha256:{fingerprint_hash}"
-[profiles.ssh]
+
+[profiles.fixture.ssh]
 host = "github.com"
 user = "git"
 port = 22
@@ -1463,7 +1711,8 @@ fingerprint = "{fingerprint}"
 public_key = {public_key_value}
 identity_file = {key_value}
 known_hosts_file = {known_hosts_value}
-[[profiles.ssh_hosts]]
+
+[[profiles.fixture.ssh.extra]]
 host = "forge.example.invalid"
 user = "git"
 port = 22
@@ -1471,10 +1720,6 @@ fingerprint = "{fingerprint}"
 public_key = {public_key_value}
 identity_file = {key_value}
 known_hosts_file = {known_hosts_value}
-[[scopes]]
-name = "fixture"
-path = {repo_path}
-profile = "fixture"
 "#,
             fingerprint_hash = "0".repeat(64),
         ),

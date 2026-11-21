@@ -147,13 +147,14 @@ impl PublicationPlan {
             .iter_mut()
             .find(|update| update.remote_ref == remote_ref)
             .ok_or(PlanError::InvalidRef)?;
-        if !matches!(
+        if !(matches!(
             update.class,
             UpdateClass::ExistingBranch
                 | UpdateClass::DeleteBranch
                 | UpdateClass::DeleteTag
                 | UpdateClass::TagUpdate
-        ) {
+        ) || (update.class == UpdateClass::InitialBranch && is_zero_oid(expected_oid)))
+        {
             return Err(PlanError::UnsupportedRefKind);
         }
         update.expected_lease_oid = Some(expected_oid.to_owned());
@@ -161,10 +162,20 @@ impl PublicationPlan {
     }
 
     pub fn with_local_history(
+        self,
+        git: &GitClient,
+        root: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<Self, PlanError> {
+        self.with_local_history_for_push(git, root, deadline, false)
+    }
+
+    pub fn with_local_history_for_push(
         mut self,
         git: &GitClient,
         root: &Path,
         deadline: std::time::Instant,
+        allow_missing_remote_ancestor: bool,
     ) -> Result<Self, PlanError> {
         for update in &mut self.updates {
             if std::time::Instant::now() >= deadline {
@@ -177,6 +188,14 @@ impl PublicationPlan {
                         {
                             Ok(true) => UpdateClass::FastForwardBranch,
                             Ok(false) => UpdateClass::RewriteBranch,
+                            Err(crate::git::GitError::MissingObject)
+                                if allow_missing_remote_ancestor
+                                    && git
+                                        .object_type(root, &update.local_oid)
+                                        .is_ok_and(|kind| kind == "commit") =>
+                            {
+                                UpdateClass::RewriteBranch
+                            }
                             Err(_) => return Err(PlanError::HistoryUnavailable),
                         };
                 }
@@ -341,6 +360,27 @@ mod tests {
             &"c".repeat(40),
         );
         assert!(!plan.updates()[0].matches_native_update(&changed));
+
+        let initial = tuple(
+            "refs/heads/new-branch",
+            &"b".repeat(40),
+            "refs/heads/new-branch",
+            &"0".repeat(40),
+        );
+        let initial_leased = PublicationPlan::new("origin", "url", std::slice::from_ref(&initial))
+            .unwrap()
+            .with_expected_lease("refs/heads/new-branch", &"0".repeat(40))
+            .unwrap();
+        assert_eq!(
+            initial_leased.updates()[0].expected_lease_oid(),
+            Some(&"0".repeat(40)[..])
+        );
+        assert_eq!(
+            PublicationPlan::new("origin", "url", std::slice::from_ref(&initial))
+                .unwrap()
+                .with_expected_lease("refs/heads/new-branch", &"a".repeat(40)),
+            Err(PlanError::UnsupportedRefKind)
+        );
     }
 
     #[test]

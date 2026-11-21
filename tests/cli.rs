@@ -42,18 +42,12 @@ fn concurrent_scope_add_commands_preserve_both_updates() {
             .into_owned(),
     );
     let config = format!(
-        r#"version = 3
+        r#"version = 4
 
-[[profiles]]
-name = "work"
-[profiles.git]
+[profiles.work]
 author = {{ name = "Synthetic", email = "author@example.invalid" }}
 committer = {{ name = "Synthetic", email = "committer@example.invalid" }}
-
-[[scopes]]
-name = "base"
-path = {base_path}
-profile = "work"
+scopes = [{{ name = "base", path = {base_path} }}]
 "#
     );
     paths.create_config(config.as_bytes()).unwrap();
@@ -209,17 +203,13 @@ fn write_policy(path: &Path, scope_root: &Path) {
     let quoted_root = toml::Value::String(root.to_owned());
 
     let contents = format!(
-        r#"
-   version = 1
+        r#"version = 4
 
-   [[scopes]]
-   name = "work"
-   path = {quoted_root}
-
-   [scopes.git]
-   author = {{ name = "Test Author", email = "author@example.invalid" }}
-   committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
-   "#
+[profiles.work]
+author = {{ name = "Test Author", email = "author@example.invalid" }}
+committer = {{ name = "Test Committer", email = "committer@example.invalid" }}
+scopes = [{quoted_root}]
+"#
     );
 
     fs::write(path, contents).expect("write fixture policy");
@@ -355,27 +345,134 @@ fn status_json_is_versioned_and_contains_typed_findings() {
 }
 
 #[test]
-fn config_migrate_preview_is_explicit_and_does_not_modify_source() {
+fn config_path_validate_and_show_commands_support_v4_and_extends() {
     let temporary = tempdir().expect("create temporary directory");
-    let scope_root = temporary.path().join("work");
-    fs::create_dir(&scope_root).expect("create scope");
+    let base_scope = temporary.path().join("base");
+    let child_scope = temporary.path().join("child");
+    fs::create_dir(&base_scope).expect("create base scope");
+    fs::create_dir(&child_scope).expect("create child scope");
     let config_path = temporary.path().join("policy.toml");
-    write_policy(&config_path, &scope_root);
+    let base_root = toml::Value::String(base_scope.to_string_lossy().into_owned());
+    let child_root = toml::Value::String(child_scope.to_string_lossy().into_owned());
+    fs::write(
+        &config_path,
+        format!(
+            r#"version = 4
+
+[profiles.base]
+name = "Base Author"
+email = "base@example.invalid"
+scopes = [{base_root}]
+
+[profiles.base.git]
+remote = "origin"
+push = ["github.com/example/*"]
+
+[profiles.child]
+extends = "base"
+email = "child@example.invalid"
+scopes = [{child_root}]
+"#
+        ),
+    )
+    .expect("write v4 fixture");
     let original = fs::read_to_string(&config_path).expect("read source config");
 
-    let output = persona_command(temporary.path())
-        .args(["config", "migrate", "--config"])
+    // `config path --config` reports the resolved path without mutating anything.
+    let path_output = persona_command(temporary.path())
+        .args(["config", "path", "--config"])
         .arg(&config_path)
-        .args(["--preview"])
         .output()
-        .expect("run migration preview");
+        .expect("run config path");
+    assert_eq!(path_output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(path_output.stdout).unwrap().trim(),
+        config_path.to_string_lossy()
+    );
 
-    assert_eq!(output.status.code(), Some(0));
+    // `config validate` validates syntax and invariants offline.
+    let validate_output = persona_command(temporary.path())
+        .args(["config", "validate", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run config validate");
+    assert_eq!(
+        validate_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&validate_output.stderr)
+    );
+    let validate_stdout = String::from_utf8(validate_output.stdout).unwrap();
+    assert!(validate_stdout.contains("is valid (v4, 2 profile(s), 2 scope(s))"));
+
+    // `config show` preserves `extends` and shorthands in authored view.
+    let show_authored = persona_command(temporary.path())
+        .args(["config", "show", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run config show");
+    assert_eq!(show_authored.status.code(), Some(0));
+    let authored_toml = String::from_utf8(show_authored.stdout).unwrap();
+    assert!(authored_toml.contains("version = 4"));
+    assert!(authored_toml.contains("extends = \"base\""));
+    let parsed_authored =
+        persona::config::Config::parse(&authored_toml).expect("authored output is valid v4");
+    assert_eq!(parsed_authored.version(), 4);
+
+    // `config show --resolved` flattens `extends` and expands shorthands.
+    let show_resolved = persona_command(temporary.path())
+        .args(["config", "show", "--config"])
+        .arg(&config_path)
+        .arg("--resolved")
+        .output()
+        .expect("run config show --resolved");
+    assert_eq!(show_resolved.status.code(), Some(0));
+    let resolved_toml = String::from_utf8(show_resolved.stdout).unwrap();
+    assert!(!resolved_toml.contains("extends ="));
+    assert!(resolved_toml.contains("git@github.com:example/*"));
+    assert!(resolved_toml.contains("https://github.com/example/*"));
+    let parsed_resolved =
+        persona::config::Config::parse(&resolved_toml).expect("resolved output is valid v4");
+    assert_eq!(parsed_resolved.version(), 4);
+
+    // `config show --profile child --resolved` yields a standalone resolved profile.
+    let show_child_resolved = persona_command(temporary.path())
+        .args(["config", "show", "--config"])
+        .arg(&config_path)
+        .args(["--profile", "child", "--resolved"])
+        .output()
+        .expect("run config show --profile child --resolved");
+    assert_eq!(show_child_resolved.status.code(), Some(0));
+    let child_toml = String::from_utf8(show_child_resolved.stdout).unwrap();
+    let parsed_child =
+        persona::config::Config::parse(&child_toml).expect("resolved child is standalone v4");
+    assert_eq!(parsed_child.profiles().len(), 1);
+    assert_eq!(parsed_child.profiles()[0].name, "child");
+    assert_eq!(parsed_child.profiles()[0].git.author.name, "Base Author");
+    assert_eq!(
+        parsed_child.profiles()[0].git.author.email,
+        "child@example.invalid"
+    );
+
+    // `config show --json` and `--profile child --json` emit structured JSON.
+    let show_json = persona_command(temporary.path())
+        .args(["config", "show", "--config"])
+        .arg(&config_path)
+        .args(["--profile", "child", "--json"])
+        .output()
+        .expect("run config show --profile child --json");
+    assert_eq!(show_json.status.code(), Some(0));
+    let payload: serde_json::Value = serde_json::from_slice(&show_json.stdout).expect("valid JSON");
+    assert_eq!(payload["version"], 4);
+    assert_eq!(payload["profile"]["name"], "child");
+    assert_eq!(payload["profile"]["extends"], "base");
+    assert_eq!(payload["profile"]["git"]["author"]["name"], "Base Author");
+    assert_eq!(
+        payload["profile"]["git"]["author"]["email"],
+        "child@example.invalid"
+    );
+
     assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
-    let preview = String::from_utf8(output.stdout).expect("preview is UTF-8");
-    let migrated = persona::config::Config::parse(&preview).expect("preview is valid v3");
-    assert_eq!(migrated.version(), 3);
-    assert_eq!(migrated.policies()[0].git.author.name, "Test Author");
 }
 
 #[test]
@@ -383,20 +480,37 @@ fn status_reports_invalid_configuration_as_an_error() {
     let temporary = tempdir().expect("create temporary directory");
     let config_path = temporary.path().join("policy.toml");
 
-    fs::write(&config_path, "version = 4\nscopes = []").expect("write invalid policy");
+    for unsupported in [3u32, 5u32] {
+        fs::write(&config_path, format!("version = {unsupported}\n"))
+            .expect("write invalid policy");
 
-    let output = persona_command(temporary.path())
-        .args(["status", "--config"])
-        .arg(&config_path)
-        .output()
-        .expect("run persona");
+        let output = persona_command(temporary.path())
+            .args(["status", "--config"])
+            .arg(&config_path)
+            .output()
+            .expect("run persona");
 
-    assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(2));
 
-    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+        let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
 
-    assert!(stderr.contains("UnsupportedVersion(4)"));
-    assert!(output.stdout.is_empty());
+        assert!(
+            stderr.contains(&format!("UnsupportedVersion({unsupported})")),
+            "expected UnsupportedVersion({unsupported}) in stderr: {stderr}"
+        );
+        assert!(output.stdout.is_empty());
+
+        let validate = persona_command(temporary.path())
+            .args(["config", "validate", "--config"])
+            .arg(&config_path)
+            .output()
+            .expect("run config validate");
+        assert_eq!(validate.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&validate.stderr)
+                .contains(&format!("UnsupportedVersion({unsupported})"))
+        );
+    }
 }
 
 #[test]
@@ -493,16 +607,16 @@ fn managed_remote_add_requires_exact_scope_destination_without_network() {
     fs::write(
         &config,
         format!(
-            r#"version = 1
-[[scopes]]
-name = "work"
-path = {root}
-[scopes.git]
+            r#"version = 4
+
+[profiles.work]
 author = {{ name = "Author", email = "author@example.invalid" }}
 committer = {{ name = "Committer", email = "committer@example.invalid" }}
-[scopes.git.push]
+scopes = [{root}]
+
+[profiles.work.git]
 remote = "origin"
-destinations = ["https://github.com/org/repo.git"]
+push = ["https://github.com/org/repo.git"]
 "#
         ),
     )
@@ -688,7 +802,7 @@ fn managed_worktree_add_is_detached_and_confined_to_the_target_scope() {
     let config = temporary.path().join("policy.toml");
     write_policy(&config, &repo);
     let mut policy_contents = fs::read_to_string(&config).unwrap();
-    policy_contents.push_str("\n[scopes.git.push]\nremote = \"origin\"\ndestinations = [\"file:///synthetic/upstream.git\"]\npreserve_authors = true\n");
+    policy_contents.push_str("\n[profiles.work.git]\nremote = \"origin\"\npush = [\"file:///synthetic/upstream.git\"]\npreserve_authors = true\n");
     fs::write(&config, policy_contents).unwrap();
 
     let target = repo.join("linked-worktree");
@@ -850,7 +964,7 @@ fn managed_worktree_add_is_detached_and_confined_to_the_target_scope() {
     let mut strict_profile = strict_config.profiles()[0].clone();
     strict_profile.git.strict_repo_hooks = true;
     strict_config.update_profile(strict_profile).unwrap();
-    fs::write(&strict_config_path, strict_config.to_v3_toml().unwrap()).unwrap();
+    fs::write(&strict_config_path, strict_config.to_v4_toml().unwrap()).unwrap();
     let hook_blocked = persona_command(&repo)
         .env("PERSONA_GIT", &git)
         .env("PATH", "/usr/bin:/bin")
@@ -928,7 +1042,7 @@ fn lightweight_tag_creation_requires_explicit_policy_opt_in() {
     fs::write(
         &config,
         format!(
-            "{base}\n[scopes.git.push]\nremote = \"origin\"\ndestinations = [\"file:///tmp/synthetic.git\"]\nallow_lightweight_tags = true\n"
+            "{base}\n[profiles.work.git]\nremote = \"origin\"\npush = [\"file:///tmp/synthetic.git\"]\nallow_lightweight_tags = true\n"
         ),
     )
     .unwrap();
@@ -1454,7 +1568,7 @@ printf '%s|%s' "$PWD" "$1"
         .unwrap();
     fs::write(
         &strict_filter_config_path,
-        strict_filter_config.to_v3_toml().unwrap(),
+        strict_filter_config.to_v4_toml().unwrap(),
     )
     .unwrap();
     let filtered_add = persona_command(temporary.path())
@@ -1597,10 +1711,30 @@ fn github_credential_selector_is_not_read_until_destination_gate_passes() {
             .success()
     );
     let root = toml::Value::String(repo.to_string_lossy().into_owned());
-    let config = temporary.path().join("policy-v2.toml");
-    fs::write(&config, format!(
-        "version = 2\n[[profiles]]\nname = \"work\"\n[profiles.git]\nauthor = {{ name = \"Synthetic Author\", email = \"author@example.invalid\" }}\ncommitter = {{ name = \"Synthetic Author\", email = \"author@example.invalid\" }}\n[profiles.git.push]\nremote = \"origin\"\ndestinations = [\"file:///allowed.git\"]\n[profiles.github]\nhost = \"github.com\"\naccount_id = \"4242\"\ntoken_fingerprint = \"hmac-sha256:{}\"\n[[scopes]]\nname = \"work\"\npath = {}\nprofile = \"work\"\n", "0".repeat(64), root
-    )).unwrap();
+    let config = temporary.path().join("policy-v4.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"version = 4
+
+[profiles.work]
+name = "Synthetic Author"
+email = "author@example.invalid"
+scopes = [{root}]
+
+[profiles.work.git]
+remote = "origin"
+push = ["file:///allowed.git"]
+
+[profiles.work.github]
+host = "github.com"
+account_id = "4242"
+token_fingerprint = "hmac-sha256:{}"
+"#,
+            "0".repeat(64)
+        ),
+    )
+    .unwrap();
     let marker = temporary.path().join("gh-was-called");
     let fake_gh = temporary.path().join("gh-fake");
     fs::write(
@@ -1720,27 +1854,24 @@ fn pre_push_hook_consumes_authenticated_handoff_for_github_without_token() {
     let config = temporary.path().join("policy.toml");
     let scope = toml::Value::String(repo.canonicalize().unwrap().to_string_lossy().into_owned());
     let contents = format!(
-        r#"version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
-committer = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
-[profiles.git.push]
+        r#"version = 4
+
+[profiles.work]
+name = "Synthetic"
+email = "synthetic@example.invalid"
+scopes = [{scope}]
+
+[profiles.work.git]
 remote = "origin"
-destinations = ["https://github.com/org/repo.git"]
-[profiles.github]
+push = ["https://github.com/org/repo.git"]
+
+[profiles.work.github]
 host = "github.com"
 account_id = "4242"
 account_selector = "synthetic"
 token_fingerprint = "hmac-sha256:{}"
-[[scopes]]
-name = "work"
-path = {}
-profile = "work"
 "#,
-        "0".repeat(64),
-        scope
+        "0".repeat(64)
     );
     fs::write(&config, &contents).unwrap();
     let install = persona_command(temporary.path())
@@ -1785,6 +1916,10 @@ profile = "work"
         }],
         dynamic_tuples: false,
         force_requested: false,
+        bare_force_with_lease: false,
+        lease_refs: Vec::new(),
+        empty_lease_refs: Vec::new(),
+        exact_leases: Vec::new(),
         github_binding: Some(HandoffGithubBinding {
             host: "github.com".into(),
             account_id: "4242".into(),
@@ -1910,7 +2045,7 @@ profile = "work"
 }
 
 #[test]
-fn setup_creates_private_v3_configuration_without_changing_native_settings() {
+fn setup_creates_private_v4_configuration_without_changing_native_settings() {
     use std::os::unix::fs::PermissionsExt;
 
     let temporary = tempdir().expect("create temporary directory");
@@ -1966,7 +2101,7 @@ fn setup_creates_private_v3_configuration_without_changing_native_settings() {
         0o600
     );
     let config = persona::config::Config::load(&config_file).unwrap();
-    assert_eq!(config.version(), 3);
+    assert_eq!(config.version(), 4);
     assert_eq!(
         config.policies()[0].git.author.email,
         "author@example.invalid"
@@ -2200,9 +2335,9 @@ fn managed_github_push_creates_and_consumes_primary_handoff_with_synthetic_crede
         &config,
         format!(
             r#"{contents}
-[scopes.git.push]
+[profiles.work.git]
 remote = "origin"
-destinations = ["https://github.com/org/repo.git"]
+push = ["https://github.com/org/repo.git"]
 "#
         ),
     )
@@ -2582,20 +2717,16 @@ exit 64
     fs::write(
         &config_file,
         format!(
-            r#"
-version = 2
-[[profiles]]
-name = "work"
-[profiles.git]
-author = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
-committer = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
-[profiles.git.push]
+            r#"version = 4
+
+[profiles.work]
+name = "Synthetic"
+email = "synthetic@example.invalid"
+scopes = [{scope_toml}]
+
+[profiles.work.git]
 remote = "origin"
-destinations = ["https://github.com/org/repo.git"]
-[[scopes]]
-name = "work"
-path = {scope_toml}
-profile = "work"
+push = ["https://github.com/org/repo.git"]
 "#
         ),
     )
@@ -3063,11 +3194,13 @@ fn profile_and_scope_cli_manages_reusable_private_configuration() {
     assert!(personal.git.signing.is_some());
     assert!(personal.git.push.is_some());
     assert!(personal.git.push.as_ref().unwrap().allow_force_with_lease);
-    assert_eq!(personal.git.remotes.len(), 1);
-    assert_eq!(personal.git.remotes[0].name, "origin");
     assert_eq!(
-        personal.git.remotes[0].fetch_destinations,
-        ["file:///tmp/synthetic-destination.git"]
+        personal.git.configured_fetch_destinations("origin"),
+        Some(["file:///tmp/synthetic-destination.git".to_owned()].as_slice())
+    );
+    assert_eq!(
+        personal.git.configured_push_destinations("origin"),
+        Some(["file:///tmp/synthetic-destination.git".to_owned()].as_slice())
     );
     assert_eq!(personal.ssh.as_ref().unwrap().host, "github.com");
     assert_eq!(personal.git.author.name, "Updated Personal Author");
@@ -3104,6 +3237,41 @@ fn profile_and_scope_cli_manages_reusable_private_configuration() {
         .unwrap();
     assert_eq!(blocked_remove.status.code(), Some(2));
 
+    let child_added = persona_command(temporary.path())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args([
+            "profile",
+            "add",
+            "personal-oss",
+            "--extends",
+            "personal",
+            "--author-email",
+            "oss@example.invalid",
+            "--committer-email",
+            "oss@example.invalid",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        child_added.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&child_added.stderr)
+    );
+    let child_show = persona_command(temporary.path())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["profile", "show", "personal-oss"])
+        .output()
+        .unwrap();
+    assert_eq!(child_show.status.code(), Some(0));
+    let child_show_stdout = String::from_utf8(child_show.stdout).unwrap();
+    assert!(child_show_stdout.contains("extends: personal"));
+    assert!(child_show_stdout.contains("author: Updated Personal Author <oss@example.invalid>"));
+    assert!(child_show_stdout.contains("signing policy: configured"));
+    assert!(child_show_stdout.contains("SSH transport hosts: github.com"));
+
     let scope_removed = persona_command(temporary.path())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
@@ -3111,6 +3279,24 @@ fn profile_and_scope_cli_manages_reusable_private_configuration() {
         .output()
         .unwrap();
     assert_eq!(scope_removed.status.code(), Some(0));
+
+    // Parent profile cannot be removed while a child profile still extends it.
+    let blocked_parent_remove = persona_command(temporary.path())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["profile", "remove", "personal"])
+        .output()
+        .unwrap();
+    assert_eq!(blocked_parent_remove.status.code(), Some(2));
+
+    let child_removed = persona_command(temporary.path())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .args(["profile", "remove", "personal-oss"])
+        .output()
+        .unwrap();
+    assert_eq!(child_removed.status.code(), Some(0));
+
     let profile_removed = persona_command(temporary.path())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
@@ -3121,12 +3307,13 @@ fn profile_and_scope_cli_manages_reusable_private_configuration() {
 }
 
 #[test]
-fn migration_apply_and_rollback_use_private_backups() {
+fn config_edit_validates_creates_private_backup_and_rolls_back() {
     use std::os::unix::fs::PermissionsExt;
 
     let temporary = tempdir().expect("create temporary directory");
     let home = temporary.path().join("home");
     let xdg = temporary.path().join("xdg-config");
+    let state = temporary.path().join("xdg-state");
     let config_dir = xdg.join("persona");
     fs::create_dir_all(&config_dir).expect("create config directory");
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3135,21 +3322,75 @@ fn migration_apply_and_rollback_use_private_backups() {
     fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)).unwrap();
     let original = fs::read(&config_file).unwrap();
 
-    let migrated = persona_command(temporary.path())
+    // 1. Invalid edited content is rejected and leaves the original config untouched.
+    let invalid_editor = temporary.path().join("editor-invalid");
+    fs::write(
+        &invalid_editor,
+        "#!/bin/sh\nprintf 'version = 3\\n' > \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&invalid_editor, fs::Permissions::from_mode(0o700)).unwrap();
+    let rejected = persona_command(temporary.path())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
-        .args(["config", "migrate", "--apply"])
+        .env("XDG_STATE_HOME", &state)
+        .env("EDITOR", &invalid_editor)
+        .args(["config", "edit"])
         .output()
-        .expect("apply migration");
+        .expect("run invalid config edit");
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("refusing invalid edited configuration")
+    );
+    assert_eq!(fs::read(&config_file).unwrap(), original);
+
+    // 2. Unchanged edit exits cleanly without creating an unnecessary rewrite.
+    let noop_editor = temporary.path().join("editor-noop");
+    fs::write(&noop_editor, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&noop_editor, fs::Permissions::from_mode(0o700)).unwrap();
+    let noop = persona_command(temporary.path())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("XDG_STATE_HOME", &state)
+        .env("EDITOR", &noop_editor)
+        .args(["config", "edit"])
+        .output()
+        .expect("run noop config edit");
+    assert_eq!(noop.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&noop.stdout).contains("No changes made"));
+    assert_eq!(fs::read(&config_file).unwrap(), original);
+
+    // 3. Valid edit atomically saves v4 config, records a private backup, and rolls back cleanly.
+    let valid_editor = temporary.path().join("editor-valid");
+    let updated_contents = String::from_utf8(original.clone())
+        .unwrap()
+        .replace("Test Author", "Edited Author");
+    let replacement_file = temporary.path().join("replacement.toml");
+    fs::write(&replacement_file, &updated_contents).unwrap();
+    fs::write(
+        &valid_editor,
+        format!("#!/bin/sh\ncp '{}' \"$1\"\n", replacement_file.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&valid_editor, fs::Permissions::from_mode(0o700)).unwrap();
+    let edited = persona_command(temporary.path())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("XDG_STATE_HOME", &state)
+        .env("VISUAL", &valid_editor)
+        .args(["config", "edit"])
+        .output()
+        .expect("apply valid config edit");
     assert_eq!(
-        migrated.status.code(),
+        edited.status.code(),
         Some(0),
         "{}",
-        String::from_utf8_lossy(&migrated.stderr)
+        String::from_utf8_lossy(&edited.stderr)
     );
     let current = persona::config::Config::load(&config_file).unwrap();
-    assert_eq!(current.version(), 3);
-    let output = String::from_utf8(migrated.stdout).unwrap();
+    assert_eq!(current.version(), 4);
+    assert_eq!(current.profiles()[0].git.author.name, "Edited Author");
+    let output = String::from_utf8(edited.stdout).unwrap();
     let backup = output
         .lines()
         .find_map(|line| line.strip_prefix("Backup: "))
@@ -3158,9 +3399,10 @@ fn migration_apply_and_rollback_use_private_backups() {
     let rolled_back = persona_command(temporary.path())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
+        .env("XDG_STATE_HOME", &state)
         .args(["config", "rollback", "--backup", backup])
         .output()
-        .expect("rollback migration");
+        .expect("rollback config edit");
     assert_eq!(
         rolled_back.status.code(),
         Some(0),
@@ -3266,18 +3508,12 @@ fn everyday_git_workflow_and_command_denylist_allowlist() {
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let config_path = config_dir.join("config.toml");
     let config = format!(
-        r#"version = 3
+        r#"version = 4
 
-[[profiles]]
+[profiles.yanfsb]
 name = "yanfsb"
-[profiles.git]
-author = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
-committer = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
-
-[[scopes]]
-name = "work"
-path = {scope:?}
-profile = "yanfsb"
+email = "yanfsb@example.invalid"
+scopes = [{{ name = "work", path = {scope:?} }}]
 "#,
         scope = repo.canonicalize().unwrap().to_string_lossy()
     );
@@ -3503,26 +3739,21 @@ fn baseline_update_pins_current_remote_tracking_refs_without_manual_sed() {
     fs::write(
         &config_path,
         format!(
-            r#"version = 3
+            r#"version = 4
 
-[[profiles]]
+[profiles.yanfsb]
 name = "yanfsb"
-[profiles.git]
-author = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
-committer = {{ name = "yanfsb", email = "yanfsb@example.invalid" }}
-[profiles.git.push]
+email = "yanfsb@example.invalid"
+scopes = [{{ name = "work", path = {scope:?} }}]
+
+[profiles.yanfsb.git]
 remote = "origin"
-destinations = [{dest:?}, "https://github.com/yanfsb/other.git"]
+push = [{dest:?}, "https://github.com/yanfsb/other.git"]
 upstream_provenance = "pinned"
-upstream_baselines = [
+baselines = [
   {{ destination = {dest:?}, tracking_ref = "refs/remotes/origin/main", oid = "1111111111111111111111111111111111111111" }},
   {{ destination = "https://github.com/yanfsb/other.git", tracking_ref = "refs/remotes/origin/main", oid = "2222222222222222222222222222222222222222" }}
 ]
-
-[[scopes]]
-name = "work"
-path = {scope:?}
-profile = "yanfsb"
 "#,
             dest = remote.to_string_lossy(),
             scope = repo.canonicalize().unwrap().to_string_lossy(),
@@ -3634,21 +3865,16 @@ fn clig_ergonomics_shims_exit_codes_json_partial_update_and_completions() {
     fs::write(
         &custom_config,
         format!(
-            r#"version = 3
+            r#"version = 4
 
-[[profiles]]
-name = "work"
-[profiles.git]
-author = {{ name = "Test Author", email = "author@example.invalid" }}
-committer = {{ name = "Test Author", email = "author@example.invalid" }}
-[profiles.git.push]
+[profiles.work]
+name = "Test Author"
+email = "author@example.invalid"
+scopes = [{{ name = "repo", path = {scope:?} }}]
+
+[profiles.work.git]
 remote = "origin"
-destinations = ["https://github.com/example/*"]
-
-[[scopes]]
-name = "repo"
-path = {scope:?}
-profile = "work"
+push = ["https://github.com/example/*"]
 "#,
             scope = repo_canon.to_string_lossy()
         ),
@@ -4089,22 +4315,16 @@ profile = "work"
     fs::write(
         &pull_config,
         format!(
-            r#"version = 3
+            r#"version = 4
 
-[[profiles]]
-name = "work"
-[profiles.git]
-author = {{ name = "Test Author", email = "author@example.invalid" }}
-committer = {{ name = "Test Author", email = "author@example.invalid" }}
-[[profiles.git.remotes]]
-name = "origin"
-fetch_destinations = ["https://127.0.0.1:1/org/repo.git"]
-push_destinations = []
+[profiles.work]
+name = "Test Author"
+email = "author@example.invalid"
+scopes = [{{ name = "pull", path = {scope:?} }}]
 
-[[scopes]]
-name = "pull"
-path = {scope:?}
-profile = "work"
+[profiles.work.git.remotes.origin]
+fetch = ["https://127.0.0.1:1/org/repo.git"]
+push = []
 "#,
             scope = pull_local_canon.to_string_lossy()
         ),
@@ -4251,62 +4471,47 @@ fn external_https_credentials_are_opt_in_and_github_binding_remains_host_scoped(
             .into_owned(),
     );
     let contents = format!(
-        r#"version = 3
+        r#"version = 4
 
-[[profiles]]
-name = "work"
-[profiles.git]
-author = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
-committer = {{ name = "Synthetic", email = "synthetic@example.invalid" }}
-deny_destinations = ["https://forge.example.invalid/org/denied.git"]
-[[profiles.git.remotes]]
-name = "origin"
-fetch_destinations = [
+[profiles.work]
+name = "Synthetic"
+email = "synthetic@example.invalid"
+scopes = [{{ name = "fixture", path = {scope_value} }}]
+
+[profiles.work.git]
+remote = "origin"
+deny = ["https://forge.example.invalid/org/denied.git"]
+allow_initial_push = true
+
+[profiles.work.git.remotes.origin]
+fetch = [
   "https://forge.example.invalid/org/repo.git",
   "https://forge.example.invalid/org/denied.git",
 ]
-push_destinations = [
+push = [
   "git@forge.example.invalid:org/repo.git",
   "https://forge.example.invalid/org/repo.git",
   "https://github.com/org/repo.git",
 ]
-[profiles.git.push]
-remote = "origin"
-destinations = [
-  "git@forge.example.invalid:org/repo.git",
-  "https://forge.example.invalid/org/repo.git",
-  "https://github.com/org/repo.git",
-]
-allow_initial_push = true
-[profiles.github]
+
+[profiles.work.github]
 host = "github.com"
 account_id = "4242"
 account_selector = "synthetic-user"
 token_fingerprint = "hmac-sha256:{fingerprint}"
-[profiles.ssh]
-host = "github.com"
+
+[profiles.work.ssh]
+hosts = ["github.com", "forge.example.invalid"]
 user = "git"
 port = 22
 fingerprint = "SHA256:syntheticfingerprint"
 public_key = {ssh_public_key}
 identity_file = {ssh_identity}
 known_hosts_file = {known_hosts}
-[[profiles.ssh_hosts]]
-host = "forge.example.invalid"
-user = "git"
-port = 22
-fingerprint = "SHA256:syntheticfingerprint"
-public_key = {ssh_public_key}
-identity_file = {ssh_identity}
-known_hosts_file = {known_hosts}
-[[profiles.https_credentials]]
-host = "forge.example.invalid"
+
+[profiles.work.https."forge.example.invalid"]
 helper = {helper_value}
 args = ["fixture-command"]
-[[scopes]]
-name = "fixture"
-path = {scope_value}
-profile = "work"
 "#,
         fingerprint = "0".repeat(64),
     );

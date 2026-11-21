@@ -122,7 +122,7 @@ fn installed_pre_push_composes_restores_and_honors_documented_bypasses() {
     fs::write(
         &config,
         format!(
-            "version=1\n[[scopes]]\nname=\"scope\"\npath={:?}\n[scopes.git]\nauthor={{name=\"Persona Committer\",email=\"committer@example.invalid\"}}\ncommitter={{name=\"Persona Committer\",email=\"committer@example.invalid\"}}\n[scopes.git.push]\nremote=\"origin\"\ndestinations=[{:?}]\n",
+            "version = 4\n[profiles.scope]\nname = \"Persona Committer\"\nemail = \"committer@example.invalid\"\nscopes = [{:?}]\n[profiles.scope.git]\nremote = \"origin\"\npush = [{:?}]\n",
             repo.to_string_lossy(),
             remote.to_string_lossy(),
         ),
@@ -572,21 +572,15 @@ fn hooks_refresh_and_installer_refresh_update_registered_worktree_hooks() {
     fs::write(
         &config_path,
         format!(
-            r#"version = 3
+            r#"version = 4
 
-[[profiles]]
-name = "work"
-[profiles.git]
+[profiles.work]
 author = {{ name = "Persona Author", email = "author@example.invalid" }}
 committer = {{ name = "Persona Committer", email = "committer@example.invalid" }}
-[profiles.git.push]
+scopes = [{{ name = "repo", path = {scope:?} }}]
+[profiles.work.git]
 remote = "origin"
-destinations = [{dest:?}]
-
-[[scopes]]
-name = "repo"
-path = {scope:?}
-profile = "work"
+push = [{dest:?}]
 "#,
             dest = remote.to_string_lossy(),
             scope = repo.canonicalize().unwrap().to_string_lossy(),

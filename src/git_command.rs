@@ -96,6 +96,8 @@ pub struct PushInvocation {
     pub leases: Vec<ExactPushLease>,
     pub bare_force_with_lease: bool,
     pub lease_refs: Vec<String>,
+    pub empty_lease_refs: Vec<String>,
+    pub force_if_includes: bool,
     pub atomic: bool,
     pub set_upstream: bool,
     pub force: bool,
@@ -123,6 +125,8 @@ impl PushInvocation {
         let mut leases = Vec::new();
         let mut bare_force_with_lease = false;
         let mut lease_refs = Vec::new();
+        let mut empty_lease_refs = Vec::new();
+        let mut force_if_includes = false;
         let mut atomic = false;
         let mut set_upstream = false;
         let mut force = false;
@@ -149,13 +153,14 @@ impl PushInvocation {
                 "-v" | "--verbose" => verbose = true,
                 "-q" | "--quiet" => quiet = true,
                 "--no-verify" => no_verify = true,
+                "--force-if-includes" => force_if_includes = true,
                 "--force-with-lease" => bare_force_with_lease = true,
                 _ if word.starts_with("--force-with-lease=") => {
                     let value = word.trim_start_matches("--force-with-lease=");
                     if let Some((remote_ref, expected_oid)) = value.split_once(':') {
                         let remote_ref = normalize_ref(remote_ref, false)?;
                         if expected_oid.is_empty() {
-                            lease_refs.push(remote_ref);
+                            empty_lease_refs.push(remote_ref);
                         } else {
                             if !(matches!(expected_oid.len(), 40 | 64)
                                 && expected_oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -239,6 +244,17 @@ impl PushInvocation {
         if remote.is_none() && !refspecs.is_empty() {
             return Err("push requires an explicit remote");
         }
+        let mut leased_refs = std::collections::HashSet::new();
+        for remote_ref in leases
+            .iter()
+            .map(|lease| lease.remote_ref.as_str())
+            .chain(lease_refs.iter().map(String::as_str))
+            .chain(empty_lease_refs.iter().map(String::as_str))
+        {
+            if !leased_refs.insert(remote_ref) {
+                return Err("force-with-lease may name each ref only once");
+            }
+        }
         if !refspecs.is_empty() {
             let mut destinations = std::collections::HashSet::new();
             for refspec in &refspecs {
@@ -248,27 +264,13 @@ impl PushInvocation {
                     return Err("push refspec destinations must be unique");
                 }
             }
-            let mut leased_refs = std::collections::HashSet::new();
-            for lease in &leases {
-                if !leased_refs.insert(lease.remote_ref.as_str()) {
-                    return Err("force-with-lease may name each ref only once");
-                }
-                if !destinations.contains(lease.remote_ref.as_str())
-                    && !lease
-                        .remote_ref
-                        .strip_prefix("refs/heads/")
-                        .is_some_and(|name| {
-                            refspecs.iter().any(|spec| spec.raw_destination == name)
-                        })
+            for remote_ref in &leased_refs {
+                if !destinations.contains(remote_ref)
+                    && !remote_ref.strip_prefix("refs/heads/").is_some_and(|name| {
+                        refspecs.iter().any(|spec| spec.raw_destination == name)
+                    })
                 {
                     return Err("force-with-lease must match a requested destination ref");
-                }
-            }
-        } else {
-            let mut leased_refs = std::collections::HashSet::new();
-            for lease in &leases {
-                if !leased_refs.insert(lease.remote_ref.as_str()) {
-                    return Err("force-with-lease may name each ref only once");
                 }
             }
         }
@@ -278,6 +280,8 @@ impl PushInvocation {
             leases,
             bare_force_with_lease,
             lease_refs,
+            empty_lease_refs,
+            force_if_includes,
             atomic,
             set_upstream,
             force,
@@ -621,6 +625,22 @@ mod tests {
         .unwrap();
         assert!(forced.force);
 
+        let bare_lease =
+            PushInvocation::parse(&args(&["--force-with-lease", "--force-if-includes"])).unwrap();
+        assert!(bare_lease.bare_force_with_lease);
+        assert!(bare_lease.force_if_includes);
+        assert!(!bare_lease.force);
+
+        let ref_lease =
+            PushInvocation::parse(&args(&["--force-with-lease=main", "origin", "main"])).unwrap();
+        assert_eq!(ref_lease.lease_refs, ["refs/heads/main"]);
+        assert!(ref_lease.empty_lease_refs.is_empty());
+
+        let empty_lease =
+            PushInvocation::parse(&args(&["--force-with-lease=main:", "origin", "main"])).unwrap();
+        assert_eq!(empty_lease.empty_lease_refs, ["refs/heads/main"]);
+        assert!(empty_lease.lease_refs.is_empty());
+
         for invalid in [
             vec!["origin", "refs/notes/a:refs/notes/b"],
             vec!["origin", "main..backup:main"],
@@ -632,10 +652,18 @@ mod tests {
                 "--force-with-lease=refs/heads/elsewhere:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "main:main",
             ],
+            vec!["origin", "--force-with-lease=elsewhere", "main:main"],
+            vec!["origin", "--force-with-lease=elsewhere:", "main:main"],
             vec![
                 "origin",
                 "--force-with-lease=main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "--force-with-lease=refs/heads/main:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "main:main",
+            ],
+            vec![
+                "origin",
+                "--force-with-lease=main",
+                "--force-with-lease=refs/heads/main:",
                 "main:main",
             ],
         ] {

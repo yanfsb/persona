@@ -123,20 +123,17 @@ fn new_clone_target_outside_managed_scopes_stays_unmanaged() {
 }
 
 #[test]
-fn nested_v2_scope_replaces_parent_profile_without_inheritance() {
+fn nested_v4_scope_replaces_parent_profile_without_implicit_inheritance() {
     let temporary = tempdir().expect("create temporary directory");
     let parent = temporary.path().join("work");
     let nested = parent.join("personal");
     fs::create_dir_all(&nested).expect("create nested scope");
     let config_text = format!(
-        "version = 2\n\
-         [[profiles]]\nname = \"work\"\n[profiles.git]\nauthor = {{ name = \"Work\", email = \"work@example.invalid\" }}\ncommitter = {{ name = \"Work\", email = \"work@example.invalid\" }}\n\
-         [[profiles]]\nname = \"personal\"\n[profiles.git]\nauthor = {{ name = \"Personal\", email = \"personal@example.invalid\" }}\ncommitter = {{ name = \"Personal\", email = \"personal@example.invalid\" }}\n\
-         [[scopes]]\nname = \"work-root\"\npath = {:?}\nprofile = \"work\"\n\
-         [[scopes]]\nname = \"personal-root\"\npath = {:?}\nprofile = \"personal\"\n",
-        parent, nested
+        "version = 4\n\
+         [profiles.work]\nscopes = [{{ name = \"work-root\", path = {parent:?} }}]\nname = \"Work\"\nemail = \"work@example.invalid\"\n\
+         [profiles.personal]\nscopes = [{{ name = \"personal-root\", path = {nested:?} }}]\nname = \"Personal\"\nemail = \"personal@example.invalid\"\n"
     );
-    let config = persona::config::Config::parse(&config_text).expect("v2 nested config");
+    let config = persona::config::Config::parse(&config_text).expect("v4 nested config");
     let selected = resolve_context(&nested, &config.scopes())
         .expect("resolve nested scope")
         .expect("nested scope selected");

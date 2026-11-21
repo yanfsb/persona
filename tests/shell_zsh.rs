@@ -175,7 +175,7 @@ fn zsh_marker_reports_only_a_matching_directory_scope() {
     fs::write(
         &config,
         format!(
-            "version = 2\n\n[[profiles]]\nname = \"work\"\n[profiles.git]\nauthor = {{ name = \"Fixture\", email = \"fixture@example.invalid\" }}\ncommitter = {{ name = \"Fixture\", email = \"fixture@example.invalid\" }}\n\n[[scopes]]\nname = \"repo\"\npath = {:?}\nprofile = \"work\"\n",
+            "version = 4\n\n[profiles.work]\nname = \"Fixture\"\nemail = \"fixture@example.invalid\"\nscopes = [{{ name = \"repo\", path = {:?} }}]\n",
             repo.display().to_string()
         ),
     )

@@ -272,7 +272,7 @@ fn invalidate_head(home: &Path, root: &Path, temporary: &Path) {
 
 fn write_policy(path: &Path, scope: &Path, fingerprint: &str, public_key: &Path) {
     let contents = format!(
-        "version = 1\n[[scopes]]\nname = \"scope\"\npath = {:?}\n[scopes.git]\nauthor = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\ncommitter = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\n[scopes.git.signing]\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n",
+        "version = 4\n[profiles.scope]\nname = \"Synthetic Signer\"\nemail = \"signer@example.invalid\"\nscopes = [{:?}]\n[profiles.scope.signing]\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n",
         scope.to_string_lossy(),
         public_key.to_string_lossy()
     );
@@ -362,7 +362,7 @@ fn write_push_policy(
     destination: &Path,
 ) {
     let contents = format!(
-        "version = 1\n[[scopes]]\nname = \"scope\"\npath = {:?}\n[scopes.git]\nauthor = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\ncommitter = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\n[scopes.git.signing]\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n[scopes.git.push]\nremote = \"origin\"\ndestinations = [{:?}]\n",
+        "version = 4\n[profiles.scope]\nname = \"Synthetic Signer\"\nemail = \"signer@example.invalid\"\nscopes = [{:?}]\n[profiles.scope.signing]\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n[profiles.scope.git]\nremote = \"origin\"\npush = [{:?}]\n",
         scope.to_string_lossy(),
         public_key.to_string_lossy(),
         destination.to_string_lossy(),
@@ -531,7 +531,7 @@ fn annotated_tag_push_audit_requires_and_accepts_the_exact_valid_signature() {
     ));
     write_policy(&policy, &repo, &fingerprint, &public_key);
     let mut policy_text = fs::read_to_string(&policy).unwrap();
-    policy_text.push_str(&format!("\n[scopes.git.push]\nremote = \"origin\"\ndestinations = [{:?}]\nallow_initial_push = true\nallow_fast_forward = true\nallow_annotated_tags = true\n", destination.to_string_lossy()));
+    policy_text.push_str(&format!("\n[profiles.scope.git]\nremote = \"origin\"\npush = [{:?}]\nallow_initial_push = true\nallow_fast_forward = true\nallow_annotated_tags = true\n", destination.to_string_lossy()));
     fs::write(&policy, policy_text).unwrap();
     checked(git(
         &home,
@@ -1083,7 +1083,7 @@ fn push_audit_trusts_pinned_upstream_signatures_but_checks_new_commits() {
     let mut policy_contents = fs::read_to_string(&policy).expect("read push policy");
     writeln!(
         policy_contents,
-        "allow_initial_push = true\n\n[[scopes.git.push.upstream_baselines]]\ndestination = {:?}\ntracking_ref = \"refs/remotes/origin/main\"\noid = \"{baseline}\"",
+        "allow_initial_push = true\n\n[[profiles.scope.git.baselines]]\ndestination = {:?}\ntracking_ref = \"refs/remotes/origin/main\"\noid = \"{baseline}\"",
         destination.to_string_lossy(),
     )
     .expect("append pinned baseline");
@@ -1258,7 +1258,7 @@ fn ssh_signature_is_audited_against_the_configured_public_key() {
     .to_owned();
     let policy = temporary.path().join("policy.toml");
     fs::write(&policy, format!(
-        "version = 1\n[[scopes]]\nname = \"scope\"\npath = {:?}\n[scopes.git]\nauthor = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\ncommitter = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\n[scopes.git.signing]\nformat = \"ssh\"\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n",
+        "version = 4\n[profiles.scope]\nname = \"Synthetic Signer\"\nemail = \"signer@example.invalid\"\nscopes = [{:?}]\n[profiles.scope.signing]\nformat = \"ssh\"\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n",
         repo.to_string_lossy(), public_key.to_string_lossy()
     )).unwrap();
     let report: Value =
@@ -1450,7 +1450,7 @@ fn ssh_commit_signature_uses_explicit_allowed_signer_and_ignores_repo_verifier()
 
     let policy = temporary.path().join("ssh-tag-policy.toml");
     fs::write(&policy, format!(
-        "version = 1\n[[scopes]]\nname = \"scope\"\npath = {:?}\n[scopes.git]\nauthor = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\ncommitter = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\n[scopes.git.signing]\nformat = \"ssh\"\nfingerprint = \"{expected}\"\npublic_key = {:?}\n",
+        "version = 4\n[profiles.scope]\nname = \"Synthetic Signer\"\nemail = \"signer@example.invalid\"\nscopes = [{:?}]\n[profiles.scope.signing]\nformat = \"ssh\"\nfingerprint = \"{expected}\"\npublic_key = {:?}\n",
         temporary.path().to_string_lossy(), public_key.to_string_lossy()
     )).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_persona"))
@@ -1596,7 +1596,7 @@ fn push_audit_verifies_each_outgoing_ssh_commit() {
     .to_owned();
     let policy = temporary.path().join("policy.toml");
     fs::write(&policy, format!(
-        "version = 1\n[[scopes]]\nname = \"scope\"\npath = {:?}\n[scopes.git]\nauthor = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\ncommitter = {{ name = \"Synthetic Signer\", email = \"signer@example.invalid\" }}\n[scopes.git.signing]\nformat = \"ssh\"\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n[scopes.git.push]\nremote = \"origin\"\ndestinations = [{:?}]\n",
+        "version = 4\n[profiles.scope]\nname = \"Synthetic Signer\"\nemail = \"signer@example.invalid\"\nscopes = [{:?}]\n[profiles.scope.signing]\nformat = \"ssh\"\nfingerprint = \"{fingerprint}\"\npublic_key = {:?}\n[profiles.scope.git]\nremote = \"origin\"\npush = [{:?}]\n",
         repo.to_string_lossy(), public_key.to_string_lossy(), remote.to_string_lossy()
     )).unwrap();
     let report = run_persona_push(
@@ -1792,14 +1792,12 @@ fn ssh_commit_signature_can_be_created_only_through_an_isolated_agent() {
     fs::write(
         &policy,
         format!(
-            r#"version = 1
-[[scopes]]
-name = "scope"
-path = {:?}
-[scopes.git]
-author = {{ name = "Synthetic Signer", email = "signer@example.invalid" }}
-committer = {{ name = "Synthetic Signer", email = "signer@example.invalid" }}
-[scopes.git.signing]
+            r#"version = 4
+[profiles.scope]
+name = "Synthetic Signer"
+email = "signer@example.invalid"
+scopes = [{:?}]
+[profiles.scope.signing]
 format = "ssh"
 fingerprint = {fingerprint:?}
 public_key = {:?}

@@ -6,7 +6,7 @@ This matrix distinguishes source implementation, local tests, and hosted CI. A t
 
 | Item | Current evidence | Status |
 |---|---|---|
-| Version | `0.2.0-rc.1`; predecessor at [`releases/v0.1.1-rc.3.md`](releases/v0.1.1-rc.3.md); candidate note at [`releases/v0.2.0-rc.1.md`](releases/v0.2.0-rc.1.md) | Minor release candidate; do not treat as a stable or production-security release |
+| Version | `0.2.0`; predecessor at [`releases/v0.2.0-rc.6.md`](releases/v0.2.0-rc.6.md); release note at [`releases/v0.2.0.md`](releases/v0.2.0.md) | First stable `0.2.0` release (schema v4); requires exact-final-commit hosted CI before tagging |
 | Declared targets | Apple Silicon macOS, Linux arm64, Linux x86_64 (`Cargo.toml`, CI matrix) | Target declaration only |
 | CI-fix branch | Run [43128664622](https://github.com/yanfsb/persona/actions/runs/43128664622), commit `e61a72d` on `fix/ci-fixtures` | Passed on Linux x86_64, Linux arm64, and macOS arm64; this run predates subsequent candidates. |
 | Merged open-source-preparation baseline | Run [43489260619](https://github.com/yanfsb/persona/actions/runs/43489260619), merge commit `d43baba` on `main` | Passed on Linux x86_64, Linux arm64, and macOS arm64, including the workflow Nix checks. |
@@ -24,7 +24,7 @@ The CI-fix and merged open-source-preparation commits have green hosted runs on 
 | Area | Implementation | Relevant tests/evidence | User-facing documentation |
 |---|---|---|---|
 | CLI, diagnostics and output | `src/main.rs`, `src/runtime.rs`, `src/audit.rs`, `src/authorization.rs`, `src/report.rs` | `tests/cli.rs`, unit tests in source | [CLI](cli.md), [security model](security-model.md) |
-| Profiles, scopes, destination/command rules and migration | `src/config.rs`, `src/command_policy.rs`, `src/destination.rs`, `src/storage.rs`, `src/context.rs` | `tests/config.rs`, `tests/config_file.rs`, `tests/context.rs`, `tests/scope.rs`, unit tests | [Configuration](configuration.md), [Getting started](getting-started.md) |
+| Profiles, scopes, destination/command rules and v4 schema | `src/config.rs`, `src/command_policy.rs`, `src/destination.rs`, `src/storage.rs`, `src/context.rs` | `tests/config.rs`, `tests/config_file.rs`, `tests/context.rs`, `tests/scope.rs`, unit tests | [Configuration](configuration.md), [Getting started](getting-started.md) |
 | Managed Git, SSH and bounded publication | `src/git_command.rs`, `src/git.rs`, `src/git_adapter.rs`, `src/pre_push.rs`, `src/push.rs`, `src/git_https.rs`, `src/ssh_transport.rs`, `src/ssh_adapter.rs` | `tests/git.rs`, `tests/git_adapter.rs`, `tests/git_https.rs`, `tests/ssh_transport.rs`, `tests/push.rs` | [Managed commands](managed-commands.md) |
 | GitHub CLI, credential binding and release assets | `src/gh_adapter.rs`, `src/gh_runner.rs`, `src/credential.rs`, `src/asset_upload.rs` | `tests/gh_adapter.rs`, `tests/cli.rs`, asset/credential unit tests; synthetic API fixtures, installed shim and local native-curl redirect test | [Managed commands](managed-commands.md), [Security](security-model.md) |
 | Signing and tag verification | `src/gpg.rs`, `src/ssh_signature.rs` | `tests/signing.rs`, `tests/identity.rs` | [Configuration](configuration.md), [Security](security-model.md) |

@@ -26,6 +26,20 @@ pub struct PushHandoff {
     pub dynamic_tuples: bool,
     #[serde(default)]
     pub force_requested: bool,
+    #[serde(default)]
+    pub bare_force_with_lease: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub empty_lease_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_leases: Vec<HandoffLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffLease {
+    pub remote_ref: String,
+    pub expected_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +222,10 @@ mod tests {
             github_binding: None,
             dynamic_tuples: false,
             force_requested: false,
+            bare_force_with_lease: false,
+            lease_refs: Vec::new(),
+            empty_lease_refs: Vec::new(),
+            exact_leases: Vec::new(),
         }
     }
 
